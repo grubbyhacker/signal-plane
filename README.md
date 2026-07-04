@@ -42,6 +42,16 @@ The smoke test starts local NATS JetStream with Docker Compose, starts the
 gateway and a one-shot observer, sends an authenticated manual event, and waits
 for the observer to log the received signal.
 
+Build the service image with:
+
+```sh
+docker build -t signal-plane:local .
+```
+
+The image contains both `signal-gateway` and `signal-observer`; the default
+entrypoint runs the gateway, and deployment tooling can override the command to
+run the observer.
+
 ## Design
 
 - [Signal plane design](docs/agent-signal-plane-design.md)

@@ -23,6 +23,9 @@ run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 [tasks.build]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer"
 
+[tasks.image-build]
+run = "docker build -t signal-plane:local ."
+
 [tasks.tidy]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go mod tidy"
 
