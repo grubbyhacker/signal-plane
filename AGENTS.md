@@ -17,7 +17,7 @@ flow before any agent or job-controller behavior is introduced.
 ## Development
 
 - Language: Go.
-- Use `make check` before handoff.
+- Use `mise run check` before handoff.
 - Keep the first implementation boring: standard library first, small packages,
   narrow interfaces, and explicit tests.
 - If external dependencies are added, keep them justified and run `go mod tidy`.

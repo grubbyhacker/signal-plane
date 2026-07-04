@@ -1,5 +1,7 @@
 .DS_Store
 /.nats/
+/.gocache/
+/.gomodcache/
 /.tools/
 /bin/
 /dist/

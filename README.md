@@ -26,13 +26,31 @@ No Hermes, job controller, or LLM runtime is part of the first milestone.
 ## Development
 
 ```sh
-make check
-go run ./cmd/signal-gateway
-go run ./cmd/signal-observer
+mise run check
+mise run compose-up
+SIGNAL_GATEWAY_MANUAL_TOKEN=local-dev-token mise run gateway
+mise run observer
 ```
 
-Local NATS and end-to-end development wiring will be added in the first
-implementation sprint.
+Run the local end-to-end smoke path with:
+
+```sh
+mise run smoke-local
+```
+
+The smoke test starts local NATS JetStream with Docker Compose, starts the
+gateway and a one-shot observer, sends an authenticated manual event, and waits
+for the observer to log the received signal.
+
+Build the service image with:
+
+```sh
+docker build -t signal-plane:local .
+```
+
+The image contains both `signal-gateway` and `signal-observer`; the default
+entrypoint runs the gateway, and deployment tooling can override the command to
+run the observer.
 
 ## Design
 
