@@ -2,23 +2,15 @@
 go = "1.26.4"
 
 [tasks.fmt]
-run = "go fmt ./..."
+run = "gofmt -w $(git ls-files --cached --others --exclude-standard '*.go')"
 
 [tasks.fmt-check]
 run = """
-tmp="$(mktemp -d)"
-cp -R . "$tmp/repo"
-go fmt ./... >/dev/null
-status=0
-diff -ru "$tmp/repo" . \
-  --exclude .git \
-  --exclude .tools \
-  --exclude .nats \
-  --exclude tmp || status=$?
-rm -rf "$tmp"
-if [ "$status" -ne 0 ]; then
+unformatted="$(gofmt -l $(git ls-files --cached --others --exclude-standard '*.go'))"
+if [ -n "$unformatted" ]; then
   echo "go fmt drift detected; run mise run fmt"
-  exit "$status"
+  echo "$unformatted"
+  exit 1
 fi
 """
 
@@ -26,10 +18,25 @@ fi
 run = "mise run fmt-check && mise run test && mise run build"
 
 [tasks.test]
-run = "go test ./..."
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 
 [tasks.build]
-run = "go build ./cmd/signal-gateway ./cmd/signal-observer"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer"
 
 [tasks.tidy]
-run = "go mod tidy"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go mod tidy"
+
+[tasks.compose-up]
+run = "docker compose -f deploy/compose.local.yaml up -d"
+
+[tasks.compose-down]
+run = "docker compose -f deploy/compose.local.yaml down"
+
+[tasks.gateway]
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go run ./cmd/signal-gateway"
+
+[tasks.observer]
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go run ./cmd/signal-observer"
+
+[tasks.smoke-local]
+run = "scripts/smoke-local.sh"

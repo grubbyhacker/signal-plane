@@ -13,7 +13,7 @@ Prove local flow without GitHub, Cloudflare, Hermes, or a job controller.
 Definition of done:
 
 - `curl -> signal-gateway -> JetStream -> signal-observer` is visible locally.
-- `make check` passes.
+- `mise run check` passes.
 
 ## Phase 2: GitHub-compatible receiver
 
