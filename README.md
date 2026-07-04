@@ -52,6 +52,9 @@ The image contains both `signal-gateway` and `signal-observer`; the default
 entrypoint runs the gateway, and deployment tooling can override the command to
 run the observer.
 
+Pushes to `main` publish the deployment image to
+`ghcr.io/grubbyhacker/signal-plane:main`.
+
 ## Design
 
 - [Signal plane design](docs/agent-signal-plane-design.md)
