@@ -1,0 +1,60 @@
+# Near-Term Phase Plan
+
+## Phase 1: local event plane
+
+Prove local flow without GitHub, Cloudflare, Hermes, or a job controller.
+
+- Scaffold `signal-gateway` and `signal-observer`.
+- Run local NATS JetStream.
+- Publish a thin envelope with raw payload.
+- Subscribe with an observer and log accepted signals.
+- Expose health, readiness, and metrics.
+
+Definition of done:
+
+- `curl -> signal-gateway -> JetStream -> signal-observer` is visible locally.
+- `make check` passes.
+
+## Phase 2: GitHub-compatible receiver
+
+Prove GitHub webhook admission locally.
+
+- Verify `X-Hub-Signature-256` against the raw body.
+- Use constant-time comparison.
+- Handle `ping` without publishing by default.
+- Filter by repository, event, and action.
+- Count rejects by reason.
+
+Definition of done:
+
+- Valid GitHub fixtures are accepted.
+- Invalid signatures and disallowed actions are rejected.
+- The raw provider payload is preserved inside the signal envelope.
+
+## Phase 3: local staging through vps-ops
+
+Deploy the event plane through the local staging path.
+
+- Add the combined `signal-plane` role in `vps-ops`.
+- Keep NATS private.
+- Decide metrics scrape topology.
+- Stimulate the gateway from the host and watch observer logs.
+
+Definition of done:
+
+- `mise run deploy:staging -- signal-plane` deploys gateway, observer, and NATS.
+
+## Phase 4: secure public ingress
+
+Expose only the webhook path through Cloudflare Tunnel.
+
+- Add Cloudflare hostname/path routing.
+- Add WAF/rate-limit/source-range controls where practical.
+- Wire Doppler-provided webhook secret into the deployed gateway.
+- Prove a public request reaches NATS and the observer.
+
+Definition of done:
+
+- GitHub `ping` reaches the gateway and is verified.
+- Real pull request events are accepted, carried through JetStream, and logged.
+- No agent, Hermes, or job controller behavior is involved.

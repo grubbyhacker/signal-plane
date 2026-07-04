@@ -1,0 +1,7 @@
+/.nats/
+/.tools/
+/bin/
+/dist/
+/tmp/
+/signal-gateway
+/signal-observer

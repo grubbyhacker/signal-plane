@@ -1,0 +1,35 @@
+[tools]
+go = "1.26.4"
+
+[tasks.fmt]
+run = "go fmt ./..."
+
+[tasks.fmt-check]
+run = """
+tmp="$(mktemp -d)"
+cp -R . "$tmp/repo"
+go fmt ./... >/dev/null
+status=0
+diff -ru "$tmp/repo" . \
+  --exclude .git \
+  --exclude .tools \
+  --exclude .nats \
+  --exclude tmp || status=$?
+rm -rf "$tmp"
+if [ "$status" -ne 0 ]; then
+  echo "go fmt drift detected; run mise run fmt"
+  exit "$status"
+fi
+"""
+
+[tasks.check]
+run = "mise run fmt-check && mise run test && mise run build"
+
+[tasks.test]
+run = "go test ./..."
+
+[tasks.build]
+run = "go build ./cmd/signal-gateway ./cmd/signal-observer"
+
+[tasks.tidy]
+run = "go mod tidy"

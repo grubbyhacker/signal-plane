@@ -1,0 +1,6 @@
+routes:
+  - id: manual-local
+    path: /manual
+    source: manual
+    max_body_bytes: 1048576
+    publish_subject_template: signals.manual.local.test
