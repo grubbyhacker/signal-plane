@@ -1,10 +1,12 @@
 package gateway
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,52 @@ import (
 type capturePublisher struct {
 	subject string
 	signal  envelope.Signal
+}
+
+type readyPublisher struct {
+	capturePublisher
+	err error
+}
+
+func (publisher *readyPublisher) Ready(context.Context) error { return publisher.err }
+
+func TestReadinessRequiresInspectableBus(t *testing.T) {
+	publisher := &readyPublisher{err: errors.New("down")}
+	server := New(slog.Default(), []config.Route{}, publisher)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"error":"not_ready"`) {
+		t.Fatalf("not ready response = %d %s", rec.Code, rec.Body.String())
+	}
+	publisher.err = nil
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ready response = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsUseBoundedSourceAndReasonLabels(t *testing.T) {
+	server := New(slog.Default(), nil, &capturePublisher{})
+	server.metrics.add(config.Route{ID: "known-route", Source: "untrusted"}, "surprise", "arbitrary")
+	metrics, err := server.metrics.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, metric := range metrics {
+		if metric.GetName() == "signal_gateway_requests_total" {
+			labels := metric.Metric[0].Label
+			got := map[string]string{}
+			for _, label := range labels {
+				got[label.GetName()] = label.GetValue()
+			}
+			if got["source"] != "other" || got["result"] != "other" || got["reason"] != "other" {
+				t.Fatalf("labels = %#v", got)
+			}
+			return
+		}
+	}
+	t.Fatal("gateway request metric not found")
 }
 
 func (publisher *capturePublisher) Publish(subject string, signal envelope.Signal) error {
