@@ -2,25 +2,29 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/buildinfo"
 	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/grubbyhacker/signal-plane/internal/source/githubwebhook"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Publisher interface {
 	Publish(subject string, signal envelope.Signal) error
 }
+
+type readinessChecker interface{ Ready(context.Context) error }
 
 type Server struct {
 	logger    *slog.Logger
@@ -43,8 +47,8 @@ func New(logger *slog.Logger, routes []config.Route, publisher Publisher) *Serve
 func (server *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", writeOK)
-	mux.HandleFunc("GET /readyz", writeOK)
-	mux.HandleFunc("GET /metrics", server.metrics.handle)
+	mux.HandleFunc("GET /readyz", server.ready)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(server.metrics.registry, promhttp.HandlerOpts{}))
 	for _, route := range server.routes {
 		route := route
 		mux.HandleFunc("POST "+route.Path, func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +56,18 @@ func (server *Server) Handler() http.Handler {
 		})
 	}
 	return mux
+}
+
+func (server *Server) ready(w http.ResponseWriter, r *http.Request) {
+	checker, ok := server.publisher.(readinessChecker)
+	if !ok || checker.Ready(r.Context()) != nil {
+		server.metrics.readiness.Set(0)
+		server.metrics.dependencyErrors.WithLabelValues("nats", "unavailable").Inc()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not_ready"})
+		return
+	}
+	server.metrics.readiness.Set(1)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func writeOK(w http.ResponseWriter, _ *http.Request) {
@@ -95,12 +111,16 @@ func (server *Server) handleRoute(w http.ResponseWriter, r *http.Request, route 
 		Payload: append(json.RawMessage(nil), body...),
 	}
 
+	started := time.Now()
 	if err := server.publisher.Publish(route.Subject(), signal); err != nil {
+		server.metrics.publishDuration.Observe(time.Since(started).Seconds())
 		server.metrics.add(route, "rejected", "publish_failed")
+		server.metrics.dependencyErrors.WithLabelValues("nats", normalizedError(err)).Inc()
 		server.logger.Error("publish failed", "route_id", route.ID, "source", route.Source, "error", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "publish_failed"})
 		return
 	}
+	server.metrics.publishDuration.Observe(time.Since(started).Seconds())
 
 	server.metrics.add(route, "accepted", "")
 	server.logger.Info(
@@ -249,26 +269,60 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 type metrics struct {
-	mu       sync.Mutex
-	counters map[string]int64
+	registry         *prometheus.Registry
+	requests         *prometheus.CounterVec
+	publishDuration  prometheus.Histogram
+	readiness        prometheus.Gauge
+	dependencyErrors *prometheus.CounterVec
 }
 
 func newMetrics() *metrics {
-	return &metrics{counters: map[string]int64{}}
+	registry := prometheus.NewRegistry()
+	m := &metrics{
+		registry:         registry,
+		requests:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "signal_gateway_requests_total", Help: "Gateway requests by bounded admission outcome."}, []string{"route_id", "source", "result", "reason"}),
+		publishDuration:  prometheus.NewHistogram(prometheus.HistogramOpts{Name: "signal_gateway_publish_duration_seconds", Help: "Synchronous JetStream publish acknowledgement duration.", Buckets: prometheus.DefBuckets}),
+		readiness:        prometheus.NewGauge(prometheus.GaugeOpts{Name: "signal_gateway_readiness", Help: "Whether NATS and the configured stream are inspectable."}),
+		dependencyErrors: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "signal_gateway_dependency_errors_total", Help: "Normalized dependency errors."}, []string{"dependency", "reason"}),
+	}
+	registry.MustRegister(m.requests, m.publishDuration, m.readiness, m.dependencyErrors, prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}), prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "signal_gateway_build_info", Help: "Build information for signal-gateway.", ConstLabels: prometheus.Labels{"version": buildinfo.Version}}, func() float64 { return 1 }))
+	return m
 }
 
 func (m *metrics) add(route config.Route, result string, reason string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fmt.Sprintf("route_id=%q,source=%q,result=%q,reason=%q", route.ID, route.Source, result, reason)
-	m.counters[key]++
+	m.requests.WithLabelValues(boundedRoute(route.ID), boundedSource(route.Source), boundedResult(result), boundedReason(reason)).Inc()
 }
 
-func (m *metrics) handle(w http.ResponseWriter, _ *http.Request) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	w.Header().Set("content-type", "text/plain; version=0.0.4")
-	for labels, count := range m.counters {
-		_, _ = fmt.Fprintf(w, "signal_gateway_requests_total{%s} %d\n", labels, count)
+func boundedRoute(value string) string {
+	if value == "" {
+		return "unknown"
 	}
+	return value
+}
+func boundedSource(value string) string {
+	switch value {
+	case "github", "manual":
+		return value
+	}
+	return "other"
+}
+func boundedResult(value string) string {
+	switch value {
+	case "accepted", "ignored", "rejected":
+		return value
+	}
+	return "other"
+}
+func boundedReason(value string) string {
+	switch value {
+	case "", "ping", "invalid_body", "unknown_source", "missing_manual_token", "bad_manual_token", "missing_github_secret", "bad_github_signature", "invalid_github_payload", "repository_not_allowed", "event_not_allowed", "action_not_allowed", "publish_failed", "rejected":
+		return value
+	}
+	return "other"
+}
+func normalizedError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "other"
 }
