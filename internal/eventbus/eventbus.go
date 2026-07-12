@@ -89,26 +89,40 @@ const (
 )
 
 func (bus *Bus) NewObserverConsumer(subject string, durable string) (*Consumer, error) {
+	if err := bus.ensureObserverConsumer(subject, durable); err != nil {
+		return nil, err
+	}
 	sub, err := bus.js.PullSubscribe(subject, durable,
-		nats.BindStream(bus.stream),
+		nats.Bind(bus.stream, durable),
 		nats.ManualAck(),
-		nats.AckWait(ObserverAckWait),
-		nats.MaxAckPending(ObserverMaxAckPending),
-		nats.MaxDeliver(ObserverMaxDeliver),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("subscribe: %w", err)
 	}
-	if err := bus.configureObserverConsumer(durable); err != nil {
-		_ = sub.Unsubscribe()
-		return nil, err
-	}
 	return &Consumer{bus: bus, sub: sub, durable: durable}, nil
 }
 
-func (bus *Bus) configureObserverConsumer(durable string) error {
+// ensureObserverConsumer creates the durable with the observer settings, or
+// updates those mutable settings before attaching to an existing durable. The
+// ordering matters: PullSubscribe validates its options against an existing
+// consumer, so a durable from an older deployment must be migrated first.
+func (bus *Bus) ensureObserverConsumer(subject string, durable string) error {
 	info, err := bus.js.ConsumerInfo(bus.stream, durable)
 	if err != nil {
+		if errors.Is(err, nats.ErrConsumerNotFound) {
+			_, err = bus.js.AddConsumer(bus.stream, &nats.ConsumerConfig{
+				Durable:       durable,
+				FilterSubject: subject,
+				AckPolicy:     nats.AckExplicitPolicy,
+				AckWait:       ObserverAckWait,
+				MaxAckPending: ObserverMaxAckPending,
+				MaxDeliver:    ObserverMaxDeliver,
+			})
+			if err != nil {
+				return fmt.Errorf("create consumer: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("inspect consumer configuration: %w", err)
 	}
 	config := info.Config
