@@ -27,14 +27,15 @@ type Config struct {
 }
 
 type DispatcherConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	Addr           string `yaml:"addr"`
-	Subject        string `yaml:"subject"`
-	Durable        string `yaml:"durable"`
-	DatabasePath   string `yaml:"database_path"`
-	BrokerURL      string `yaml:"broker_url"`
-	BrokerTokenEnv string `yaml:"broker_token_env"`
-	Workers        int    `yaml:"workers"`
+	Enabled               bool   `yaml:"enabled"`
+	Addr                  string `yaml:"addr"`
+	Subject               string `yaml:"subject"`
+	Durable               string `yaml:"durable"`
+	DatabasePath          string `yaml:"database_path"`
+	BrokerURL             string `yaml:"broker_url"`
+	BrokerTokenEnv        string `yaml:"broker_token_env"`
+	Workers               int    `yaml:"workers"`
+	RecoveryStartSequence uint64 `yaml:"recovery_start_sequence"`
 }
 
 type GatewayConfig struct {
@@ -65,9 +66,16 @@ type GitHubConfig struct {
 }
 
 type AdmissionSet struct {
-	Repositories []string `yaml:"repositories"`
-	Events       []string `yaml:"events"`
-	Actions      []string `yaml:"actions"`
+	Repositories []string         `yaml:"repositories"`
+	Events       []string         `yaml:"events"`
+	Actions      []string         `yaml:"actions"`
+	Tuples       []AdmissionTuple `yaml:"tuples"`
+}
+
+type AdmissionTuple struct {
+	Repository string   `yaml:"repository"`
+	Event      string   `yaml:"event"`
+	Actions    []string `yaml:"actions"`
 }
 
 func Load(path string) (Config, error) {
@@ -191,6 +199,35 @@ func (route Route) Validate() error {
 	}
 	if strings.TrimSpace(route.Subject()) == "" {
 		return fmt.Errorf("route %q publish_subject is required", route.ID)
+	}
+	if len(route.Admission.Tuples) > 0 {
+		if len(route.Admission.Repositories) > 0 || len(route.Admission.Events) > 0 || len(route.Admission.Actions) > 0 {
+			return fmt.Errorf("route %q admission cannot combine tuples with repositories/events/actions", route.ID)
+		}
+		seen := make(map[string]struct{}, len(route.Admission.Tuples))
+		for i, tuple := range route.Admission.Tuples {
+			if strings.TrimSpace(tuple.Repository) == "" || strings.TrimSpace(tuple.Event) == "" {
+				return fmt.Errorf("route %q admission tuple %d requires repository and event", route.ID, i)
+			}
+			if len(tuple.Actions) == 0 {
+				return fmt.Errorf("route %q admission tuple %d requires at least one action", route.ID, i)
+			}
+			key := tuple.Repository + "\x00" + tuple.Event
+			if _, ok := seen[key]; ok {
+				return fmt.Errorf("route %q admission has duplicate tuple for %q and %q", route.ID, tuple.Repository, tuple.Event)
+			}
+			seen[key] = struct{}{}
+			actions := make(map[string]struct{}, len(tuple.Actions))
+			for _, action := range tuple.Actions {
+				if strings.TrimSpace(action) == "" {
+					return fmt.Errorf("route %q admission tuple %d contains an empty action", route.ID, i)
+				}
+				if _, ok := actions[action]; ok {
+					return fmt.Errorf("route %q admission tuple %d contains duplicate action %q", route.ID, i, action)
+				}
+				actions[action] = struct{}{}
+			}
+		}
 	}
 	return nil
 }

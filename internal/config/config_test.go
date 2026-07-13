@@ -85,3 +85,42 @@ func TestValidateRejectsDuplicateRoutePaths(t *testing.T) {
 		t.Fatal("expected duplicate path error")
 	}
 }
+
+func TestValidateAdmissionTuples(t *testing.T) {
+	base := Config{
+		Gateway: GatewayConfig{Addr: ":8080"},
+		NATS:    NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}},
+		Routes: []Route{{
+			ID: "github", Path: "/github", Source: "github", MaxBodyBytes: 1024, PublishSubject: "signals.github",
+			Admission: AdmissionSet{Tuples: []AdmissionTuple{{Repository: "owner/repo", Event: "issues", Actions: []string{"labeled"}}}},
+		}},
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid tuples rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"mixed legacy", func(c *Config) { c.Routes[0].Admission.Events = []string{"issues"} }},
+		{"empty repository", func(c *Config) { c.Routes[0].Admission.Tuples[0].Repository = "" }},
+		{"empty event", func(c *Config) { c.Routes[0].Admission.Tuples[0].Event = "" }},
+		{"no actions", func(c *Config) { c.Routes[0].Admission.Tuples[0].Actions = nil }},
+		{"empty action", func(c *Config) { c.Routes[0].Admission.Tuples[0].Actions = []string{""} }},
+		{"duplicate action", func(c *Config) { c.Routes[0].Admission.Tuples[0].Actions = []string{"labeled", "labeled"} }},
+		{"duplicate tuple", func(c *Config) {
+			c.Routes[0].Admission.Tuples = append(c.Routes[0].Admission.Tuples, c.Routes[0].Admission.Tuples[0])
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			cfg.Routes = append([]Route(nil), base.Routes...)
+			cfg.Routes[0].Admission.Tuples = append([]AdmissionTuple(nil), base.Routes[0].Admission.Tuples...)
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected tuple validation error")
+			}
+		})
+	}
+}

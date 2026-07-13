@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +20,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "recovery-metadata" {
+		if err := runRecoveryMetadata(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg, err := config.Load(envDefault("SIGNAL_GATEWAY_CONFIG", "configs/example.yaml"))
 	if err != nil {
@@ -54,7 +65,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer bus.Close()
-	consumer, err := bus.NewConsumer(eventbus.ConsumerConfig{Subject: cfg.Dispatcher.Subject, Durable: cfg.Dispatcher.Durable, AckWait: 30 * time.Second, MaxAckPending: 64, MaxDeliver: 10})
+	consumer, err := bus.NewConsumer(eventbus.ConsumerConfig{Subject: cfg.Dispatcher.Subject, Durable: cfg.Dispatcher.Durable, AckWait: 30 * time.Second, MaxAckPending: 64, MaxDeliver: 10, StartSequence: cfg.Dispatcher.RecoveryStartSequence})
 	if err != nil {
 		logger.Error("create dispatcher consumer failed", "error", err)
 		os.Exit(1)
@@ -81,6 +92,43 @@ func main() {
 		metrics.SetReady(true)
 		dispatcher.Process(ctx, logger, metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
+}
+
+func runRecoveryMetadata(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("recovery-metadata", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	database := flags.String("database", "", "dispatcher SQLite database path")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("usage: github-task-dispatcher recovery-metadata --database PATH: %w", err)
+	}
+	if *database == "" || flags.NArg() != 0 {
+		return errors.New("usage: github-task-dispatcher recovery-metadata --database PATH")
+	}
+	info, err := os.Stat(*database)
+	if err != nil {
+		return fmt.Errorf("stat dispatcher database: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("dispatcher database must be a regular file")
+	}
+	store, err := dispatcher.OpenStore(*database)
+	if err != nil {
+		return fmt.Errorf("open dispatcher database: %w", err)
+	}
+	defer store.Close()
+	schema, checkpoint, start, err := store.RecoveryMetadata(context.Background())
+	if err != nil {
+		return fmt.Errorf("read recovery metadata: %w", err)
+	}
+	return json.NewEncoder(output).Encode(struct {
+		SchemaVersion                  int    `json:"schema_version"`
+		LastPersistedJetStreamSequence uint64 `json:"last_persisted_jetstream_sequence"`
+		RecoveryStartSequence          uint64 `json:"recovery_start_sequence"`
+	}{
+		SchemaVersion:                  schema,
+		LastPersistedJetStreamSequence: checkpoint,
+		RecoveryStartSequence:          start,
+	})
 }
 func worker(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metrics, store *dispatcher.Store, broker *dispatcher.Broker) {
 	ticker := time.NewTicker(250 * time.Millisecond)

@@ -110,7 +110,7 @@ func TestStoreDeliveryAndSemanticDedupeAndRestart(t *testing.T) {
 
 func TestBrokerRequest(t *testing.T) {
 	var header, auth, path string
-	var body map[string]any
+	var bodies []map[string]any
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -118,14 +118,17 @@ func TestBrokerRequest(t *testing.T) {
 		auth = r.Header.Get("Authorization")
 		path = r.URL.Path
 		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
 		_ = json.Unmarshal(raw, &body)
+		bodies = append(bodies, body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"run-123","status":"running"}`))
 	}))
 	defer server.Close()
 	b := Broker{URL: server.URL + "/v1/launch-profiles/codex-issue-implement/launch", Token: "token", Client: server.Client()}
 	job := Job{Repository: Repository, IssueNumber: 9, DeliveryID: "abc"}
-	for i := 0; i < 2; i++ {
+	for i, deliveryID := range []string{"first-label-delivery", "later-relabel-delivery"} {
+		job.DeliveryID = deliveryID
 		result, err := b.Launch(context.Background(), job)
 		if err != nil || result.RunID != "run-123" {
 			t.Fatalf("launch %d result=%+v err=%v", i+1, result, err)
@@ -137,9 +140,9 @@ func TestBrokerRequest(t *testing.T) {
 	if header != "github-task-dispatcher:v2:grubbyhacker/apple-jobs-matcher:issue:9:codex-issue-implement" || auth != "Bearer token" {
 		t.Fatalf("headers %q %q", header, auth)
 	}
-	want := map[string]any{"parameters": map[string]any{"issue_number": float64(9), "source_delivery_id": "abc"}}
-	if !reflect.DeepEqual(body, want) {
-		t.Fatalf("body=%#v", body)
+	want := map[string]any{"parameters": map[string]any{"issue_number": float64(9), "source_delivery_id": brokerSourceID(job)}}
+	if len(bodies) != 2 || !reflect.DeepEqual(bodies[0], want) || !reflect.DeepEqual(bodies[1], want) {
+		t.Fatalf("bodies=%#v", bodies)
 	}
 }
 
@@ -167,15 +170,139 @@ type launchSequence struct {
 	statuses     []RunStatus
 	statusErrors []error
 	statusCalls  int
+	jobs         []Job
 }
 
-func (l *launchSequence) Launch(context.Context, Job) (LaunchResult, error) {
+func (l *launchSequence) Launch(_ context.Context, job Job) (LaunchResult, error) {
+	l.jobs = append(l.jobs, job)
 	var err error
 	if l.calls < len(l.errors) {
 		err = l.errors[l.calls]
 	}
 	l.calls++
 	return LaunchResult{RunID: "run-sequence"}, err
+}
+
+func TestLaunchRetryNeverLeapfrogsOldestJob(t *testing.T) {
+	ctx := context.Background()
+	started := time.Unix(20_000, 0)
+	s, err := OpenStore(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	first, _ := Select(validSignal("first-delivery", 1))
+	second, _ := Select(validSignal("second-delivery", 2))
+	if err := s.Record(ctx, first.DeliveryID, "accepted", 1, &first, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(ctx, second.DeliveryID, "accepted", 2, &second, started.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	retry := BrokerError{Transport: true, Message: "unavailable"}
+	broker := &launchSequence{errors: make([]error, 100)}
+	for i := range broker.errors {
+		broker.errors[i] = retry
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	metrics := NewMetrics()
+	if worked, err := RunOne(ctx, logger, metrics, s, broker, started); err != nil || !worked {
+		t.Fatalf("first attempt worked=%v err=%v", worked, err)
+	}
+	if worked, err := RunOne(ctx, logger, metrics, s, broker, started.Add(time.Second)); err != nil || worked {
+		t.Fatalf("retry wait must block second job: worked=%v err=%v", worked, err)
+	}
+	for {
+		var state string
+		var dueMillis int64
+		if err := s.db.QueryRow(`SELECT status,due_at FROM jobs WHERE issue_number=1`).Scan(&state, &dueMillis); err != nil {
+			t.Fatal(err)
+		}
+		if state == StateFailed {
+			break
+		}
+		at := time.UnixMilli(dueMillis)
+		if worked, err := RunOne(ctx, logger, metrics, s, broker, at); err != nil || !worked {
+			t.Fatalf("retry at %s worked=%v err=%v", at, worked, err)
+		}
+	}
+	for _, launched := range broker.jobs {
+		if launched.IssueNumber != 1 {
+			t.Fatalf("issue %d leapfrogged during retry lifecycle", launched.IssueNumber)
+		}
+	}
+	boundary := started.Add(LaunchRetryWindow)
+	if worked, err := RunOne(ctx, logger, metrics, s, broker, boundary); err != nil || !worked {
+		t.Fatalf("second launch after terminal transition worked=%v err=%v", worked, err)
+	}
+	if got := broker.jobs[len(broker.jobs)-1].IssueNumber; got != 2 {
+		t.Fatalf("last launched issue=%d want=2", got)
+	}
+}
+
+func TestRecoveryMetadataContractAndReplay(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema, checkpoint, start, err := s.RecoveryMetadata(ctx)
+	if err != nil || schema != SchemaVersion || checkpoint != 0 || start != 1 {
+		t.Fatalf("empty metadata schema=%d checkpoint=%d start=%d err=%v", schema, checkpoint, start, err)
+	}
+	first, _ := Select(validSignal("original-delivery", 19))
+	if err := s.Record(ctx, first.DeliveryID, "accepted", 40, &first, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	relabel, _ := Select(validSignal("relabel-after-restore", 19))
+	if err := s.Record(ctx, relabel.DeliveryID, "accepted", 44, &relabel, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	schema, checkpoint, start, err = s.RecoveryMetadata(ctx)
+	if err != nil || schema != SchemaVersion || checkpoint != 44 || start != 45 {
+		t.Fatalf("restored metadata schema=%d checkpoint=%d start=%d err=%v", schema, checkpoint, start, err)
+	}
+	var storedDelivery string
+	if err := s.db.QueryRow(`SELECT source_delivery_id FROM jobs`).Scan(&storedDelivery); err != nil || storedDelivery != first.DeliveryID {
+		t.Fatalf("audit delivery=%q err=%v", storedDelivery, err)
+	}
+	if brokerSourceID(Job{Repository: Repository, IssueNumber: 19, DeliveryID: first.DeliveryID}) != brokerSourceID(Job{Repository: Repository, IssueNumber: 19, DeliveryID: relabel.DeliveryID}) {
+		t.Fatal("broker fingerprint field changed across restored replay")
+	}
+}
+
+func TestLifecycleUpdatesRejectUnexpectedState(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(30_000, 0)
+	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
+	defer s.Close()
+	candidate, _ := Select(validSignal("lifecycle", 3))
+	_ = s.Record(ctx, candidate.DeliveryID, "accepted", 1, &candidate, now)
+	work, ok, err := s.ClaimDue(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if err := s.MarkLaunched(ctx, work.Job.ID, "run", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkLaunchFailure(ctx, work.Job.ID, true, now, "stale", now); err == nil {
+		t.Fatal("stale launch failure update succeeded")
+	}
+	if err := s.MarkStatus(ctx, work.Job.ID, StateCompleted, now, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkStatus(ctx, work.Job.ID, StateFailed, now, "stale", now); err == nil {
+		t.Fatal("stale status update succeeded")
+	}
 }
 
 func TestLaunchRetrySchedule(t *testing.T) {

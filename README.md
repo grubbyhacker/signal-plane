@@ -57,7 +57,9 @@ is `POST dispatcher.broker_url` with this fixed shape:
 It requires `broker_token_env` and uses `Authorization: Bearer ...`; it
 sets the semantic `Idempotency-Key`
 `github-task-dispatcher:v2:<repo>:issue:<issue-number>:codex-issue-implement`;
-the delivery ID remains in the bounded request for audit correlation. Transport
+the broker's required `source_delivery_id` parameter is a stable semantic hash
+of repository, issue, and profile. The real GitHub delivery ID remains only in
+SQLite for audit correlation. Transport
 failures, HTTP 429/5xx, and structured `profile_busy` responses use a durable,
 deterministic 2s/4s/8s/16s/20s launch retry schedule for at most ten minutes.
 Other errors, including `idempotency_conflict` and malformed success responses,
@@ -72,8 +74,9 @@ stored immediately. The single worker then polls only scoped
 reaches `completed`, `failed`, or `timed_out`.
 
 Every recorded delivery includes its JetStream stream sequence. After restoring
-SQLite, operators can call `Store.RecoverySequence` and create a new durable via
-`eventbus.ConsumerConfig.StartSequence`; recovery start positions are immutable,
+SQLite, operators can run `github-task-dispatcher recovery-metadata --database PATH`
+and set the reported `recovery_start_sequence` in dispatcher configuration while
+choosing a new `durable` name. Recovery start positions are immutable,
 so the library rejects attempts to retarget an existing durable.
 
 ## Development

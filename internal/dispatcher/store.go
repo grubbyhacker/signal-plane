@@ -11,6 +11,8 @@ import (
 )
 
 const (
+	SchemaVersion      = 1
+	checkpointKey      = "last_persisted_jetstream_sequence"
 	StatePendingLaunch = "pending_launch"
 	StateLaunchRetry   = "launch_retry"
 	StateLaunched      = "launched"
@@ -53,10 +55,21 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	var existingVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&existingVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read sqlite schema version: %w", err)
+	}
+	if existingVersion > SchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("sqlite schema version %d is newer than supported version %d", existingVersion, SchemaVersion)
+	}
 	statements := []string{
 		`PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`, `PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS deliveries (delivery_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, semantic_key TEXT, stream_sequence INTEGER NOT NULL DEFAULT 0, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS dispatcher_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
+		`INSERT INTO dispatcher_metadata(key,value) VALUES('last_persisted_jetstream_sequence',0) ON CONFLICT(key) DO NOTHING`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -80,6 +93,8 @@ func OpenStore(path string) (*Store, error) {
 		`UPDATE jobs SET status='launched' WHERE status='succeeded' AND broker_run_id<>''`,
 		`UPDATE jobs SET status='failed' WHERE status IN ('succeeded','terminal')`,
 		`CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at)`,
+		`UPDATE dispatcher_metadata SET value=MAX(value,(SELECT COALESCE(MAX(stream_sequence),0) FROM deliveries)) WHERE key='last_persisted_jetstream_sequence'`,
+		`PRAGMA user_version=1`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -147,6 +162,9 @@ func (s *Store) Record(ctx context.Context, deliveryID, outcome string, streamSe
 			return err
 		}
 		if inserted == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE dispatcher_metadata SET value=MAX(value,?) WHERE key=?`, streamSequence, checkpointKey); err != nil {
+				return err
+			}
 			return tx.Commit()
 		}
 	}
@@ -155,6 +173,9 @@ func (s *Store) Record(ctx context.Context, deliveryID, outcome string, streamSe
 		if err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatcher_metadata SET value=MAX(value,?) WHERE key=?`, streamSequence, checkpointKey); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -166,8 +187,8 @@ func nullable(value string) any {
 	return value
 }
 
-// ClaimDue serializes the lifecycle. Any nonterminal broker run blocks all new
-// launches, even while its next status poll is not due.
+// ClaimDue serializes the lifecycle by creation order. The oldest nonterminal
+// job blocks every later job, including while a launch retry is not due.
 func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -177,27 +198,22 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	var job Job
 	var first sql.NullInt64
 	var due int64
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status=? ORDER BY id LIMIT 1`, StateLaunched).
-		Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
-	if err == nil {
-		if first.Valid {
-			job.FirstAttemptAt = time.UnixMilli(first.Int64)
-		}
-		if due > now.UnixMilli() {
-			return Work{}, false, nil
-		}
-		return Work{Kind: WorkStatus, Job: job}, true, tx.Commit()
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return Work{}, false, err
-	}
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?) AND due_at<=? ORDER BY due_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, now.UnixMilli()).
+	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched).
 		Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Work{}, false, nil
 	}
 	if err != nil {
 		return Work{}, false, err
+	}
+	if first.Valid {
+		job.FirstAttemptAt = time.UnixMilli(first.Int64)
+	}
+	if due > now.UnixMilli() {
+		return Work{}, false, nil
+	}
+	if job.Status == StateLaunched {
+		return Work{Kind: WorkStatus, Job: job}, true, tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE jobs SET attempts=attempts+1,first_launch_attempt_at=COALESCE(first_launch_attempt_at,?),updated_at=? WHERE id=? AND status IN (?,?)`, now.UnixMilli(), now.UnixMilli(), job.ID, StatePendingLaunch, StateLaunchRetry)
 	if err != nil {
@@ -220,8 +236,8 @@ func (s *Store) MarkLaunched(ctx context.Context, id int64, brokerRunID string, 
 	if brokerRunID == "" {
 		return errors.New("broker run id is required")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,broker_run_id=?,due_at=?,updated_at=?,last_error='' WHERE id=?`, StateLaunched, brokerRunID, due.UnixMilli(), now.UnixMilli(), id)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,broker_run_id=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?)`, StateLaunched, brokerRunID, due.UnixMilli(), now.UnixMilli(), id, StatePendingLaunch, StateLaunchRetry)
+	return expectOne(result, err, "mark launched")
 }
 
 func (s *Store) MarkLaunchFailure(ctx context.Context, id int64, retry bool, due time.Time, message string, now time.Time) error {
@@ -229,21 +245,46 @@ func (s *Store) MarkLaunchFailure(ctx context.Context, id int64, retry bool, due
 	if retry {
 		status = StateLaunchRetry
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=?`, status, due.UnixMilli(), message, now.UnixMilli(), id)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=? AND status IN (?,?)`, status, due.UnixMilli(), message, now.UnixMilli(), id, StatePendingLaunch, StateLaunchRetry)
+	return expectOne(result, err, "mark launch failure")
 }
 
 func (s *Store) MarkStatus(ctx context.Context, id int64, status string, due time.Time, message string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=?`, status, due.UnixMilli(), message, now.UnixMilli(), id)
-	return err
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=? AND status=?`, status, due.UnixMilli(), message, now.UnixMilli(), id, StateLaunched)
+	return expectOne(result, err, "mark status")
+}
+
+func expectOne(result sql.Result, err error, operation string) error {
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("%s: expected one lifecycle row, updated %d", operation, rows)
+	}
+	return nil
 }
 
 func (s *Store) RecoverySequence(ctx context.Context) (uint64, error) {
-	var sequence uint64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(stream_sequence),0)+1 FROM deliveries`).Scan(&sequence); err != nil {
+	var checkpoint uint64
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM dispatcher_metadata WHERE key=?`, checkpointKey).Scan(&checkpoint); err != nil {
 		return 0, err
 	}
-	return sequence, nil
+	return checkpoint + 1, nil
+}
+
+func (s *Store) RecoveryMetadata(ctx context.Context) (schemaVersion int, checkpoint, startSequence uint64, err error) {
+	if err = s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
+		return
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT value FROM dispatcher_metadata WHERE key=?`, checkpointKey).Scan(&checkpoint); err != nil {
+		return
+	}
+	startSequence = checkpoint + 1
+	return
 }
 
 type StoreStats struct {

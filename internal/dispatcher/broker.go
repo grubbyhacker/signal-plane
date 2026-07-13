@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,7 +51,7 @@ func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 	}{Parameters: struct {
 		IssueNumber      int64  `json:"issue_number"`
 		SourceDeliveryID string `json:"source_delivery_id"`
-	}{job.IssueNumber, job.DeliveryID}})
+	}{job.IssueNumber, brokerSourceID(job)}})
 	if err != nil {
 		return LaunchResult{}, permanentMalformed("encode broker launch request", err)
 	}
@@ -71,6 +72,14 @@ func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 		return LaunchResult{}, permanentMalformed("broker launch response is missing run_id", nil)
 	}
 	return result, nil
+}
+
+// brokerSourceID is deliberately semantic rather than a GitHub delivery ID.
+// Every field in the broker's idempotency fingerprint must remain identical
+// for relabels and restored-database replay of the same repository issue.
+func brokerSourceID(job Job) string {
+	stable := fmt.Sprintf("%s\x00%d\x00%s", job.Repository, job.IssueNumber, Profile)
+	return fmt.Sprintf("github-task-dispatcher-v2-%x", sha256.Sum256([]byte(stable)))
 }
 
 func (b *Broker) Status(ctx context.Context, runID string) (RunStatus, error) {
