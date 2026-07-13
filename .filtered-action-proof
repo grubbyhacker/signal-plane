@@ -1,1 +1,2 @@
 Disposable proof that pull_request.closed is acknowledged without publishing.
+Second commit emits pull_request.synchronize after hook-secret restoration.
