@@ -49,19 +49,29 @@ func TestReadinessRequiresInspectableBus(t *testing.T) {
 func TestMetricsUseBoundedSourceAndReasonLabels(t *testing.T) {
 	server := New(slog.Default(), nil, &capturePublisher{})
 	server.metrics.add(config.Route{ID: "known-route", Source: "untrusted"}, "surprise", "arbitrary")
+	server.metrics.add(config.Route{ID: "github", Source: "github"}, "ignored", "action_filtered")
 	metrics, err := server.metrics.registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, metric := range metrics {
 		if metric.GetName() == "signal_gateway_requests_total" {
-			labels := metric.Metric[0].Label
-			got := map[string]string{}
-			for _, label := range labels {
-				got[label.GetName()] = label.GetValue()
+			foundOther := false
+			foundFiltered := false
+			for _, sample := range metric.Metric {
+				got := map[string]string{}
+				for _, label := range sample.Label {
+					got[label.GetName()] = label.GetValue()
+				}
+				if got["source"] == "other" && got["result"] == "other" && got["reason"] == "other" {
+					foundOther = true
+				}
+				if got["source"] == "github" && got["result"] == "ignored" && got["reason"] == "action_filtered" {
+					foundFiltered = true
+				}
 			}
-			if got["source"] != "other" || got["result"] != "other" || got["reason"] != "other" {
-				t.Fatalf("labels = %#v", got)
+			if !foundOther || !foundFiltered {
+				t.Fatalf("expected bounded other and action_filtered metric samples")
 			}
 			return
 		}

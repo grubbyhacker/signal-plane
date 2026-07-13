@@ -325,7 +325,7 @@ func boundedResult(value string) string {
 }
 func boundedReason(value string) string {
 	switch value {
-	case "", "ping", "invalid_body", "unknown_source", "missing_manual_token", "bad_manual_token", "missing_github_secret", "bad_github_signature", "invalid_github_payload", "repository_not_allowed", "event_not_allowed", "action_not_allowed", "publish_failed", "rejected":
+	case "", "ping", "action_filtered", "invalid_body", "unknown_source", "missing_manual_token", "bad_manual_token", "missing_github_secret", "bad_github_signature", "invalid_github_payload", "repository_not_allowed", "event_not_allowed", "action_not_allowed", "publish_failed", "rejected":
 		return value
 	}
 	return "other"
