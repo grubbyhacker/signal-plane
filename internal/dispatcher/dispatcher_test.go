@@ -3,13 +3,13 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,13 +75,13 @@ func TestStoreDeliveryAndSemanticDedupeAndRestart(t *testing.T) {
 	}
 	a, _ := Select(validSignal("delivery-1", 42))
 	b, _ := Select(validSignal("delivery-2", 42))
-	if err := s.Record(ctx, a.DeliveryID, "accepted", &a, now); err != nil {
+	if err := s.Record(ctx, a.DeliveryID, "accepted", 10, &a, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Record(ctx, a.DeliveryID, "accepted", &a, now); err != nil {
+	if err := s.Record(ctx, a.DeliveryID, "accepted", 10, &a, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Record(ctx, b.DeliveryID, "accepted", &b, now); err != nil {
+	if err := s.Record(ctx, b.DeliveryID, "accepted", 11, &b, now); err != nil {
 		t.Fatal(err)
 	}
 	deliveries, jobs, err := s.Counts(ctx)
@@ -98,9 +98,13 @@ func TestStoreDeliveryAndSemanticDedupeAndRestart(t *testing.T) {
 	if err != nil || deliveries != 2 || jobs != 1 {
 		t.Fatalf("restart counts=%d,%d err=%v", deliveries, jobs, err)
 	}
-	job, ok, err := s.ClaimDue(ctx, now)
-	if err != nil || !ok || job.DeliveryID != "delivery-1" {
-		t.Fatalf("job=%+v ok=%v err=%v", job, ok, err)
+	work, ok, err := s.ClaimDue(ctx, now)
+	if err != nil || !ok || work.Job.DeliveryID != "delivery-1" {
+		t.Fatalf("work=%+v ok=%v err=%v", work, ok, err)
+	}
+	sequence, err := s.RecoverySequence(ctx)
+	if err != nil || sequence != 12 {
+		t.Fatalf("recovery sequence=%d err=%v", sequence, err)
 	}
 }
 
@@ -130,7 +134,7 @@ func TestBrokerRequest(t *testing.T) {
 	if calls != 2 || path != "/v1/launch-profiles/codex-issue-implement/launch" {
 		t.Fatalf("calls=%d path=%q", calls, path)
 	}
-	if header != "github-task-dispatcher:v1:grubbyhacker/apple-jobs-matcher:delivery:abc:codex-issue-implement" || auth != "Bearer token" {
+	if header != "github-task-dispatcher:v2:grubbyhacker/apple-jobs-matcher:issue:9:codex-issue-implement" || auth != "Bearer token" {
 		t.Fatalf("headers %q %q", header, auth)
 	}
 	want := map[string]any{"parameters": map[string]any{"issue_number": float64(9), "source_delivery_id": "abc"}}
@@ -150,19 +154,197 @@ func TestBrokerRejectsInvalidSuccessResponses(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected invalid response error")
 			}
+			if IsRetryable(err) {
+				t.Fatalf("malformed success must fail immediately: %v", err)
+			}
 		})
 	}
 }
 
 type launchSequence struct {
-	errors []error
-	calls  int
+	errors       []error
+	calls        int
+	statuses     []RunStatus
+	statusErrors []error
+	statusCalls  int
 }
 
 func (l *launchSequence) Launch(context.Context, Job) (LaunchResult, error) {
-	err := l.errors[l.calls]
+	var err error
+	if l.calls < len(l.errors) {
+		err = l.errors[l.calls]
+	}
 	l.calls++
 	return LaunchResult{RunID: "run-sequence"}, err
+}
+
+func TestLaunchRetrySchedule(t *testing.T) {
+	want := []time.Duration{2, 4, 8, 16, 20, 20}
+	for i, seconds := range want {
+		if got := LaunchRetryDelay(i + 1); got != seconds*time.Second {
+			t.Fatalf("attempt %d delay=%s want=%s", i+1, got, seconds*time.Second)
+		}
+	}
+}
+
+func TestBrokerRetryClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		retryable bool
+	}{
+		{"rate limited", 429, `{}`, true},
+		{"server error", 503, `{}`, true},
+		{"profile busy", 409, `{"error":{"code":"profile_busy","message":"busy"}}`, true},
+		{"authentication", 401, `{}`, false},
+		{"authorization", 403, `{}`, false},
+		{"validation", 422, `{}`, false},
+		{"idempotency conflict", 409, `{"code":"idempotency_conflict","message":"different request"}`, false},
+		{"other permanent", 418, `{}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			_, err := (&Broker{URL: server.URL, Client: server.Client()}).Launch(context.Background(), Job{})
+			if err == nil || IsRetryable(err) != tt.retryable {
+				t.Fatalf("error=%v retryable=%v", err, IsRetryable(err))
+			}
+		})
+	}
+	if !IsRetryable(BrokerError{Transport: true, Message: "network"}) {
+		t.Fatal("transport failure must retry")
+	}
+}
+
+func TestStatusLifecycleSerializesLaunches(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(3000, 0)
+	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
+	defer s.Close()
+	first, _ := Select(validSignal("first", 1))
+	second, _ := Select(validSignal("second", 2))
+	_ = s.Record(ctx, "first", "accepted", 1, &first, now)
+	_ = s.Record(ctx, "second", "accepted", 2, &second, now)
+	broker := &launchSequence{statuses: []RunStatus{{RunID: "run-sequence", Status: "running"}, {RunID: "run-sequence", Status: "completed"}}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	metrics := NewMetrics()
+	late := now.Add(11 * time.Minute)
+	for _, at := range []time.Time{now, late, late.Add(2 * time.Second)} {
+		if worked, err := RunOne(ctx, logger, metrics, s, broker, at); err != nil || !worked {
+			t.Fatalf("at=%s worked=%v err=%v", at, worked, err)
+		}
+	}
+	if broker.calls != 1 || broker.statusCalls != 2 {
+		t.Fatalf("launches=%d status calls=%d", broker.calls, broker.statusCalls)
+	}
+	if worked, err := RunOne(ctx, logger, metrics, s, broker, late.Add(2*time.Second)); err != nil || !worked {
+		t.Fatalf("second launch worked=%v err=%v", worked, err)
+	}
+	if broker.calls != 2 {
+		t.Fatalf("launches=%d want=2", broker.calls)
+	}
+}
+
+func TestBrokerTerminalStatusMapping(t *testing.T) {
+	for _, tt := range []struct{ broker, stored string }{
+		{"completed", StateCompleted},
+		{"failed", StateFailed},
+		{"timed_out", StateTimedOut},
+	} {
+		t.Run(tt.broker, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Unix(3500, 0)
+			s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
+			defer s.Close()
+			candidate, _ := Select(validSignal("terminal", 3))
+			_ = s.Record(ctx, "terminal", "accepted", 1, &candidate, now)
+			broker := &launchSequence{statuses: []RunStatus{{RunID: "run-sequence", Status: tt.broker}}}
+			metrics := NewMetrics()
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			_, _ = RunOne(ctx, logger, metrics, s, broker, now)
+			_, _ = RunOne(ctx, logger, metrics, s, broker, now.Add(StatusPollInterval))
+			var state string
+			if err := s.db.QueryRow(`SELECT status FROM jobs`).Scan(&state); err != nil || state != tt.stored {
+				t.Fatalf("state=%s err=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestCrashBeforeLaunchResponseReplaysSameSemanticJob(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(4000, 0)
+	path := filepath.Join(t.TempDir(), "db")
+	s, _ := OpenStore(path)
+	candidate, _ := Select(validSignal("audit-delivery", 8))
+	_ = s.Record(ctx, candidate.DeliveryID, "accepted", 7, &candidate, now)
+	if work, ok, err := s.ClaimDue(ctx, now); err != nil || !ok || work.Job.Attempts != 1 {
+		t.Fatalf("claim before crash=%+v ok=%v err=%v", work, ok, err)
+	}
+	_ = s.Close()
+	s, _ = OpenStore(path)
+	defer s.Close()
+	broker := &launchSequence{}
+	if worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), s, broker, now); err != nil || !worked {
+		t.Fatalf("replay worked=%v err=%v", worked, err)
+	}
+	var attempts int
+	var status string
+	_ = s.db.QueryRow(`SELECT attempts,status FROM jobs`).Scan(&attempts, &status)
+	if attempts != 2 || status != StateLaunched || broker.calls != 1 {
+		t.Fatalf("attempts=%d status=%s launches=%d", attempts, status, broker.calls)
+	}
+}
+
+func TestBrokerStatusUsesOnlyScopedRunEndpoint(t *testing.T) {
+	var method, path, auth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path, auth = r.Method, r.URL.EscapedPath(), r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"run_id":"run/123","status":"running"}`))
+	}))
+	defer server.Close()
+	broker := &Broker{URL: server.URL + "/v1/launch-profiles/codex-issue-implement/launch", Token: "token", Client: server.Client()}
+	result, err := broker.Status(context.Background(), "run/123")
+	if err != nil || result.Status != "running" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if method != http.MethodGet || path != "/v1/runs/run%2F123" || auth != "Bearer token" {
+		t.Fatalf("method=%s path=%s auth=%s", method, path, auth)
+	}
+}
+
+func TestDisabledStandbyHealthAndReadiness(t *testing.T) {
+	metrics := NewMetrics()
+	metrics.SetDisabled()
+	for _, tt := range []struct {
+		path       string
+		statusCode int
+		body       string
+	}{{"/healthz", 200, "ok"}, {"/readyz", 503, "disabled"}} {
+		recorder := httptest.NewRecorder()
+		metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tt.path, nil))
+		if recorder.Code != tt.statusCode || !strings.Contains(recorder.Body.String(), tt.body) {
+			t.Fatalf("%s code=%d body=%q", tt.path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func (l *launchSequence) Status(context.Context, string) (RunStatus, error) {
+	var result RunStatus
+	if l.statusCalls < len(l.statuses) {
+		result = l.statuses[l.statusCalls]
+	}
+	var err error
+	if l.statusCalls < len(l.statusErrors) {
+		err = l.statusErrors[l.statusCalls]
+	}
+	l.statusCalls++
+	return result, err
 }
 
 func TestRetriesAndTerminalErrors(t *testing.T) {
@@ -174,14 +356,14 @@ func TestRetriesAndTerminalErrors(t *testing.T) {
 		name      string
 		launchErr error
 		terminal  bool
-	}{{"transient", errors.New("network"), false}, {"4xx", BrokerError{Status: 400, Message: "bad config"}, true}} {
+	}{{"transient", BrokerError{Transport: true, Message: "network"}, false}, {"4xx", BrokerError{Status: 400, Message: "bad config"}, true}} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 			defer s.Close()
 			c, _ := Select(validSignal("d", 1))
-			_ = s.Record(ctx, "d", "accepted", &c, now)
+			_ = s.Record(ctx, "d", "accepted", 1, &c, now)
 			launcher := &launchSequence{errors: []error{tt.launchErr}}
-			worked, err := RunOne(ctx, logger, metrics, s, launcher, now, 5)
+			worked, err := RunOne(ctx, logger, metrics, s, launcher, now)
 			if err != nil || !worked {
 				t.Fatal(err)
 			}
@@ -189,9 +371,9 @@ func TestRetriesAndTerminalErrors(t *testing.T) {
 			if err := s.db.QueryRow(`SELECT status FROM jobs`).Scan(&status); err != nil {
 				t.Fatal(err)
 			}
-			want := "retry"
+			want := StateLaunchRetry
 			if tt.terminal {
-				want = "terminal"
+				want = StateFailed
 			}
 			if status != want {
 				t.Fatalf("status=%s", status)
@@ -209,43 +391,46 @@ func TestSuccessfulLaunchRecordsBrokerRunID(t *testing.T) {
 	}
 	defer s.Close()
 	c, _ := Select(validSignal("success", 5))
-	if err := s.Record(ctx, "success", "accepted", &c, now); err != nil {
+	if err := s.Record(ctx, "success", "accepted", 1, &c, now); err != nil {
 		t.Fatal(err)
 	}
 	launcher := &launchSequence{errors: []error{nil}}
-	if worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), s, launcher, now, 5); err != nil || !worked {
+	if worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), s, launcher, now); err != nil || !worked {
 		t.Fatalf("worked=%v err=%v", worked, err)
 	}
 	var status, runID string
 	if err := s.db.QueryRow(`SELECT status,broker_run_id FROM jobs`).Scan(&status, &runID); err != nil {
 		t.Fatal(err)
 	}
-	if status != "succeeded" || runID != "run-sequence" {
+	if status != StateLaunched || runID != "run-sequence" {
 		t.Fatalf("status=%q broker_run_id=%q", status, runID)
 	}
 }
 
-func TestTransientRetriesStopAtBound(t *testing.T) {
+func TestTransientRetriesStopAtDurableWindow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(2000, 0)
 	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 	defer s.Close()
 	c, _ := Select(validSignal("bounded", 2))
-	_ = s.Record(ctx, "bounded", "accepted", &c, now)
-	launcher := &launchSequence{errors: []error{errors.New("one"), errors.New("two")}}
+	_ = s.Record(ctx, "bounded", "accepted", 1, &c, now)
+	launcher := &launchSequence{errors: []error{BrokerError{Transport: true, Message: "one"}}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metrics := NewMetrics()
-	if worked, err := RunOne(ctx, logger, metrics, s, launcher, now, 2); err != nil || !worked {
+	if worked, err := RunOne(ctx, logger, metrics, s, launcher, now); err != nil || !worked {
 		t.Fatal(err)
 	}
-	if worked, err := RunOne(ctx, logger, metrics, s, launcher, now.Add(time.Second), 2); err != nil || !worked {
+	if _, err := s.db.Exec(`UPDATE jobs SET due_at=?`, now.Add(LaunchRetryWindow).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if worked, err := RunOne(ctx, logger, metrics, s, launcher, now.Add(LaunchRetryWindow)); err != nil || !worked {
 		t.Fatal(err)
 	}
 	var status string
 	if err := s.db.QueryRow(`SELECT status FROM jobs`).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != "terminal" || launcher.calls != 2 {
+	if status != StateFailed || launcher.calls != 1 {
 		t.Fatalf("status=%s calls=%d", status, launcher.calls)
 	}
 }
@@ -253,11 +438,13 @@ func TestTransientRetriesStopAtBound(t *testing.T) {
 type fakeDelivery struct {
 	data          []byte
 	acked, termed bool
+	sequence      uint64
 }
 
-func (d *fakeDelivery) Data() []byte   { return d.data }
-func (d *fakeDelivery) AckSync() error { d.acked = true; return nil }
-func (d *fakeDelivery) Term() error    { d.termed = true; return nil }
+func (d *fakeDelivery) Data() []byte                    { return d.data }
+func (d *fakeDelivery) StreamSequence() (uint64, error) { return d.sequence, nil }
+func (d *fakeDelivery) AckSync() error                  { d.acked = true; return nil }
+func (d *fakeDelivery) Term() error                     { d.termed = true; return nil }
 
 func TestIrrelevantValidDeliveryIsMinimallyRecordedAndAcked(t *testing.T) {
 	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
@@ -265,7 +452,7 @@ func TestIrrelevantValidDeliveryIsMinimallyRecordedAndAcked(t *testing.T) {
 	signal := validSignal("irrelevant", 3)
 	signal.Meta.SourceAction = "closed"
 	data, _ := json.Marshal(signal)
-	d := &fakeDelivery{data: data}
+	d := &fakeDelivery{data: data, sequence: 1}
 	if !Process(context.Background(), slog.Default(), NewMetrics(), s, d, time.Unix(1, 0)) || !d.acked {
 		t.Fatal("not acknowledged")
 	}

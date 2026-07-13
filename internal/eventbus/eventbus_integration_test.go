@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -59,6 +60,11 @@ func TestGitHubDispatcherFileJetStreamEndToEndAndPublishDedupe(t *testing.T) {
 	if consumerInfo.NumAckPending != 0 {
 		t.Fatalf("ack pending = %d", consumerInfo.NumAckPending)
 	}
+	recoverySequence, err := store.RecoverySequence(context.Background())
+	metadata, metadataErr := msg.Metadata()
+	if err != nil || metadataErr != nil || recoverySequence != metadata.Sequence.Stream+1 {
+		t.Fatalf("recovery sequence=%d err=%v", recoverySequence, err)
+	}
 }
 
 const (
@@ -106,6 +112,34 @@ func TestNewObserverConsumerCreatesDurable(t *testing.T) {
 	defer consumer.sub.Unsubscribe()
 
 	assertObserverConsumerConfig(t, bus, testDurable)
+}
+
+func TestRecoveryConsumerStartsAfterSQLiteCheckpoint(t *testing.T) {
+	bus := newIntegrationBus(t)
+	for i := 1; i <= 3; i++ {
+		signal := envelope.Signal{Meta: envelope.Meta{SourceDeliveryID: fmt.Sprintf("recovery-%d", i)}}
+		if err := bus.Publish(testSubject, signal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	consumer, err := bus.NewConsumer(ConsumerConfig{Subject: testSubject, Durable: "dispatcher-recovery", AckWait: time.Second, MaxAckPending: 1, MaxDeliver: 3, StartSequence: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := consumer.Fetch(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := msg.Metadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Sequence.Stream != 2 {
+		t.Fatalf("stream sequence=%d", metadata.Sequence.Stream)
+	}
+	if _, err := bus.NewConsumer(ConsumerConfig{Subject: testSubject, Durable: "dispatcher-recovery", AckWait: time.Second, MaxAckPending: 1, MaxDeliver: 3, StartSequence: 3}); err == nil {
+		t.Fatal("expected immutable recovery start rejection")
+	}
 }
 
 func newIntegrationBus(t *testing.T) *Bus {

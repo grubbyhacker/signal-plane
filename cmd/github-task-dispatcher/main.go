@@ -22,9 +22,14 @@ func main() {
 		logger.Error("load config failed", "error", err)
 		os.Exit(1)
 	}
+	metrics := dispatcher.NewMetrics()
 	if !cfg.Dispatcher.Enabled {
-		logger.Info("github-task-dispatcher disabled by configuration", "version", buildinfo.Version)
-		return
+		metrics.SetDisabled()
+		logger.Info("github-task-dispatcher disabled; entering standby", "version", buildinfo.Version, "addr", cfg.Dispatcher.Addr)
+		if err := http.ListenAndServe(cfg.Dispatcher.Addr, metrics.Handler()); err != nil {
+			logger.Error("dispatcher standby HTTP listener exited", "error", err)
+			os.Exit(1)
+		}
 	}
 	token := os.Getenv(cfg.Dispatcher.BrokerTokenEnv)
 	if token == "" {
@@ -37,7 +42,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
-	metrics := dispatcher.NewMetrics()
 	go func() {
 		logger.Info("starting dispatcher HTTP listener", "addr", cfg.Dispatcher.Addr)
 		if err := http.ListenAndServe(cfg.Dispatcher.Addr, metrics.Handler()); err != nil {
@@ -58,10 +62,8 @@ func main() {
 	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, Client: &http.Client{Timeout: 30 * time.Second}}
 	ctx := context.Background()
 	metrics.SetReady(true)
-	for i := 0; i < cfg.Dispatcher.Workers; i++ {
-		go worker(ctx, logger, metrics, store, broker, cfg.Dispatcher.MaxAttempts)
-	}
-	logger.Info("starting github-task-dispatcher", "version", buildinfo.Version, "durable", cfg.Dispatcher.Durable, "workers", cfg.Dispatcher.Workers)
+	go worker(ctx, logger, metrics, store, broker)
+	logger.Info("starting github-task-dispatcher", "version", buildinfo.Version, "durable", cfg.Dispatcher.Durable, "workers", 1)
 	for {
 		msg, err := consumer.Fetch(2 * time.Second)
 		if errors.Is(err, nats.ErrTimeout) {
@@ -80,7 +82,7 @@ func main() {
 		dispatcher.Process(ctx, logger, metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
 }
-func worker(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metrics, store *dispatcher.Store, broker *dispatcher.Broker, max int) {
+func worker(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metrics, store *dispatcher.Store, broker *dispatcher.Broker) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -89,7 +91,7 @@ func worker(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metric
 			return
 		case now := <-ticker.C:
 			for {
-				worked, err := dispatcher.RunOne(ctx, logger, metrics, store, broker, now.UTC(), max)
+				worked, err := dispatcher.RunOne(ctx, logger, metrics, store, broker, now.UTC())
 				if err != nil {
 					logger.Error("run due job failed", "error", err)
 					break
@@ -97,6 +99,9 @@ func worker(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metric
 				if !worked {
 					break
 				}
+			}
+			if err := metrics.Refresh(ctx, store, now.UTC()); err != nil {
+				logger.Error("refresh dispatcher metrics failed", "error", err)
 			}
 		}
 	}

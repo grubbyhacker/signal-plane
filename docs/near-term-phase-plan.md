@@ -67,8 +67,12 @@ Definition of done:
   before acknowledging transport delivery.
 - POST bounded parameters only to the broker's fixed
   `/v1/launch-profiles/codex-issue-implement/launch` endpoint, validate fresh
-  and replayed launch responses, persist the returned run ID, and use bounded
-  retries.
+  and replayed launch responses, persist the returned run ID immediately, and
+  use a durable ten-minute launch retry window.
+- Serialize launches and durably poll scoped run status through explicit
+  pending, retry, launched, and terminal lifecycle states.
+- Store the accepted JetStream sequence for restore/replay recovery without
+  storing provider payload or prose.
 - Keep all provider prose and payloads out of dispatcher persistence.
 
 Handoff gates before any production/private deployment:

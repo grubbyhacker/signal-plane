@@ -18,7 +18,6 @@ dispatcher:
   broker_url: http://127.0.0.1:8091/v1/launch-profiles/codex-issue-implement/launch
   broker_token_env: GITHUB_TASK_DISPATCHER_BROKER_TOKEN
   workers: 1
-  max_attempts: 5
 
 routes:
   - id: manual-local

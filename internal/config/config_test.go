@@ -47,12 +47,17 @@ func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
 		NATS:    NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}},
 		Dispatcher: DispatcherConfig{
 			Enabled: true, Subject: "signals.github.>", Durable: "dispatcher", DatabasePath: "jobs.db",
-			BrokerURL: "https://broker.internal" + BrokerProfilePath, BrokerTokenEnv: "BROKER_TOKEN", Workers: 1, MaxAttempts: 1,
+			BrokerURL: "https://broker.internal" + BrokerProfilePath, BrokerTokenEnv: "BROKER_TOKEN", Workers: 1,
 		},
 		Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}},
 	}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("valid fixed endpoint rejected: %v", err)
+	}
+	multipleWorkers := base
+	multipleWorkers.Dispatcher.Workers = 2
+	if err := multipleWorkers.Validate(); err == nil || !strings.Contains(err.Error(), "exactly one worker") {
+		t.Fatalf("multiple worker error=%v", err)
 	}
 	for _, invalid := range []string{
 		"https://broker.internal/v1/jobs",

@@ -72,6 +72,9 @@ type ConsumerConfig struct {
 	AckWait       time.Duration
 	MaxAckPending int
 	MaxDeliver    int
+	// StartSequence is a recovery-only contract. Use Store.RecoverySequence
+	// with a new durable name after restoring dispatcher SQLite state.
+	StartSequence uint64
 }
 
 func (bus *Bus) NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
@@ -91,7 +94,12 @@ func (bus *Bus) NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 func (bus *Bus) ensureConsumer(want ConsumerConfig) error {
 	info, err := bus.js.ConsumerInfo(bus.stream, want.Durable)
 	if errors.Is(err, nats.ErrConsumerNotFound) {
-		_, err = bus.js.AddConsumer(bus.stream, &nats.ConsumerConfig{Durable: want.Durable, FilterSubject: want.Subject, AckPolicy: nats.AckExplicitPolicy, AckWait: want.AckWait, MaxAckPending: want.MaxAckPending, MaxDeliver: want.MaxDeliver})
+		cfg := &nats.ConsumerConfig{Durable: want.Durable, FilterSubject: want.Subject, AckPolicy: nats.AckExplicitPolicy, AckWait: want.AckWait, MaxAckPending: want.MaxAckPending, MaxDeliver: want.MaxDeliver}
+		if want.StartSequence > 0 {
+			cfg.DeliverPolicy = nats.DeliverByStartSequencePolicy
+			cfg.OptStartSeq = want.StartSequence
+		}
+		_, err = bus.js.AddConsumer(bus.stream, cfg)
 		if err != nil {
 			return fmt.Errorf("create consumer: %w", err)
 		}
@@ -102,6 +110,9 @@ func (bus *Bus) ensureConsumer(want ConsumerConfig) error {
 	}
 	if info.Config.FilterSubject != want.Subject {
 		return fmt.Errorf("consumer %q filter subject is immutable: have %q want %q", want.Durable, info.Config.FilterSubject, want.Subject)
+	}
+	if want.StartSequence > 0 && (info.Config.DeliverPolicy != nats.DeliverByStartSequencePolicy || info.Config.OptStartSeq != want.StartSequence) {
+		return fmt.Errorf("consumer %q recovery start is immutable; use a new durable name", want.Durable)
 	}
 	cfg := info.Config
 	cfg.AckPolicy, cfg.AckWait, cfg.MaxAckPending, cfg.MaxDeliver = nats.AckExplicitPolicy, want.AckWait, want.MaxAckPending, want.MaxDeliver

@@ -35,7 +35,6 @@ type DispatcherConfig struct {
 	BrokerURL      string `yaml:"broker_url"`
 	BrokerTokenEnv string `yaml:"broker_token_env"`
 	Workers        int    `yaml:"workers"`
-	MaxAttempts    int    `yaml:"max_attempts"`
 }
 
 type GatewayConfig struct {
@@ -127,9 +126,6 @@ func applyEnv(cfg *Config) {
 	if cfg.Dispatcher.Workers == 0 {
 		cfg.Dispatcher.Workers = 1
 	}
-	if cfg.Dispatcher.MaxAttempts == 0 {
-		cfg.Dispatcher.MaxAttempts = 5
-	}
 
 	for i := range cfg.Routes {
 		if cfg.Routes[i].MaxBodyBytes == 0 {
@@ -158,8 +154,8 @@ func (cfg Config) Validate() error {
 		if strings.TrimSpace(cfg.Dispatcher.Subject) == "" || strings.TrimSpace(cfg.Dispatcher.Durable) == "" || strings.TrimSpace(cfg.Dispatcher.DatabasePath) == "" || strings.TrimSpace(cfg.Dispatcher.BrokerURL) == "" || strings.TrimSpace(cfg.Dispatcher.BrokerTokenEnv) == "" {
 			return errors.New("enabled dispatcher requires subject, durable, database_path, broker_url, and broker_token_env")
 		}
-		if cfg.Dispatcher.Workers < 1 || cfg.Dispatcher.MaxAttempts < 1 {
-			return errors.New("enabled dispatcher workers and max_attempts must be positive")
+		if cfg.Dispatcher.Workers != 1 {
+			return errors.New("enabled dispatcher requires exactly one worker")
 		}
 		brokerURL, err := url.Parse(cfg.Dispatcher.BrokerURL)
 		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || brokerURL.EscapedPath() != BrokerProfilePath || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
