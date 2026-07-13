@@ -15,7 +15,10 @@ fi
 """
 
 [tasks.check]
-run = "mise run fmt-check && mise run test && mise run build"
+run = "mise run fmt-check && mise run validate:image-tag-contract && mise run test && mise run build"
+
+[tasks."validate:image-tag-contract"]
+run = "python3 scripts/validate-image-tag-contract.py"
 
 [tasks.test]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
