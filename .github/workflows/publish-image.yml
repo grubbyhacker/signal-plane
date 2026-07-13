@@ -32,7 +32,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=main
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=long
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
