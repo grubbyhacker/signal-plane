@@ -2,7 +2,9 @@ name: Deploy Production
 
 # Required production environment secrets:
 # - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@100.66.40.39.
-# - VPS_OPS_TAILSCALE_AUTHKEY: Tailscale auth key for tailscale/github-action.
+# - TS_OAUTH_CLIENT_ID: Tailscale OAuth client ID authorized to apply
+#   tag:github-actions-deploy.
+# - TS_OAUTH_SECRET: Tailscale OAuth client secret for TS_OAUTH_CLIENT_ID.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
 # - VPS_OPS_* Signal Plane Doppler env-source secrets consumed by the vps-ops
 #   deploy wrapper. Values remain in the GitHub production environment.
@@ -57,7 +59,8 @@ jobs:
       - name: Connect to Tailnet
         uses: tailscale/github-action@v4
         with:
-          authkey: ${{ secrets.VPS_OPS_TAILSCALE_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:github-actions-deploy
           ping: ${{ env.DEPLOY_HOST }}
 
