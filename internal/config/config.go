@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -15,12 +16,26 @@ const (
 	DefaultStreamName  = "SIGNALS"
 	DefaultSubject     = "signals.>"
 	DefaultMaxBody     = int64(1 << 20)
+	BrokerProfilePath  = "/v1/launch-profiles/codex-issue-implement/launch"
 )
 
 type Config struct {
-	Gateway GatewayConfig `yaml:"gateway"`
-	NATS    NATSConfig    `yaml:"nats"`
-	Routes  []Route       `yaml:"routes"`
+	Gateway    GatewayConfig    `yaml:"gateway"`
+	NATS       NATSConfig       `yaml:"nats"`
+	Dispatcher DispatcherConfig `yaml:"dispatcher"`
+	Routes     []Route          `yaml:"routes"`
+}
+
+type DispatcherConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	Addr           string `yaml:"addr"`
+	Subject        string `yaml:"subject"`
+	Durable        string `yaml:"durable"`
+	DatabasePath   string `yaml:"database_path"`
+	BrokerURL      string `yaml:"broker_url"`
+	BrokerTokenEnv string `yaml:"broker_token_env"`
+	Workers        int    `yaml:"workers"`
+	MaxAttempts    int    `yaml:"max_attempts"`
 }
 
 type GatewayConfig struct {
@@ -97,6 +112,24 @@ func applyEnv(cfg *Config) {
 	if len(cfg.NATS.Subjects) == 0 {
 		cfg.NATS.Subjects = []string{DefaultSubject}
 	}
+	if cfg.Dispatcher.Addr == "" {
+		cfg.Dispatcher.Addr = ":8082"
+	}
+	if cfg.Dispatcher.Subject == "" {
+		cfg.Dispatcher.Subject = "signals.github.>"
+	}
+	if cfg.Dispatcher.Durable == "" {
+		cfg.Dispatcher.Durable = "github-task-dispatcher"
+	}
+	if cfg.Dispatcher.DatabasePath == "" {
+		cfg.Dispatcher.DatabasePath = "github-task-dispatcher.db"
+	}
+	if cfg.Dispatcher.Workers == 0 {
+		cfg.Dispatcher.Workers = 1
+	}
+	if cfg.Dispatcher.MaxAttempts == 0 {
+		cfg.Dispatcher.MaxAttempts = 5
+	}
 
 	for i := range cfg.Routes {
 		if cfg.Routes[i].MaxBodyBytes == 0 {
@@ -120,6 +153,18 @@ func (cfg Config) Validate() error {
 	}
 	if len(cfg.Routes) == 0 {
 		return errors.New("at least one route is required")
+	}
+	if cfg.Dispatcher.Enabled {
+		if strings.TrimSpace(cfg.Dispatcher.Subject) == "" || strings.TrimSpace(cfg.Dispatcher.Durable) == "" || strings.TrimSpace(cfg.Dispatcher.DatabasePath) == "" || strings.TrimSpace(cfg.Dispatcher.BrokerURL) == "" || strings.TrimSpace(cfg.Dispatcher.BrokerTokenEnv) == "" {
+			return errors.New("enabled dispatcher requires subject, durable, database_path, broker_url, and broker_token_env")
+		}
+		if cfg.Dispatcher.Workers < 1 || cfg.Dispatcher.MaxAttempts < 1 {
+			return errors.New("enabled dispatcher workers and max_attempts must be positive")
+		}
+		brokerURL, err := url.Parse(cfg.Dispatcher.BrokerURL)
+		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || brokerURL.EscapedPath() != BrokerProfilePath || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
+			return fmt.Errorf("enabled dispatcher broker_url must be the exact codex issue profile endpoint ending in %s", BrokerProfilePath)
+		}
 	}
 
 	seen := map[string]string{}

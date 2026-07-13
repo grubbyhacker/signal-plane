@@ -58,3 +58,26 @@ Definition of done:
 - GitHub `ping` reaches the gateway and is verified.
 - Real pull request events are accepted, carried through JetStream, and logged.
 - No agent, Hermes, or job controller behavior is involved.
+
+## Phase 5: narrow GitHub issue dispatch (implementation complete, rollout blocked)
+
+- Run the disabled-by-default `github-task-dispatcher` as a separate binary.
+- Consume GitHub envelopes with an independent durable JetStream consumer.
+- Transactionally deduplicate deliveries and semantic issue jobs in SQLite WAL
+  before acknowledging transport delivery.
+- POST bounded parameters only to the broker's fixed
+  `/v1/launch-profiles/codex-issue-implement/launch` endpoint, validate fresh
+  and replayed launch responses, persist the returned run ID, and use bounded
+  retries.
+- Keep all provider prose and payloads out of dispatcher persistence.
+
+Handoff gates before any production/private deployment:
+
+- Broker idempotency behavior and caller/profile-scoped status access are a
+  hard contract, not an assumption.
+- `vps-ops` must supply the private control network, broker token, persistent
+  state path, and SQLite backup/restore plan.
+- GitHub hook admission and signal-gateway route configuration must admit
+  `issues` / `labeled` for `grubbyhacker/apple-jobs-matcher`.
+
+No deployment or `vps-ops` changes are included in this phase's code handoff.
