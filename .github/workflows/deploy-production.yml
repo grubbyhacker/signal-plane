@@ -1,0 +1,123 @@
+name: Deploy Production
+
+# Required production environment secrets:
+# - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@100.66.40.39.
+# - VPS_OPS_TAILSCALE_AUTHKEY: Tailscale auth key for tailscale/github-action.
+# - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
+# - VPS_OPS_* Signal Plane Doppler env-source secrets consumed by the vps-ops
+#   deploy wrapper. Values remain in the GitHub production environment.
+
+on:
+  workflow_run:
+    workflows: ["publish image"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: Optional Git SHA to deploy; defaults to the workflow dispatch ref SHA.
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  deploy:
+    name: Deploy signal-plane
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: "100.66.40.39"
+      DEPLOY_PORT: "22"
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+
+    steps:
+      - name: Resolve deployment inputs
+        id: deploy_inputs
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            deploy_sha="${{ github.event.inputs.image_sha || github.sha }}"
+          else
+            deploy_sha="${{ github.event.workflow_run.head_sha }}"
+          fi
+
+          echo "deploy_sha=$deploy_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout vps-ops
+        uses: actions/checkout@v7
+        with:
+          repository: grubbyhacker/vps-ops
+          token: ${{ secrets.VPS_OPS_READ_TOKEN }}
+          path: vps-ops
+
+      - name: Connect to Tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.VPS_OPS_TAILSCALE_AUTHKEY }}
+          tags: tag:github-actions-deploy
+          ping: ${{ env.DEPLOY_HOST }}
+
+      - name: Install Ansible
+        run: |
+          python3 -m pip install --user "ansible==10.*"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Ansible collections
+        working-directory: vps-ops
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Write deploy SSH key
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 0600 /dev/null /tmp/hermes-deploy
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > /tmp/hermes-deploy
+
+      - name: Deploy signal-plane
+        working-directory: vps-ops
+        env:
+          VPS_OPS_SECRET_BACKEND: doppler
+          VPS_OPS_DOPPLER_SOURCE: env
+          VPS_OPS_DOPPLER_ROLES: signal-plane
+          # Keep in sync with vps-ops scripts/doppler-secret-mapping.json.
+          VPS_OPS_SIGNAL_PLANE_CLOUDFLARED_TUNNEL_TOKEN: ${{ secrets.VPS_OPS_SIGNAL_PLANE_CLOUDFLARED_TUNNEL_TOKEN }}
+          VPS_OPS_SIGNAL_PLANE_GITHUB_WEBHOOK_SECRET: ${{ secrets.VPS_OPS_SIGNAL_PLANE_GITHUB_WEBHOOK_SECRET }}
+          VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN }}
+          VPS_OPS_SIGNAL_PLANE_DISPATCHER_RESTIC_REPOSITORY: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_RESTIC_REPOSITORY }}
+          VPS_OPS_SIGNAL_PLANE_DISPATCHER_RESTIC_PASSWORD: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_RESTIC_PASSWORD }}
+          VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_ACCESS_KEY_ID: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_ACCESS_KEY_ID }}
+          VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_SECRET_ACCESS_KEY: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-signal-plane.yml \
+            -e "signal_plane_image=ghcr.io/grubbyhacker/signal-plane:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
+            -e "ansible_host=${DEPLOY_HOST}" \
+            -e "ansible_port=${DEPLOY_PORT}" \
+            -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
+
+      - name: Log successful deploy telemetry
+        if: success()
+        uses: ./vps-ops/.github/actions/deploy-telemetry
+        with:
+          outcome: success
+          service_label: signal-plane
+          github_token: ${{ github.token }}
+
+      - name: Capture SSH failure diagnostics
+        if: failure()
+        uses: ./vps-ops/.github/actions/deploy-telemetry
+        with:
+          outcome: failure
+          ssh_host: ${{ env.DEPLOY_HOST }}
+          ssh_user: github-deployer
+          ssh_port: ${{ env.DEPLOY_PORT }}
+          ssh_key_path: /tmp/hermes-deploy
+          service_label: signal-plane
+          github_token: ${{ github.token }}
+
+      - name: Clean up secrets
+        if: always()
+        run: rm -f /tmp/hermes-deploy
