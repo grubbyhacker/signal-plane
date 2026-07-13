@@ -93,8 +93,11 @@ func (server *Server) handleRoute(w http.ResponseWriter, r *http.Request, route 
 		return
 	}
 	if admission.ignore {
-		server.metrics.add(route, "ignored", "ping")
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored", "reason": "ping"})
+		server.metrics.add(route, "ignored", admission.ignoreReason)
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"status": "ignored",
+			"reason": admission.ignoreReason,
+		})
 		return
 	}
 
@@ -162,10 +165,11 @@ func firstNonSpace(body []byte) byte {
 }
 
 type admissionResult struct {
-	event      string
-	action     string
-	deliveryID string
-	ignore     bool
+	event        string
+	action       string
+	deliveryID   string
+	ignore       bool
+	ignoreReason string
 }
 
 func (server *Server) admit(r *http.Request, route config.Route, body []byte) (admissionResult, error) {
@@ -223,10 +227,16 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "event_not_allowed"}
 	}
 	if event == "ping" && !route.GitHub.PublishPing {
-		return admissionResult{ignore: true}, nil
+		return admissionResult{ignore: true, ignoreReason: "ping"}, nil
 	}
 	if !config.ContainsAllowed(route.Admission.Actions, decoded.Action) {
-		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "action_not_allowed"}
+		return admissionResult{
+			event:        event,
+			action:       decoded.Action,
+			deliveryID:   deliveryID,
+			ignore:       true,
+			ignoreReason: "action_filtered",
+		}, nil
 	}
 	return admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, nil
 }
