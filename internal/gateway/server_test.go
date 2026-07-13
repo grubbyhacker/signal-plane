@@ -216,6 +216,50 @@ func TestGitHubPingIsAcknowledgedWithoutPublishByDefault(t *testing.T) {
 	}
 }
 
+func TestGitHubAllowedEventWithFilteredActionIsAcknowledgedWithoutPublish(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	publisher := &capturePublisher{}
+	route := config.Route{
+		ID:             "github-local",
+		Path:           "/webhooks/github",
+		Source:         "github",
+		MaxBodyBytes:   1024,
+		PublishSubject: "signals.github.webhook",
+		GitHub: config.GitHubConfig{
+			WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET",
+		},
+		Admission: config.AdmissionSet{
+			Repositories: []string{"grubbyhacker/signal-plane"},
+			Events:       []string{"pull_request"},
+			Actions:      []string{"opened", "synchronize"},
+		},
+	}
+	server := New(slog.Default(), []config.Route{route}, publisher)
+	body := []byte(`{"action":"closed","repository":{"full_name":"grubbyhacker/signal-plane"}}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "delivery-filtered-action")
+	rec := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if publisher.subject != "" {
+		t.Fatalf("filtered action should not publish, got subject %q", publisher.subject)
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "ignored" || response["reason"] != "action_filtered" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
 func githubSignature(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(body)
