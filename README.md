@@ -44,8 +44,9 @@ so it remains ready while the stream is idle. Malformed messages are terminally
 rejected after metadata-only logging; successful observer work uses synchronous
 JetStream acknowledgement.
 
-When enabled, `github-task-dispatcher` serves the same private operational
-endpoints on its configured address (default `:8082`). Its SQLite schema never
+`github-task-dispatcher` serves the same private operational endpoints on its
+configured address (default `:8082`). When disabled it remains alive in standby:
+health is healthy and readiness returns `503` with `disabled`. Its SQLite schema never
 stores issue title, body, comments, or the provider payload. The broker request
 is `POST dispatcher.broker_url` with this fixed shape:
 
@@ -54,16 +55,29 @@ is `POST dispatcher.broker_url` with this fixed shape:
 ```
 
 It requires `broker_token_env` and uses `Authorization: Bearer ...`; it
-sets `Idempotency-Key` to
-`github-task-dispatcher:v1:<repo>:delivery:<delivery-id>:codex-issue-implement`.
-Broker 4xx responses are terminal; network and 5xx failures use bounded
-exponential retry attempts. The semantic job key is
+sets the semantic `Idempotency-Key`
+`github-task-dispatcher:v2:<repo>:issue:<issue-number>:codex-issue-implement`;
+the broker's required `source_delivery_id` parameter is a stable semantic hash
+of repository, issue, and profile. The real GitHub delivery ID remains only in
+SQLite for audit correlation. Transport
+failures, HTTP 429/5xx, and structured `profile_busy` responses use a durable,
+deterministic 2s/4s/8s/16s/20s launch retry schedule for at most ten minutes.
+Other errors, including `idempotency_conflict` and malformed success responses,
+fail immediately. The semantic job key is
 `github-issue-implement:v1:<repo>:<issue-number>`. `broker_url` must be the
 exact private endpoint
 `/v1/launch-profiles/codex-issue-implement/launch`. A 2xx response counts as
 successful only when it contains a nonempty JSON `run_id`; fresh and
 idempotently replayed responses are validated the same way, and that run ID is
-stored with the dispatcher job.
+stored immediately. The single worker then polls only scoped
+`GET /v1/runs/{run_id}` status and does not launch another issue until the run
+reaches `completed`, `failed`, or `timed_out`.
+
+Every recorded delivery includes its JetStream stream sequence. After restoring
+SQLite, operators can run `github-task-dispatcher recovery-metadata --database PATH`
+and set the reported `recovery_start_sequence` in dispatcher configuration while
+choosing a new `durable` name. Recovery start positions are immutable,
+so the library rejects attempts to retarget an existing durable.
 
 ## Development
 

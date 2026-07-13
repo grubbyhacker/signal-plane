@@ -14,11 +14,12 @@ dispatcher:
   addr: ":8082"
   subject: signals.github.>
   durable: github-task-dispatcher
+  # Recovery only: set recovery_start_sequence with a new durable name.
+  # recovery_start_sequence: 1
   database_path: github-task-dispatcher.db
   broker_url: http://127.0.0.1:8091/v1/launch-profiles/codex-issue-implement/launch
   broker_token_env: GITHUB_TASK_DISPATCHER_BROKER_TOKEN
   workers: 1
-  max_attempts: 5
 
 routes:
   - id: manual-local
@@ -37,12 +38,7 @@ routes:
       webhook_secret_env: SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET
       publish_ping: false
     admission:
-      repositories:
-        - grubbyhacker/signal-plane
-      events:
-        - pull_request
-        - ping
-      actions:
-        - opened
-        - reopened
-        - synchronize
+      tuples:
+        - repository: grubbyhacker/signal-plane
+          event: pull_request
+          actions: [opened, reopened, synchronize]

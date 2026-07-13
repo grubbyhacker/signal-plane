@@ -23,6 +23,10 @@ run = "python3 scripts/validate-image-tag-contract.py"
 [tasks.test]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 
+[tasks."proof:phase5-local"]
+description = "Run the deterministic versioned Phase 5 local integration proof"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/dispatcher -run '^TestPhase5LocalV1Proof$' -count=1"
+
 [tasks.build]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher"
 

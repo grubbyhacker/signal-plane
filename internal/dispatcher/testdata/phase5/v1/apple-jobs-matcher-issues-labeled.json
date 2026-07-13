@@ -1,0 +1,17 @@
+{
+  "action": "labeled",
+  "repository": {
+    "full_name": "grubbyhacker/apple-jobs-matcher"
+  },
+  "issue": {
+    "number": 42,
+    "state": "open",
+    "title": "Phase 5 deterministic local proof"
+  },
+  "label": {
+    "name": "agent:implement"
+  },
+  "sender": {
+    "login": "phase5-local-proof"
+  }
+}

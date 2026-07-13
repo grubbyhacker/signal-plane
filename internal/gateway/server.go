@@ -220,6 +220,9 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_github_payload"}
 	}
+	if len(route.Admission.Tuples) > 0 {
+		return admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
+	}
 	if !config.ContainsAllowed(route.Admission.Repositories, decoded.Repository.FullName) {
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
 	}
@@ -239,6 +242,30 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 		}, nil
 	}
 	return admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, nil
+}
+
+func admitGitHubTuple(route config.Route, event, deliveryID, action, repository string) (admissionResult, error) {
+	repositoryMatched := false
+	for _, tuple := range route.Admission.Tuples {
+		if tuple.Repository != repository {
+			continue
+		}
+		repositoryMatched = true
+		if tuple.Event != event {
+			continue
+		}
+		if event == "ping" && !route.GitHub.PublishPing {
+			return admissionResult{ignore: true, ignoreReason: "ping"}, nil
+		}
+		if !config.ContainsAllowed(tuple.Actions, action) {
+			return admissionResult{event: event, action: action, deliveryID: deliveryID, ignore: true, ignoreReason: "action_filtered"}, nil
+		}
+		return admissionResult{event: event, action: action, deliveryID: deliveryID}, nil
+	}
+	if !repositoryMatched {
+		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
+	}
+	return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "event_not_allowed"}
 }
 
 func bearerOrHeaderMatches(r *http.Request, want string) bool {

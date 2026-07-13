@@ -270,6 +270,45 @@ func TestGitHubAllowedEventWithFilteredActionIsAcknowledgedWithoutPublish(t *tes
 	}
 }
 
+func TestGitHubAdmissionTuplesRejectCartesianCrossCombinations(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	route := config.Route{
+		ID: "github", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 1024, PublishSubject: "signals.github.webhook",
+		GitHub: config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET"},
+		Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{
+			{Repository: "grubbyhacker/signal-plane", Event: "pull_request", Actions: []string{"opened"}},
+			{Repository: "grubbyhacker/apple-jobs-matcher", Event: "issues", Actions: []string{"labeled"}},
+		}},
+	}
+	tests := []struct {
+		name, repository, event, action string
+		wantStatus                      int
+		wantPublish                     bool
+	}{
+		{"signal plane pull request", "grubbyhacker/signal-plane", "pull_request", "opened", http.StatusAccepted, true},
+		{"apple issue", "grubbyhacker/apple-jobs-matcher", "issues", "labeled", http.StatusAccepted, true},
+		{"signal plane issue cross combination", "grubbyhacker/signal-plane", "issues", "labeled", http.StatusForbidden, false},
+		{"apple pull request cross combination", "grubbyhacker/apple-jobs-matcher", "pull_request", "opened", http.StatusForbidden, false},
+		{"wrong tuple action", "grubbyhacker/apple-jobs-matcher", "issues", "opened", http.StatusAccepted, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &capturePublisher{}
+			server := New(slog.Default(), []config.Route{route}, publisher)
+			body := []byte(`{"action":"` + tt.action + `","repository":{"full_name":"` + tt.repository + `"}}`)
+			req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(string(body)))
+			req.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+			req.Header.Set("X-GitHub-Event", tt.event)
+			req.Header.Set("X-GitHub-Delivery", "tuple-delivery")
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus || (publisher.subject != "") != tt.wantPublish {
+				t.Fatalf("status=%d body=%s published=%q", rec.Code, rec.Body.String(), publisher.subject)
+			}
+		})
+	}
+}
+
 func githubSignature(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(body)
