@@ -56,8 +56,57 @@ func (bus *Bus) Publish(subject string, signal envelope.Signal) error {
 	if err != nil {
 		return fmt.Errorf("marshal signal: %w", err)
 	}
-	if _, err := bus.js.Publish(subject, data); err != nil {
+	opts := []nats.PubOpt{}
+	if signal.Meta.SourceDeliveryID != "" {
+		opts = append(opts, nats.MsgId(signal.Meta.SourceDeliveryID))
+	}
+	if _, err := bus.js.Publish(subject, data, opts...); err != nil {
 		return fmt.Errorf("publish signal: %w", err)
+	}
+	return nil
+}
+
+type ConsumerConfig struct {
+	Subject       string
+	Durable       string
+	AckWait       time.Duration
+	MaxAckPending int
+	MaxDeliver    int
+}
+
+func (bus *Bus) NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
+	if cfg.AckWait <= 0 || cfg.MaxAckPending <= 0 || cfg.MaxDeliver <= 0 {
+		return nil, errors.New("consumer acknowledgement settings must be positive")
+	}
+	if err := bus.ensureConsumer(cfg); err != nil {
+		return nil, err
+	}
+	sub, err := bus.js.PullSubscribe(cfg.Subject, cfg.Durable, nats.Bind(bus.stream, cfg.Durable), nats.ManualAck())
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: %w", err)
+	}
+	return &Consumer{bus: bus, sub: sub, durable: cfg.Durable}, nil
+}
+
+func (bus *Bus) ensureConsumer(want ConsumerConfig) error {
+	info, err := bus.js.ConsumerInfo(bus.stream, want.Durable)
+	if errors.Is(err, nats.ErrConsumerNotFound) {
+		_, err = bus.js.AddConsumer(bus.stream, &nats.ConsumerConfig{Durable: want.Durable, FilterSubject: want.Subject, AckPolicy: nats.AckExplicitPolicy, AckWait: want.AckWait, MaxAckPending: want.MaxAckPending, MaxDeliver: want.MaxDeliver})
+		if err != nil {
+			return fmt.Errorf("create consumer: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect consumer configuration: %w", err)
+	}
+	if info.Config.FilterSubject != want.Subject {
+		return fmt.Errorf("consumer %q filter subject is immutable: have %q want %q", want.Durable, info.Config.FilterSubject, want.Subject)
+	}
+	cfg := info.Config
+	cfg.AckPolicy, cfg.AckWait, cfg.MaxAckPending, cfg.MaxDeliver = nats.AckExplicitPolicy, want.AckWait, want.MaxAckPending, want.MaxDeliver
+	if _, err := bus.js.UpdateConsumer(bus.stream, &cfg); err != nil {
+		return fmt.Errorf("configure consumer: %w", err)
 	}
 	return nil
 }
@@ -75,7 +124,6 @@ func (bus *Bus) Ready(_ context.Context) error {
 }
 
 // Consumer is a durable pull subscription with explicit acknowledgements.
-// It is created once and reused for the observer's lifetime.
 type Consumer struct {
 	bus     *Bus
 	sub     *nats.Subscription
@@ -89,54 +137,7 @@ const (
 )
 
 func (bus *Bus) NewObserverConsumer(subject string, durable string) (*Consumer, error) {
-	if err := bus.ensureObserverConsumer(subject, durable); err != nil {
-		return nil, err
-	}
-	sub, err := bus.js.PullSubscribe(subject, durable,
-		nats.Bind(bus.stream, durable),
-		nats.ManualAck(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("subscribe: %w", err)
-	}
-	return &Consumer{bus: bus, sub: sub, durable: durable}, nil
-}
-
-// ensureObserverConsumer creates the durable with the observer settings, or
-// updates those mutable settings before attaching to an existing durable. The
-// ordering matters: PullSubscribe validates its options against an existing
-// consumer, so a durable from an older deployment must be migrated first.
-func (bus *Bus) ensureObserverConsumer(subject string, durable string) error {
-	info, err := bus.js.ConsumerInfo(bus.stream, durable)
-	if err != nil {
-		if errors.Is(err, nats.ErrConsumerNotFound) {
-			_, err = bus.js.AddConsumer(bus.stream, &nats.ConsumerConfig{
-				Durable:       durable,
-				FilterSubject: subject,
-				AckPolicy:     nats.AckExplicitPolicy,
-				AckWait:       ObserverAckWait,
-				MaxAckPending: ObserverMaxAckPending,
-				MaxDeliver:    ObserverMaxDeliver,
-			})
-			if err != nil {
-				return fmt.Errorf("create consumer: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("inspect consumer configuration: %w", err)
-	}
-	config := info.Config
-	if config.AckPolicy == nats.AckExplicitPolicy && config.AckWait == ObserverAckWait && config.MaxAckPending == ObserverMaxAckPending && config.MaxDeliver == ObserverMaxDeliver {
-		return nil
-	}
-	config.AckPolicy = nats.AckExplicitPolicy
-	config.AckWait = ObserverAckWait
-	config.MaxAckPending = ObserverMaxAckPending
-	config.MaxDeliver = ObserverMaxDeliver
-	if _, err := bus.js.UpdateConsumer(bus.stream, &config); err != nil {
-		return fmt.Errorf("configure consumer: %w", err)
-	}
-	return nil
+	return bus.NewConsumer(ConsumerConfig{Subject: subject, Durable: durable, AckWait: ObserverAckWait, MaxAckPending: ObserverMaxAckPending, MaxDeliver: ObserverMaxDeliver})
 }
 
 // Fetch returns an unacknowledged message. Callers must explicitly AckSync or

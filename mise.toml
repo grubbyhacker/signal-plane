@@ -21,7 +21,7 @@ run = "mise run fmt-check && mise run test && mise run build"
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 
 [tasks.build]
-run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher"
 
 [tasks.image-build]
 run = "docker build -t signal-plane:local ."

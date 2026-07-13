@@ -1,12 +1,65 @@
 package eventbus
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
+	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
+
+func TestGitHubDispatcherFileJetStreamEndToEndAndPublishDedupe(t *testing.T) {
+	bus := newIntegrationBus(t)
+	signal := envelope.Signal{Meta: envelope.Meta{Source: "github", SourceEvent: "issues", SourceAction: "labeled", SourceDeliveryID: "delivery-e2e"}, Payload: json.RawMessage(`{"action":"labeled","repository":{"full_name":"grubbyhacker/apple-jobs-matcher"},"issue":{"number":12,"state":"open"},"label":{"name":"agent:implement"},"sender":{"login":"roger"}}`)}
+	if err := bus.Publish(testSubject, signal); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(testSubject, signal); err != nil {
+		t.Fatal(err)
+	}
+	info, err := bus.js.StreamInfo(testStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 {
+		t.Fatalf("stream messages = %d, want Nats-Msg-Id dedupe", info.State.Msgs)
+	}
+	consumer, err := bus.NewConsumer(ConsumerConfig{Subject: testSubject, Durable: "github-task-dispatcher-test", AckWait: time.Second, MaxAckPending: 1, MaxDeliver: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := consumer.Fetch(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := dispatcher.OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	metrics := dispatcher.NewMetrics()
+	if !dispatcher.Process(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Unix(1, 0)) {
+		t.Fatal("delivery not processed")
+	}
+	deliveries, jobs, err := store.Counts(context.Background())
+	if err != nil || deliveries != 1 || jobs != 1 {
+		t.Fatalf("counts=%d,%d err=%v", deliveries, jobs, err)
+	}
+	consumerInfo, err := consumer.Ready(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumerInfo.NumAckPending != 0 {
+		t.Fatalf("ack pending = %d", consumerInfo.NumAckPending)
+	}
+}
 
 const (
 	testStream  = "SIGNALS"

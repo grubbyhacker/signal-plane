@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,6 +38,32 @@ routes:
 	}
 	if cfg.Routes[0].MaxBodyBytes != DefaultMaxBody {
 		t.Fatalf("max body = %d", cfg.Routes[0].MaxBodyBytes)
+	}
+}
+
+func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
+	base := Config{
+		Gateway: GatewayConfig{Addr: ":8080"},
+		NATS:    NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}},
+		Dispatcher: DispatcherConfig{
+			Enabled: true, Subject: "signals.github.>", Durable: "dispatcher", DatabasePath: "jobs.db",
+			BrokerURL: "https://broker.internal" + BrokerProfilePath, BrokerTokenEnv: "BROKER_TOKEN", Workers: 1, MaxAttempts: 1,
+		},
+		Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}},
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid fixed endpoint rejected: %v", err)
+	}
+	for _, invalid := range []string{
+		"https://broker.internal/v1/jobs",
+		"https://broker.internal" + BrokerProfilePath + "/",
+		"https://broker.internal" + BrokerProfilePath + "?profile=other",
+	} {
+		cfg := base
+		cfg.Dispatcher.BrokerURL = invalid
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), BrokerProfilePath) {
+			t.Fatalf("broker_url %q error=%v", invalid, err)
+		}
 	}
 }
 
