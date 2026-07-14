@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	Repository = "grubbyhacker/apple-jobs-matcher"
+	// Repository is a synthetic target retained only so the disabled dispatcher
+	// proof and its persistence/recovery tests remain deterministic. Production
+	// admission does not route events for this repository.
+	Repository = "example/automation-target"
 	Profile    = "codex-issue-implement"
 )
 
@@ -54,7 +57,7 @@ func Select(signal envelope.Signal) (Candidate, string) {
 	if event.Action != "labeled" || event.Repository.FullName != Repository {
 		return Candidate{}, "repository_filtered"
 	}
-	if event.Label.Name != "agent:implement" {
+	if event.Label.Name != "automation:requested" {
 		return Candidate{}, "label_filtered"
 	}
 	if event.Issue.Number <= 0 || event.Issue.State != "open" || len(event.Issue.PullRequest) != 0 || event.Sender.Login == "" {

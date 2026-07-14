@@ -18,7 +18,7 @@ import (
 
 func TestGitHubDispatcherFileJetStreamEndToEndAndPublishDedupe(t *testing.T) {
 	bus := newIntegrationBus(t)
-	signal := envelope.Signal{Meta: envelope.Meta{Source: "github", SourceEvent: "issues", SourceAction: "labeled", SourceDeliveryID: "delivery-e2e"}, Payload: json.RawMessage(`{"action":"labeled","repository":{"full_name":"grubbyhacker/apple-jobs-matcher"},"issue":{"number":12,"state":"open"},"label":{"name":"agent:implement"},"sender":{"login":"roger"}}`)}
+	signal := envelope.Signal{Meta: envelope.Meta{Source: "github", SourceEvent: "issues", SourceAction: "labeled", SourceDeliveryID: "delivery-e2e"}, Payload: json.RawMessage(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":12,"state":"open"},"label":{"name":"automation:requested"},"sender":{"login":"test-user"}}`)}
 	if err := bus.Publish(testSubject, signal); err != nil {
 		t.Fatal(err)
 	}

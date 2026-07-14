@@ -401,7 +401,7 @@ func phase5V1Bus(t *testing.T) *eventbus.Bus {
 
 func phase5V1Fixture(t *testing.T) []byte {
 	t.Helper()
-	body, err := os.ReadFile("testdata/phase5/v1/apple-jobs-matcher-issues-labeled.json")
+	body, err := os.ReadFile("testdata/phase5/v1/automation-target-issues-labeled.json")
 	if err != nil {
 		t.Fatal(err)
 	}

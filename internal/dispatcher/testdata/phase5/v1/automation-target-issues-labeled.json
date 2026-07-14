@@ -1,0 +1,17 @@
+{
+  "action": "labeled",
+  "repository": {
+    "full_name": "example/automation-target"
+  },
+  "issue": {
+    "number": 42,
+    "state": "open",
+    "title": "Synthetic deterministic dispatcher proof"
+  },
+  "label": {
+    "name": "automation:requested"
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

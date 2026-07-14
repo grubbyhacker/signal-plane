@@ -144,7 +144,7 @@ func recoverySignal(delivery string, issue int64) envelope.Signal {
 	payload, _ := json.Marshal(map[string]any{
 		"action": "labeled", "repository": map[string]any{"full_name": dispatcher.Repository},
 		"issue": map[string]any{"number": issue, "state": "open"},
-		"label": map[string]any{"name": "agent:implement"}, "sender": map[string]any{"login": "proof"},
+		"label": map[string]any{"name": "automation:requested"}, "sender": map[string]any{"login": "proof"},
 	})
 	return envelope.Signal{Meta: envelope.Meta{Source: "github", SourceEvent: "issues", SourceAction: "labeled", SourceDeliveryID: delivery}, Payload: payload}
 }
