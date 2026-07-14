@@ -17,7 +17,7 @@ import (
 )
 
 func validSignal(delivery string, issue int64) envelope.Signal {
-	payload := map[string]any{"action": "labeled", "repository": map[string]any{"full_name": Repository}, "issue": map[string]any{"number": issue, "state": "open"}, "label": map[string]any{"name": "agent:implement"}, "sender": map[string]any{"login": "test-user"}}
+	payload := map[string]any{"action": "labeled", "repository": map[string]any{"full_name": Repository}, "issue": map[string]any{"number": issue, "state": "open"}, "label": map[string]any{"name": "automation:requested"}, "sender": map[string]any{"login": "test-user"}}
 	body, _ := json.Marshal(payload)
 	return envelope.Signal{Meta: envelope.Meta{Source: "github", SourceEvent: "issues", SourceAction: "labeled", SourceDeliveryID: delivery}, Payload: body}
 }
@@ -32,22 +32,22 @@ func TestSelectPredicate(t *testing.T) {
 		{"wrong event", func(s *envelope.Signal) { s.Meta.SourceEvent = "pull_request" }, false},
 		{"missing delivery", func(s *envelope.Signal) { s.Meta.SourceDeliveryID = "" }, false},
 		{"wrong repository", func(s *envelope.Signal) {
-			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/other-target"},"issue":{"number":7,"state":"open"},"label":{"name":"agent:implement"},"sender":{"login":"x"}}`)
+			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/other-target"},"issue":{"number":7,"state":"open"},"label":{"name":"automation:requested"},"sender":{"login":"x"}}`)
 		}, false},
 		{"wrong label", func(s *envelope.Signal) {
 			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"open"},"label":{"name":"triage"},"sender":{"login":"x"}}`)
 		}, false},
 		{"nonpositive issue", func(s *envelope.Signal) {
-			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":0,"state":"open"},"label":{"name":"agent:implement"},"sender":{"login":"x"}}`)
+			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":0,"state":"open"},"label":{"name":"automation:requested"},"sender":{"login":"x"}}`)
 		}, false},
 		{"missing sender", func(s *envelope.Signal) {
-			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"open"},"label":{"name":"agent:implement"},"sender":{}}`)
+			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"open"},"label":{"name":"automation:requested"},"sender":{}}`)
 		}, false},
 		{"closed", func(s *envelope.Signal) {
-			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"closed"},"label":{"name":"agent:implement"},"sender":{"login":"x"}}`)
+			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"closed"},"label":{"name":"automation:requested"},"sender":{"login":"x"}}`)
 		}, false},
 		{"pull request", func(s *envelope.Signal) {
-			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"open","pull_request":{"url":"x"}},"label":{"name":"agent:implement"},"sender":{"login":"x"}}`)
+			s.Payload = []byte(`{"action":"labeled","repository":{"full_name":"example/automation-target"},"issue":{"number":7,"state":"open","pull_request":{"url":"x"}},"label":{"name":"automation:requested"},"sender":{"login":"x"}}`)
 		}, false},
 	}
 	for _, tt := range tests {

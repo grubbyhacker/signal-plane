@@ -57,7 +57,7 @@ func Select(signal envelope.Signal) (Candidate, string) {
 	if event.Action != "labeled" || event.Repository.FullName != Repository {
 		return Candidate{}, "repository_filtered"
 	}
-	if event.Label.Name != "agent:implement" {
+	if event.Label.Name != "automation:requested" {
 		return Candidate{}, "label_filtered"
 	}
 	if event.Issue.Number <= 0 || event.Issue.State != "open" || len(event.Issue.PullRequest) != 0 || event.Sender.Login == "" {
