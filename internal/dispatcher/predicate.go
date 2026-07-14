@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	Repository = "grubbyhacker/apple-jobs-matcher"
+	// Repository is a synthetic target retained only so the disabled dispatcher
+	// proof and its persistence/recovery tests remain deterministic. Production
+	// admission does not route events for this repository.
+	Repository = "example/automation-target"
 	Profile    = "codex-issue-implement"
 )
 

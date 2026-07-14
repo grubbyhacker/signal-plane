@@ -59,7 +59,7 @@ Definition of done:
 - Real pull request events are accepted, carried through JetStream, and logged.
 - No agent, Hermes, or job controller behavior is involved.
 
-## Phase 5: narrow GitHub issue dispatch (implementation complete, rollout blocked)
+## Phase 5: narrow GitHub issue dispatch (historical proof, route retired)
 
 - Run the disabled-by-default `github-task-dispatcher` as a separate binary.
 - Consume GitHub envelopes with an independent durable JetStream consumer.
@@ -77,14 +77,17 @@ Definition of done:
   at checkpoint + 1, records bounded replay evidence, reconciles restored runs,
   and keeps normal startup blocked until the recovery marker is complete.
 - Keep all provider prose and payloads out of dispatcher persistence.
+- Retain a neutral `example/automation-target` fixture so the dispatcher,
+  persistence, idempotency, serialization, status, and recovery tests remain
+  runnable without a production repository route.
 
-Handoff gates before any production/private deployment:
+Retirement state:
 
-- Broker idempotency behavior and caller/profile-scoped status access are a
-  hard contract, not an assumption.
-- `vps-ops` must supply the private control network, broker token, persistent
-  state path, and SQLite backup/restore plan.
-- GitHub hook admission and signal-gateway route configuration must admit
-  `issues` / `labeled` for `grubbyhacker/apple-jobs-matcher`.
+- No production GitHub admission or webhook registration targets the synthetic
+  repository.
+- No production broker identity is authorized for the synthetic repository.
+- The proof dispatcher remains disabled and is not the future generalized
+  Signal Plane router.
 
-No deployment or `vps-ops` changes are included in this phase's code handoff.
+The settled generalized implementation sequence lives in
+`vps-ops/docs/repository-agent-automation-roadmap.md`.

@@ -277,7 +277,7 @@ func TestGitHubAdmissionTuplesRejectCartesianCrossCombinations(t *testing.T) {
 		GitHub: config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET"},
 		Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{
 			{Repository: "grubbyhacker/signal-plane", Event: "pull_request", Actions: []string{"opened"}},
-			{Repository: "grubbyhacker/apple-jobs-matcher", Event: "issues", Actions: []string{"labeled"}},
+			{Repository: "example/automation-target", Event: "issues", Actions: []string{"labeled"}},
 		}},
 	}
 	tests := []struct {
@@ -286,10 +286,10 @@ func TestGitHubAdmissionTuplesRejectCartesianCrossCombinations(t *testing.T) {
 		wantPublish                     bool
 	}{
 		{"signal plane pull request", "grubbyhacker/signal-plane", "pull_request", "opened", http.StatusAccepted, true},
-		{"apple issue", "grubbyhacker/apple-jobs-matcher", "issues", "labeled", http.StatusAccepted, true},
+		{"automation target issue", "example/automation-target", "issues", "labeled", http.StatusAccepted, true},
 		{"signal plane issue cross combination", "grubbyhacker/signal-plane", "issues", "labeled", http.StatusForbidden, false},
-		{"apple pull request cross combination", "grubbyhacker/apple-jobs-matcher", "pull_request", "opened", http.StatusForbidden, false},
-		{"wrong tuple action", "grubbyhacker/apple-jobs-matcher", "issues", "opened", http.StatusAccepted, false},
+		{"automation target pull request cross combination", "example/automation-target", "pull_request", "opened", http.StatusForbidden, false},
+		{"wrong tuple action", "example/automation-target", "issues", "opened", http.StatusAccepted, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -10,7 +10,7 @@ GitHub or manual test sender
   -> signal-gateway
   -> NATS JetStream
   -> signal-observer (observation)
-  -> github-task-dispatcher (narrow, disabled-by-default task dispatch)
+  -> github-task-dispatcher (retained, disabled proof implementation)
 ```
 
 The gateway remains generic. Agent-specific selection and durable job state are
@@ -24,11 +24,13 @@ isolated in `github-task-dispatcher`.
 - `signal-observer`: NATS consumer used to watch accepted events flow through
   the stream. It retains a durable pull consumer and acknowledges only after
   successful decode and observer logging.
-- `github-task-dispatcher`: disabled by default. Its own configurable durable
-  consumer accepts only open, non-PR `issues/labeled` events for
-  `grubbyhacker/apple-jobs-matcher` carrying `agent:implement`. It stores only
+- `github-task-dispatcher`: disabled by default and retained to preserve the
+  proven persistence, idempotency, serialization, status, and recovery
+  mechanics while the generalized router is built. Its predicate matches only
+  the synthetic `example/automation-target` fixture; no production admission,
+  webhook, or broker authorization exists for that repository. It stores only
   delivery/job control data in SQLite WAL and calls the private broker's
-  `codex-issue-implement` profile.
+  `codex-issue-implement` profile when exercised by tests.
 
 ## Service endpoints
 
@@ -115,17 +117,16 @@ The image contains all three binaries; the default
 entrypoint runs the gateway, and deployment tooling can override the command to
 run the observer or dispatcher.
 
-## Dispatcher deployment prerequisites
+## Dispatcher proof boundary
 
-This repository does not perform deployment. Before enabling the dispatcher in
-a private environment, the following hard prerequisites must be satisfied:
+This repository does not perform deployment. The old repository-specific proof
+route has been retired, and the remaining synthetic selector is not a
+production deployment target. Do not register a webhook, add gateway admission,
+or grant a broker identity access to `example/automation-target`.
 
-- The broker must guarantee idempotency and scope status lookups to the caller
-  and profile; an idempotency key must not expose another caller's job state.
-- VPS operations must provide a private control network, broker token delivery,
-  and backup/restore coverage for the SQLite state file (including WAL state).
-- GitHub hook admission and gateway configuration must permit the target
-  repository's `issues` / `labeled` events while retaining signature checks.
+Future production routing and authority bootstrap follow the settled roadmap in
+`vps-ops/docs/repository-agent-automation-roadmap.md`; this proof dispatcher is
+not the generalized router.
 
 Pushes to `main` publish the deployment image to
 `ghcr.io/grubbyhacker/signal-plane:main`.
