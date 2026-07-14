@@ -91,6 +91,30 @@ func (bus *Bus) NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 	return &Consumer{bus: bus, sub: sub, durable: cfg.Durable}, nil
 }
 
+// ResetConsumer deliberately destroys and recreates a durable at an immutable
+// recovery sequence. It is only used by the explicit offline recovery command.
+func (bus *Bus) ResetConsumer(cfg ConsumerConfig) (*Consumer, uint64, error) {
+	if cfg.StartSequence == 0 {
+		return nil, 0, errors.New("reset consumer requires a recovery start sequence")
+	}
+	if _, err := bus.js.ConsumerInfo(bus.stream, cfg.Durable); err == nil {
+		if err := bus.js.DeleteConsumer(bus.stream, cfg.Durable); err != nil {
+			return nil, 0, fmt.Errorf("delete recovery consumer: %w", err)
+		}
+	} else if !errors.Is(err, nats.ErrConsumerNotFound) {
+		return nil, 0, fmt.Errorf("inspect recovery consumer: %w", err)
+	}
+	consumer, err := bus.NewConsumer(cfg)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := consumer.Ready(context.Background())
+	if err != nil {
+		return nil, 0, err
+	}
+	return consumer, info.NumPending, nil
+}
+
 func (bus *Bus) ensureConsumer(want ConsumerConfig) error {
 	info, err := bus.js.ConsumerInfo(bus.stream, want.Durable)
 	if errors.Is(err, nats.ErrConsumerNotFound) {

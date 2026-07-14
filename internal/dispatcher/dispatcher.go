@@ -3,6 +3,8 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -121,33 +123,57 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 func Process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, delivery Delivery, now time.Time) bool {
+	err := process(ctx, logger, metrics, store, delivery, now, "", true)
+	return err == nil
+}
+
+// ProcessRecovery fails closed without terminating malformed stream data. Its
+// replay evidence is committed atomically with the normal dispatcher state.
+func ProcessRecovery(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, recoveryID string, delivery Delivery, now time.Time) error {
+	if recoveryID == "" {
+		return errors.New("recovery id is required")
+	}
+	return process(ctx, logger, metrics, store, delivery, now, recoveryID, false)
+}
+
+func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, delivery Delivery, now time.Time, recoveryID string, terminateMalformed bool) error {
 	streamSequence, err := delivery.StreamSequence()
 	if err != nil || streamSequence == 0 {
 		metrics.deliveries.WithLabelValues("metadata_failed").Inc()
 		logger.Error("read JetStream delivery metadata failed", "error", err)
-		return false
+		if err == nil {
+			err = errors.New("stream sequence is zero")
+		}
+		return fmt.Errorf("read JetStream delivery metadata: %w", err)
 	}
 	var signal envelope.Signal
 	if err := json.Unmarshal(delivery.Data(), &signal); err != nil {
 		metrics.deliveries.WithLabelValues("malformed").Inc()
 		logger.Warn("malformed signal; terminating delivery")
-		_ = delivery.Term()
-		return false
+		if terminateMalformed {
+			_ = delivery.Term()
+		}
+		return fmt.Errorf("decode replayed signal: %w", err)
 	}
 	candidate, outcome := Select(signal)
 	var selected *Candidate
 	if outcome == "accepted" {
 		selected = &candidate
 	}
-	if err := store.Record(ctx, signal.Meta.SourceDeliveryID, outcome, streamSequence, selected, now); err != nil {
+	if recoveryID == "" {
+		err = store.Record(ctx, signal.Meta.SourceDeliveryID, outcome, streamSequence, selected, now)
+	} else {
+		err = store.RecordRecovery(ctx, recoveryID, signal.Meta.SourceDeliveryID, outcome, streamSequence, selected, now)
+	}
+	if err != nil {
 		metrics.deliveries.WithLabelValues("store_failed").Inc()
 		logger.Error("persist delivery failed", "error", err)
-		return false
+		return fmt.Errorf("persist delivery: %w", err)
 	}
 	if err := delivery.AckSync(); err != nil {
 		metrics.deliveries.WithLabelValues("ack_failed").Inc()
 		logger.Error("acknowledge delivery failed", "error", err)
-		return false
+		return fmt.Errorf("acknowledge delivery: %w", err)
 	}
 	if selected != nil {
 		metrics.deliveries.WithLabelValues("accepted").Inc()
@@ -155,7 +181,7 @@ func Process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *
 		metrics.deliveries.WithLabelValues("irrelevant").Inc()
 	}
 	_ = metrics.Refresh(ctx, store, now)
-	return true
+	return nil
 }
 
 type BrokerClient interface {
@@ -236,19 +262,9 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 		_ = metrics.Refresh(ctx, store, now)
 		return true, storeErr
 	}
-	state := ""
-	switch result.Status {
-	case "accepted", "queued", "pending", "launching", "running", "in_progress":
-		state = StateLaunched
-	case "completed", "succeeded", "success":
-		state = StateCompleted
-	case "failed", "error", "cancelled", "canceled":
+	state, err := ReconciledStatus(result.Status)
+	if err != nil {
 		state = StateFailed
-	case "timed_out", "timeout":
-		state = StateTimedOut
-	default:
-		state = StateFailed
-		err = BrokerError{Malformed: true, Message: "broker returned unknown run status"}
 	}
 	due := now
 	if state == StateLaunched {
@@ -265,4 +281,21 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 	storeErr := store.MarkStatus(ctx, job.ID, state, due, message, now)
 	_ = metrics.Refresh(ctx, store, now)
 	return true, storeErr
+}
+
+// ReconciledStatus validates the broker's bounded lifecycle vocabulary. The
+// recovery workflow uses this before mutating a restored job.
+func ReconciledStatus(status string) (string, error) {
+	switch status {
+	case "accepted", "queued", "pending", "launching", "running", "in_progress":
+		return StateLaunched, nil
+	case "completed", "succeeded", "success":
+		return StateCompleted, nil
+	case "failed", "error", "cancelled", "canceled":
+		return StateFailed, nil
+	case "timed_out", "timeout":
+		return StateTimedOut, nil
+	default:
+		return "", BrokerError{Malformed: true, Message: "broker returned unknown run status"}
+	}
 }

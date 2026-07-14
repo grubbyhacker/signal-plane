@@ -73,6 +73,9 @@ Definition of done:
   pending, retry, launched, and terminal lifecycle states.
 - Store the accepted JetStream sequence for restore/replay recovery without
   storing provider payload or prose.
+- Execute restore recovery through a dry-run-first CLI that resets the durable
+  at checkpoint + 1, records bounded replay evidence, reconciles restored runs,
+  and keeps normal startup blocked until the recovery marker is complete.
 - Keep all provider prose and payloads out of dispatcher persistence.
 
 Handoff gates before any production/private deployment:

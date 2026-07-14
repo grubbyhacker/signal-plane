@@ -14,7 +14,8 @@ dispatcher:
   addr: ":8082"
   subject: signals.github.>
   durable: github-task-dispatcher
-  # Recovery only: set recovery_start_sequence with a new durable name.
+  # Recovery only: set this to the validated manifest sequence + 1. Normal
+  # startup rejects it until `recover --execute` records matching evidence.
   # recovery_start_sequence: 1
   database_path: github-task-dispatcher.db
   broker_url: http://127.0.0.1:8091/v1/launch-profiles/codex-issue-implement/launch

@@ -27,6 +27,10 @@ run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 description = "Run the deterministic versioned Phase 5 local integration proof"
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/dispatcher -run '^TestPhase5LocalV1Proof$' -count=1"
 
+[tasks."proof:dispatcher-recovery"]
+description = "Run the deterministic in-process dispatcher restore/replay/reconciliation proof"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/recovery -run '^TestDispatcherRecoveryProof$' -count=1"
+
 [tasks.build]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher"
 

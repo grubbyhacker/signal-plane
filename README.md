@@ -73,16 +73,21 @@ stored immediately. The single worker then polls only scoped
 `GET /v1/runs/{run_id}` status and does not launch another issue until the run
 reaches `completed`, `failed`, or `timed_out`.
 
-Every recorded delivery includes its JetStream stream sequence. After restoring
-SQLite, operators can run `github-task-dispatcher recovery-metadata --database PATH`
-and set the reported `recovery_start_sequence` in dispatcher configuration while
-choosing a new `durable` name. Recovery start positions are immutable,
-so the library rejects attempts to retarget an existing durable.
+Every recorded delivery includes its JetStream stream sequence. Restores use
+the managed, offline `github-task-dispatcher recover` procedure documented in
+[Dispatcher recovery](docs/dispatcher-recovery.md). It validates the restored
+checkpoint against the backup manifest, resets the configured durable to
+checkpoint + 1, replays the bounded backlog, reconciles every restored active
+run through the authenticated broker status endpoint, and records JSON plus
+SQLite evidence. The command is read-only unless `--execute` is supplied and
+never calls the broker launch endpoint. An incomplete recovery marker blocks
+normal dispatcher startup and therefore blocks new launches.
 
 ## Development
 
 ```sh
 mise run check
+mise run proof:dispatcher-recovery
 mise run compose-up
 SIGNAL_GATEWAY_MANUAL_TOKEN=local-dev-token mise run gateway
 mise run observer
