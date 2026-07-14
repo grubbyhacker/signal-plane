@@ -5,13 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 const (
-	SchemaVersion      = 1
+	SchemaVersion      = 2
 	checkpointKey      = "last_persisted_jetstream_sequence"
 	StatePendingLaunch = "pending_launch"
 	StateLaunchRetry   = "launch_retry"
@@ -19,6 +20,8 @@ const (
 	StateCompleted     = "completed"
 	StateFailed        = "failed"
 	StateTimedOut      = "timed_out"
+	RecoveryIncomplete = "incomplete"
+	RecoveryCompleted  = "completed"
 )
 
 var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateCompleted, StateFailed, StateTimedOut}
@@ -49,6 +52,27 @@ type Work struct {
 	Job  Job
 }
 
+// OpenStoreReadOnly validates and inspects an existing database without
+// running migrations or creating SQLite journal files.
+func OpenStoreReadOnly(path string) (*Store, error) {
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read sqlite schema version: %w", err)
+	}
+	if version < 1 || version > SchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("unsupported sqlite schema version %d", version)
+	}
+	return &Store{db: db}, nil
+}
+
 func OpenStore(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -70,6 +94,10 @@ func OpenStore(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS dispatcher_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 		`INSERT INTO dispatcher_metadata(key,value) VALUES('last_persisted_jetstream_sequence',0) ON CONFLICT(key) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS recovery_runs (recovery_id TEXT PRIMARY KEY, durable TEXT NOT NULL, manifest_sequence INTEGER NOT NULL, start_sequence INTEGER NOT NULL, restored_job_count INTEGER NOT NULL DEFAULT -1, replay_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, completed_at INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS recovery_jobs (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, semantic_key TEXT NOT NULL, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, attempts INTEGER NOT NULL, first_launch_attempt_at INTEGER, PRIMARY KEY(recovery_id,job_id))`,
+		`CREATE TABLE IF NOT EXISTS recovery_reconciliations (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, broker_status TEXT NOT NULL, reconciled_status TEXT NOT NULL, reconciled_at INTEGER NOT NULL, PRIMARY KEY(recovery_id,job_id))`,
+		`CREATE TABLE IF NOT EXISTS recovery_replayed_messages (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), stream_sequence INTEGER NOT NULL, PRIMARY KEY(recovery_id,stream_sequence))`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -94,7 +122,7 @@ func OpenStore(path string) (*Store, error) {
 		`UPDATE jobs SET status='failed' WHERE status IN ('succeeded','terminal')`,
 		`CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at)`,
 		`UPDATE dispatcher_metadata SET value=MAX(value,(SELECT COALESCE(MAX(stream_sequence),0) FROM deliveries)) WHERE key='last_persisted_jetstream_sequence'`,
-		`PRAGMA user_version=1`,
+		`PRAGMA user_version=2`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
@@ -137,6 +165,20 @@ func (s *Store) Ready(ctx context.Context) error { return s.db.PingContext(ctx) 
 // atomically. The sequence is the recovery checkpoint: a restored consumer can
 // replay starting at RecoverySequence without losing accepted work.
 func (s *Store) Record(ctx context.Context, deliveryID, outcome string, streamSequence uint64, candidate *Candidate, now time.Time) error {
+	return s.record(ctx, "", deliveryID, outcome, streamSequence, candidate, now)
+}
+
+// RecordRecovery persists replay evidence in the same transaction as the
+// delivery checkpoint. A crash can therefore redeliver a message, but cannot
+// make the recorded replay count disagree with durable SQLite state.
+func (s *Store) RecordRecovery(ctx context.Context, recoveryID, deliveryID, outcome string, streamSequence uint64, candidate *Candidate, now time.Time) error {
+	if recoveryID == "" {
+		return errors.New("recovery id is required")
+	}
+	return s.record(ctx, recoveryID, deliveryID, outcome, streamSequence, candidate, now)
+}
+
+func (s *Store) record(ctx context.Context, recoveryID, deliveryID, outcome string, streamSequence uint64, candidate *Candidate, now time.Time) error {
 	if streamSequence == 0 {
 		return errors.New("positive JetStream stream sequence is required")
 	}
@@ -148,6 +190,25 @@ func (s *Store) Record(ctx context.Context, deliveryID, outcome string, streamSe
 		return err
 	}
 	defer tx.Rollback()
+	if recoveryID != "" {
+		result, err := tx.ExecContext(ctx, `INSERT INTO recovery_replayed_messages(recovery_id,stream_sequence) SELECT ?,? WHERE EXISTS (SELECT 1 FROM recovery_runs WHERE recovery_id=? AND status=?) ON CONFLICT DO NOTHING`, recoveryID, streamSequence, recoveryID, RecoveryIncomplete)
+		if err != nil {
+			return err
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if inserted == 0 {
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recovery_runs WHERE recovery_id=? AND status=?`, recoveryID, RecoveryIncomplete).Scan(&exists); err != nil {
+				return err
+			}
+			if exists != 1 {
+				return errors.New("recovery is not incomplete")
+			}
+		}
+	}
 	semantic := ""
 	if candidate != nil {
 		semantic = candidate.SemanticKey()
@@ -178,6 +239,239 @@ func (s *Store) Record(ctx context.Context, deliveryID, outcome string, streamSe
 		return err
 	}
 	return tx.Commit()
+}
+
+type RecoveryRun struct {
+	ID               string `json:"recovery_id"`
+	Durable          string `json:"durable"`
+	ManifestSequence uint64 `json:"manifest_last_persisted_jetstream_sequence"`
+	StartSequence    uint64 `json:"start_sequence"`
+	ReplayCount      uint64 `json:"replay_count"`
+	Status           string `json:"status"`
+	Error            string `json:"error,omitempty"`
+}
+
+type Reconciliation struct {
+	JobID            int64  `json:"job_id"`
+	BrokerRunID      string `json:"broker_run_id"`
+	PriorStatus      string `json:"prior_status"`
+	BrokerStatus     string `json:"broker_status"`
+	ReconciledStatus string `json:"reconciled_status"`
+}
+
+func (s *Store) BeginRecovery(ctx context.Context, id, durable string, manifestSequence uint64, now time.Time) error {
+	if id == "" || durable == "" {
+		return errors.New("recovery id and durable are required")
+	}
+	checkpoint, err := s.recoveryCheckpoint(ctx)
+	if err != nil {
+		return err
+	}
+	if checkpoint != manifestSequence {
+		return fmt.Errorf("manifest sequence %d does not match restored SQLite checkpoint %d", manifestSequence, checkpoint)
+	}
+	start := manifestSequence + 1
+	result, err := s.db.ExecContext(ctx, `INSERT INTO recovery_runs(recovery_id,durable,manifest_sequence,start_sequence,status,started_at) VALUES(?,?,?,?,?,?) ON CONFLICT(recovery_id) DO NOTHING`, id, durable, manifestSequence, start, RecoveryIncomplete, now.UnixMilli())
+	if err != nil {
+		return err
+	}
+	inserted, _ := result.RowsAffected()
+	var run RecoveryRun
+	if err := s.db.QueryRowContext(ctx, `SELECT recovery_id,durable,manifest_sequence,start_sequence,replay_count,status,error FROM recovery_runs WHERE recovery_id=?`, id).Scan(&run.ID, &run.Durable, &run.ManifestSequence, &run.StartSequence, &run.ReplayCount, &run.Status, &run.Error); err != nil {
+		return err
+	}
+	if run.Durable != durable || run.ManifestSequence != manifestSequence || run.StartSequence != start || run.Status == RecoveryCompleted && inserted == 0 {
+		return errors.New("recovery id already exists with different or completed parameters")
+	}
+	var other int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM recovery_runs WHERE status=? AND recovery_id<>?`, RecoveryIncomplete, id).Scan(&other); err != nil {
+		return err
+	}
+	if other != 0 {
+		return errors.New("another recovery is incomplete")
+	}
+	return nil
+}
+
+func (s *Store) FailRecovery(ctx context.Context, id string, failure error) error {
+	message := "recovery failed"
+	if failure != nil {
+		message = failure.Error()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE recovery_runs SET error=? WHERE recovery_id=? AND status=?`, message, id, RecoveryIncomplete)
+	return err
+}
+
+func (s *Store) RecoveryJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?) ORDER BY id`, StatePendingLaunch, StateLaunchRetry, StateLaunched)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		var first sql.NullInt64
+		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
+			return nil, err
+		}
+		if first.Valid {
+			job.FirstAttemptAt = time.UnixMilli(first.Int64)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// PrepareRecoveryJobs freezes the restored nonterminal set before replay can
+// add new jobs. It is resumable after partial reconciliation.
+func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var expected int
+	if err := tx.QueryRowContext(ctx, `SELECT restored_job_count FROM recovery_runs WHERE recovery_id=? AND status=?`, recoveryID, RecoveryIncomplete).Scan(&expected); err != nil {
+		return nil, err
+	}
+	if expected < 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_jobs(recovery_id,job_id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at) SELECT ?,id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?)`, recoveryID, StatePendingLaunch, StateLaunchRetry, StateLaunched); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recovery_jobs WHERE recovery_id=?`, recoveryID).Scan(&expected); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE recovery_runs SET restored_job_count=? WHERE recovery_id=? AND restored_job_count=-1`, expected, recoveryID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at FROM recovery_jobs WHERE recovery_id=? ORDER BY job_id`, recoveryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]Job, 0, expected)
+	for rows.Next() {
+		var job Job
+		var first sql.NullInt64
+		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
+			return nil, err
+		}
+		if first.Valid {
+			job.FirstAttemptAt = time.UnixMilli(first.Int64)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (s *Store) RecordReconciliation(ctx context.Context, recoveryID string, job Job, brokerStatus, reconciledStatus string, now time.Time) error {
+	if job.Status != StateLaunched || job.BrokerRunID == "" {
+		return fmt.Errorf("restored nonterminal job %d has no reconcilable broker run", job.ID)
+	}
+	if !validLifecycleState(reconciledStatus) || reconciledStatus == StatePendingLaunch || reconciledStatus == StateLaunchRetry {
+		return fmt.Errorf("invalid reconciled status %q", reconciledStatus)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recovery_reconciliations WHERE recovery_id=? AND job_id=?`, recoveryID, job.ID).Scan(&existing); err != nil {
+		return err
+	}
+	if existing == 1 {
+		return tx.Commit()
+	}
+	due := now
+	if reconciledStatus == StateLaunched {
+		due = now.Add(StatusPollInterval)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error='',updated_at=? WHERE id=? AND status=? AND broker_run_id=?`, reconciledStatus, due.UnixMilli(), now.UnixMilli(), job.ID, job.Status, job.BrokerRunID)
+	if err := expectOne(result, err, "reconcile job"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_reconciliations(recovery_id,job_id,broker_run_id,prior_status,broker_status,reconciled_status,reconciled_at) VALUES(?,?,?,?,?,?,?)`, recoveryID, job.ID, job.BrokerRunID, job.Status, brokerStatus, reconciledStatus, now.UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CompleteRecovery(ctx context.Context, id string, expectedReconciliations int, now time.Time) (RecoveryRun, []Reconciliation, error) {
+	var reconciled int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM recovery_reconciliations WHERE recovery_id=?`, id).Scan(&reconciled); err != nil {
+		return RecoveryRun{}, nil, err
+	}
+	if reconciled != expectedReconciliations {
+		return RecoveryRun{}, nil, fmt.Errorf("recorded %d reconciliations for %d restored nonterminal jobs", reconciled, expectedReconciliations)
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE recovery_runs SET replay_count=(SELECT count(*) FROM recovery_replayed_messages WHERE recovery_id=?),status=?,error='',completed_at=? WHERE recovery_id=? AND status=?`, id, RecoveryCompleted, now.UnixMilli(), id, RecoveryIncomplete)
+	if err := expectOne(result, err, "complete recovery"); err != nil {
+		return RecoveryRun{}, nil, err
+	}
+	return s.RecoveryEvidence(ctx, id)
+}
+
+func (s *Store) RecoveryEvidence(ctx context.Context, id string) (RecoveryRun, []Reconciliation, error) {
+	var run RecoveryRun
+	if err := s.db.QueryRowContext(ctx, `SELECT recovery_id,durable,manifest_sequence,start_sequence,replay_count,status,error FROM recovery_runs WHERE recovery_id=?`, id).Scan(&run.ID, &run.Durable, &run.ManifestSequence, &run.StartSequence, &run.ReplayCount, &run.Status, &run.Error); err != nil {
+		return RecoveryRun{}, nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id,broker_run_id,prior_status,broker_status,reconciled_status FROM recovery_reconciliations WHERE recovery_id=? ORDER BY job_id`, id)
+	if err != nil {
+		return RecoveryRun{}, nil, err
+	}
+	defer rows.Close()
+	var outcomes []Reconciliation
+	for rows.Next() {
+		var outcome Reconciliation
+		if err := rows.Scan(&outcome.JobID, &outcome.BrokerRunID, &outcome.PriorStatus, &outcome.BrokerStatus, &outcome.ReconciledStatus); err != nil {
+			return RecoveryRun{}, nil, err
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	return run, outcomes, rows.Err()
+}
+
+func (s *Store) AssertRecoveryComplete(ctx context.Context, durable string, startSequence uint64) error {
+	var incomplete int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM recovery_runs WHERE status=?`, RecoveryIncomplete).Scan(&incomplete); err != nil {
+		return err
+	}
+	if incomplete != 0 {
+		return errors.New("dispatcher recovery is incomplete; launches are blocked")
+	}
+	if startSequence == 0 {
+		return nil
+	}
+	var completed int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM recovery_runs WHERE durable=? AND start_sequence=? AND status=?`, durable, startSequence, RecoveryCompleted).Scan(&completed); err != nil {
+		return err
+	}
+	if completed != 1 {
+		return errors.New("dispatcher recovery configuration has no matching completed recovery")
+	}
+	return nil
+}
+
+func (s *Store) recoveryCheckpoint(ctx context.Context) (uint64, error) {
+	var checkpoint uint64
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM dispatcher_metadata WHERE key=?`, checkpointKey).Scan(&checkpoint)
+	return checkpoint, err
+}
+
+func validLifecycleState(status string) bool {
+	for _, state := range lifecycleStates {
+		if status == state {
+			return true
+		}
+	}
+	return false
 }
 
 func nullable(value string) any {
