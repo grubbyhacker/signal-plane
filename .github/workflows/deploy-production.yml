@@ -49,6 +49,20 @@ jobs:
 
           echo "deploy_sha=$deploy_sha" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve immutable deployment image
+        id: deploy_image
+        env:
+          IMAGE_TAG: "ghcr.io/grubbyhacker/signal-plane:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}"
+        run: |
+          set -euo pipefail
+
+          digest="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Published image did not resolve to an immutable OCI digest" >&2
+            exit 1
+          fi
+          echo "image=ghcr.io/grubbyhacker/signal-plane@${digest}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout vps-ops
         uses: actions/checkout@v7
         with:
@@ -96,7 +110,7 @@ jobs:
           VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_SECRET_ACCESS_KEY: ${{ secrets.VPS_OPS_SIGNAL_PLANE_DISPATCHER_BACKUP_AWS_SECRET_ACCESS_KEY }}
         run: |
           scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-signal-plane.yml \
-            -e "signal_plane_image=ghcr.io/grubbyhacker/signal-plane:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
+            -e "signal_plane_image=${{ steps.deploy_image.outputs.image }}" \
             -e "ansible_host=${DEPLOY_HOST}" \
             -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
