@@ -45,8 +45,10 @@ rejected after metadata-only logging; successful observer work uses synchronous
 JetStream acknowledgement.
 
 `github-task-dispatcher` serves the same private operational endpoints on its
-configured address (default `:8082`). When disabled it remains alive in standby:
-health is healthy and readiness returns `503` with `disabled`. Its SQLite schema never
+configured address (default `:8082`). When disabled it initializes and validates
+the configured SQLite schema and checkpoint metadata, then remains alive in
+standby: health is healthy and readiness returns `503` with `disabled`. Standby
+does not read the broker token or connect to NATS. Its SQLite schema never
 stores issue title, body, comments, or the provider payload. The broker request
 is `POST dispatcher.broker_url` with this fixed shape:
 
