@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that deployment resolves the published full-SHA tag to a digest."""
+"""Validate immutable image deployment and retired proof-route boundaries."""
 
 from pathlib import Path
 
@@ -21,6 +21,9 @@ def main() -> int:
         "image=ghcr.io/grubbyhacker/signal-plane@${digest}",
         'signal_plane_image=${{ steps.deploy_image.outputs.image }}',
     )
+    forbidden_deploy_fragments = (
+        "VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
+    )
 
     errors: list[str] = []
     if required_publish not in publish:
@@ -34,13 +37,19 @@ def main() -> int:
                 "deploy-production.yml must resolve the full-SHA tag and pass its immutable digest: "
                 f"missing {fragment!r}"
             )
+    for fragment in forbidden_deploy_fragments:
+        if fragment in deploy:
+            errors.append(
+                "deploy-production.yml must not export retired proof-route secrets: "
+                f"found {fragment!r}"
+            )
 
     if errors:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
 
-    print("Image publish tag and immutable deployment digest contract are aligned.")
+    print("Image deployment and retired proof-route secret contracts are aligned.")
     return 0
 
 
