@@ -2,13 +2,75 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 )
+
+func TestDisabledStandbyPreparesStoreWithoutBrokerOrNATS(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "dispatcher.db")
+	t.Setenv("DISABLED_STANDBY_BROKER_TOKEN", "")
+	listenerCalled := false
+	listenerStopped := errors.New("listener stopped")
+	err := runDisabledStandby(config.Config{
+		NATS: config.NATSConfig{URL: "nats://127.0.0.1:1"},
+		Dispatcher: config.DispatcherConfig{
+			Addr:           "127.0.0.1:0",
+			DatabasePath:   database,
+			BrokerTokenEnv: "DISABLED_STANDBY_BROKER_TOKEN",
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), dispatcher.NewMetrics(), func(addr string, handler http.Handler) error {
+		listenerCalled = true
+		if addr != "127.0.0.1:0" {
+			t.Fatalf("listener address = %q", addr)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("standby readiness status = %d", response.Code)
+		}
+		return listenerStopped
+	})
+	if !errors.Is(err, listenerStopped) {
+		t.Fatalf("run disabled standby: %v", err)
+	}
+	if !listenerCalled {
+		t.Fatal("standby listener was not called")
+	}
+	store, err := dispatcher.OpenStoreReadOnly(database)
+	if err != nil {
+		t.Fatalf("open prepared store: %v", err)
+	}
+	defer store.Close()
+	schema, checkpoint, start, err := store.RecoveryMetadata(context.Background())
+	if err != nil || schema != dispatcher.SchemaVersion || checkpoint != 0 || start != 1 {
+		t.Fatalf("prepared metadata schema=%d checkpoint=%d start=%d err=%v", schema, checkpoint, start, err)
+	}
+}
+
+func TestDisabledStandbyFailsClosedWhenStoreCannotInitialize(t *testing.T) {
+	listenerCalled := false
+	err := runDisabledStandby(config.Config{Dispatcher: config.DispatcherConfig{DatabasePath: t.TempDir()}}, slog.New(slog.NewTextHandler(io.Discard, nil)), dispatcher.NewMetrics(), func(string, http.Handler) error {
+		listenerCalled = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected store initialization error")
+	}
+	if listenerCalled {
+		t.Fatal("standby listener started after store initialization failed")
+	}
+}
 
 func TestRecoveryMetadataCommandEmptyDatabase(t *testing.T) {
 	var output bytes.Buffer

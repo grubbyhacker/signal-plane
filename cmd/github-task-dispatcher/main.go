@@ -42,9 +42,7 @@ func main() {
 	}
 	metrics := dispatcher.NewMetrics()
 	if !cfg.Dispatcher.Enabled {
-		metrics.SetDisabled()
-		logger.Info("github-task-dispatcher disabled; entering standby", "version", buildinfo.Version, "addr", cfg.Dispatcher.Addr)
-		if err := http.ListenAndServe(cfg.Dispatcher.Addr, metrics.Handler()); err != nil {
+		if err := runDisabledStandby(cfg, logger, metrics, http.ListenAndServe); err != nil {
 			logger.Error("dispatcher standby HTTP listener exited", "error", err)
 			os.Exit(1)
 		}
@@ -103,6 +101,25 @@ func main() {
 		metrics.SetReady(true)
 		dispatcher.Process(ctx, logger, metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
+}
+
+// runDisabledStandby prepares the durable store before exposing standby health.
+// It deliberately does not read the broker token or initialize event transport.
+func runDisabledStandby(cfg config.Config, logger *slog.Logger, metrics *dispatcher.Metrics, listenAndServe func(string, http.Handler) error) error {
+	store, err := dispatcher.OpenStore(cfg.Dispatcher.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("initialize standby job store: %w", err)
+	}
+	if _, _, _, err := store.RecoveryMetadata(context.Background()); err != nil {
+		store.Close()
+		return fmt.Errorf("validate standby job store metadata: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("close standby job store: %w", err)
+	}
+	metrics.SetDisabled()
+	logger.Info("github-task-dispatcher disabled; entering standby", "version", buildinfo.Version, "addr", cfg.Dispatcher.Addr)
+	return listenAndServe(cfg.Dispatcher.Addr, metrics.Handler())
 }
 
 func runRecovery(args []string, output io.Writer) error {
