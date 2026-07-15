@@ -153,6 +153,9 @@ func TestStagingSyntheticReleaseToDeployedYouKnowMe(t *testing.T) {
 	if worked, err := router.WorkOne(ctx); err != nil || !worked {
 		t.Fatalf("same-content execution: worked=%v err=%v", worked, err)
 	}
+	if recordedYKM.calls != 1 {
+		t.Fatalf("same-content release called YouKnowMe again: calls=%d want=1", recordedYKM.calls)
+	}
 	replayedUploadID, replayedResult, ok, err := store.ContentResult(ctx, digest)
 	if err != nil || !ok || replayedUploadID != uploadID || replayedResult != resultDigest {
 		t.Fatalf("content replay: upload=%q result=%q ok=%v err=%v", replayedUploadID, replayedResult, ok, err)
