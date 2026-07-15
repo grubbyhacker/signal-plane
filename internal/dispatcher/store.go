@@ -8,11 +8,12 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	SchemaVersion      = 2
+	SchemaVersion      = workledger.SchemaVersion
 	checkpointKey      = "last_persisted_jetstream_sequence"
 	StatePendingLaunch = "pending_launch"
 	StateLaunchRetry   = "launch_retry"
@@ -122,12 +123,15 @@ func OpenStore(path string) (*Store, error) {
 		`UPDATE jobs SET status='failed' WHERE status IN ('succeeded','terminal')`,
 		`CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at)`,
 		`UPDATE dispatcher_metadata SET value=MAX(value,(SELECT COALESCE(MAX(stream_sequence),0) FROM deliveries)) WHERE key='last_persisted_jetstream_sequence'`,
-		`PRAGMA user_version=2`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("initialize lifecycle: %w", err)
 		}
+	}
+	if err := workledger.Migrate(context.Background(), db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return &Store{db: db}, nil
 }

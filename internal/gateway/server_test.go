@@ -165,7 +165,7 @@ func TestGitHubRoutePublishesAllowedEvent(t *testing.T) {
 		},
 	}
 	server := New(slog.Default(), []config.Route{route}, publisher)
-	body := []byte(`{"action":"opened","repository":{"full_name":"grubbyhacker/signal-plane"}}`)
+	body := []byte(`{"action":"opened","repository":{"full_name":"grubbyhacker/signal-plane"},"pull_request":{"number":42,"updated_at":"2026-07-14T12:00:00Z","head":{"sha":"abc123"}},"sender":{"type":"User"}}`)
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", strings.NewReader(string(body)))
 	req.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
@@ -180,6 +180,10 @@ func TestGitHubRoutePublishesAllowedEvent(t *testing.T) {
 	}
 	if publisher.signal.Meta.SourceDeliveryID != "delivery-1" {
 		t.Fatalf("delivery id = %q", publisher.signal.Meta.SourceDeliveryID)
+	}
+	meta := publisher.signal.Meta
+	if !meta.Authentication.Verified || meta.Authentication.Method != "github_hmac_sha256" || meta.Namespace != "grubbyhacker/signal-plane" || meta.ObjectKind != "pull_request" || meta.ObjectID != "42" || meta.SourceRevision != "abc123" || meta.ActorClass != "user" {
+		t.Fatalf("normalized authenticated metadata = %#v", meta)
 	}
 	var preserved map[string]any
 	if err := json.Unmarshal(publisher.signal.Payload, &preserved); err != nil {
