@@ -72,6 +72,30 @@ func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
 	}
 }
 
+func TestValidateWorkRouterAuthModesFailClosed(t *testing.T) {
+	base := Config{Gateway: GatewayConfig{Addr: ":8080"}, NATS: NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}}, Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}}}
+	base.WorkRouter = WorkRouterConfig{Enabled: true, Subject: "signals.github.webhook", Durable: "resume-release-router", DatabasePath: "jobs.db", YKMURL: "https://mcp.fleiglabs.cc/mcp", YKMAuthMode: "cloudflare_access", GitHubPrivateKeyPath: "/run/secrets/app.pem", YKMClientIDEnv: "CF_ID", YKMClientSecretEnv: "CF_SECRET"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid production mode rejected: %v", err)
+	}
+	local := base
+	local.WorkRouter.YKMURL = "http://youknowme-mcp:8765/mcp"
+	local.WorkRouter.YKMAuthMode = "local_secret"
+	local.WorkRouter.YKMClientIDEnv = ""
+	local.WorkRouter.YKMClientSecretEnv = ""
+	local.WorkRouter.YKMLocalSecretEnv = "YKM_LOCAL_SECRET"
+	if err := local.Validate(); err != nil {
+		t.Fatalf("valid local mode rejected: %v", err)
+	}
+	for _, mutate := range []func(*Config){func(c *Config) { c.WorkRouter.YKMAuthMode = "caller" }, func(c *Config) { c.WorkRouter.YKMURL = "https://mcp.example.test/other" }, func(c *Config) { c.WorkRouter.YKMLocalSecretEnv = "EXTRA" }, func(c *Config) { c.WorkRouter.GitHubPrivateKeyPath = "" }} {
+		cfg := base
+		mutate(&cfg)
+		if cfg.Validate() == nil {
+			t.Fatalf("invalid work router accepted: %#v", cfg.WorkRouter)
+		}
+	}
+}
+
 func TestValidateRejectsDuplicateRoutePaths(t *testing.T) {
 	cfg := Config{
 		Gateway: GatewayConfig{Addr: ":8080"},

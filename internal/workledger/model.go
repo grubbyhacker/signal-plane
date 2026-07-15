@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 type WorkState string
 
@@ -170,6 +170,7 @@ type ExecutorAttempt struct {
 	ExecutorKind             ExecutorKind
 	ExecutorVersion          string
 	IdempotencyKey           string
+	OperationIdempotencyKey  string
 	RequestedOperationDigest string
 	State                    AttemptState
 	RetryClassification      string
@@ -182,6 +183,39 @@ type AdmissionResult struct {
 	WorkItem  WorkItem
 	EventID   string
 	Duplicate bool
+}
+
+type ReleaseOperation struct {
+	RepositoryID, InstallationID, ReleaseID                     int64
+	Repository, Tag, PublishedAt, TargetCommitish, CommitSHA    string
+	AssetID, AssetSize                                          int64
+	AssetName, AssetContentType, ProviderDigest, ComputedDigest string
+}
+
+func (operation ReleaseOperation) Validate() error {
+	if operation.Repository != "grubbyhacker/resume-builder" || operation.RepositoryID <= 0 || operation.InstallationID != 146625575 || operation.ReleaseID <= 0 || operation.AssetID <= 0 || operation.AssetSize <= 0 || operation.AssetSize > 20*1024 {
+		return errors.New("release operation has invalid fixed identity or bounds")
+	}
+	for name, value := range map[string]string{"tag": operation.Tag, "published_at": operation.PublishedAt, "target_commitish": operation.TargetCommitish, "commit_sha": operation.CommitSHA, "asset_name": operation.AssetName, "asset_content_type": operation.AssetContentType, "provider_digest": operation.ProviderDigest, "computed_digest": operation.ComputedDigest} {
+		if value == "" || len(value) > 256 {
+			return fmt.Errorf("release operation %s is missing or oversized", name)
+		}
+	}
+	tagPattern := regexp.MustCompile(`^v\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}$`)
+	if !tagPattern.MatchString(operation.Tag) || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(operation.CommitSHA) {
+		return errors.New("release operation tag or commit contract is invalid")
+	}
+	date := strings.ReplaceAll(operation.Tag[1:11], ".", "")
+	if _, err := time.Parse(time.RFC3339, operation.PublishedAt); err != nil {
+		return errors.New("release operation published_at is invalid")
+	}
+	if operation.TargetCommitish != operation.CommitSHA || operation.AssetContentType != "text/markdown" || operation.Tag[len(operation.Tag)-7:] != operation.CommitSHA[:7] || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*_`+date+`\.structured\.md$`).MatchString(operation.AssetName) {
+		return errors.New("release operation tag, commit, or asset contract is invalid")
+	}
+	if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(operation.ProviderDigest) || operation.ProviderDigest != operation.ComputedDigest {
+		return errors.New("release operation digest contract is invalid")
+	}
+	return nil
 }
 
 func DecodeRouteDefinition(data []byte) (RouteDefinition, error) {

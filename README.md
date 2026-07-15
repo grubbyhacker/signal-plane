@@ -20,6 +20,15 @@ proof dispatcher. The registry accepts only compiled executor implementations;
 route JSON cannot select commands, URLs, images, credentials, or authority.
 No generalized production route is active in this slice.
 
+The disabled-by-default `resume-release-router` is the first compiled
+deterministic executor. When deployment-owned configuration enables it, it
+admits only GitHub `release/published` events for
+`grubbyhacker/resume-builder`, verifies the numeric release, tag, full commit,
+canonical structured-Markdown asset, and SHA-256 digests through the fixed
+read-only GitHub App identity, then calls YouKnowMe with a content-derived
+idempotency key. Release prose and caller-selected URLs, commands, images,
+credentials, authority, or merge choices never enter its operation schema.
+
 The gateway remains generic. Agent-specific selection and durable job state are
 isolated in `github-task-dispatcher`.
 
@@ -43,6 +52,10 @@ isolated in `github-task-dispatcher`.
   a SQLite store. GitHub is the first authenticated ingress adapter. The core
   carries namespace/object identity plus correlation and causation without
   assuming that every future source is GitHub.
+- `resume-release-router`: inert generalized router and
+  `youknowme_upload_v1` executor. It supports only deployment-owned
+  `cloudflare_access` or `local_secret` YouKnowMe authentication and loads the
+  GitHub App PEM from a mounted file.
 
 ## Service endpoints
 
@@ -125,7 +138,7 @@ Build the service image with:
 docker build -t signal-plane:local .
 ```
 
-The image contains all three binaries; the default
+The image contains all four binaries; the default
 entrypoint runs the gateway, and deployment tooling can override the command to
 run the observer or dispatcher.
 

@@ -22,6 +22,19 @@ dispatcher:
   broker_token_env: GITHUB_TASK_DISPATCHER_BROKER_TOKEN
   workers: 1
 
+# Compiled deterministic Resume Builder release route. It remains inert until
+# deployment-owned configuration and secrets explicitly enable it.
+work_router:
+  enabled: false
+  addr: ":8083"
+  subject: signals.github.webhook
+  durable: resume-release-router
+  database_path: github-task-dispatcher.db
+  ykm_url: http://youknowme-mcp:8765/mcp
+  ykm_auth_mode: local_secret
+  github_private_key_path: /run/secrets/github-fleiglabs-release-reader-app.pem
+  ykm_local_secret_env: SIGNAL_PLANE_YKM_LOCAL_SECRET
+
 routes:
   - id: manual-local
     path: /manual

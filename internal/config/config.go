@@ -23,7 +23,22 @@ type Config struct {
 	Gateway    GatewayConfig    `yaml:"gateway"`
 	NATS       NATSConfig       `yaml:"nats"`
 	Dispatcher DispatcherConfig `yaml:"dispatcher"`
+	WorkRouter WorkRouterConfig `yaml:"work_router"`
 	Routes     []Route          `yaml:"routes"`
+}
+
+type WorkRouterConfig struct {
+	Enabled              bool   `yaml:"enabled"`
+	Addr                 string `yaml:"addr"`
+	Subject              string `yaml:"subject"`
+	Durable              string `yaml:"durable"`
+	DatabasePath         string `yaml:"database_path"`
+	YKMURL               string `yaml:"ykm_url"`
+	YKMAuthMode          string `yaml:"ykm_auth_mode"`
+	GitHubPrivateKeyPath string `yaml:"github_private_key_path"`
+	YKMClientIDEnv       string `yaml:"ykm_client_id_env"`
+	YKMClientSecretEnv   string `yaml:"ykm_client_secret_env"`
+	YKMLocalSecretEnv    string `yaml:"ykm_local_secret_env"`
 }
 
 type DispatcherConfig struct {
@@ -134,6 +149,18 @@ func applyEnv(cfg *Config) {
 	if cfg.Dispatcher.Workers == 0 {
 		cfg.Dispatcher.Workers = 1
 	}
+	if cfg.WorkRouter.Addr == "" {
+		cfg.WorkRouter.Addr = ":8083"
+	}
+	if cfg.WorkRouter.Subject == "" {
+		cfg.WorkRouter.Subject = "signals.github.webhook"
+	}
+	if cfg.WorkRouter.Durable == "" {
+		cfg.WorkRouter.Durable = "resume-release-router"
+	}
+	if cfg.WorkRouter.DatabasePath == "" {
+		cfg.WorkRouter.DatabasePath = "github-task-dispatcher.db"
+	}
 
 	for i := range cfg.Routes {
 		if cfg.Routes[i].MaxBodyBytes == 0 {
@@ -168,6 +195,28 @@ func (cfg Config) Validate() error {
 		brokerURL, err := url.Parse(cfg.Dispatcher.BrokerURL)
 		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || brokerURL.EscapedPath() != BrokerProfilePath || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
 			return fmt.Errorf("enabled dispatcher broker_url must be the exact codex issue profile endpoint ending in %s", BrokerProfilePath)
+		}
+	}
+	if cfg.WorkRouter.Enabled {
+		wr := cfg.WorkRouter
+		if wr.Subject == "" || wr.Durable == "" || wr.DatabasePath == "" || wr.YKMURL == "" || wr.GitHubPrivateKeyPath == "" {
+			return errors.New("enabled work_router requires subject, durable, database_path, ykm_url, and github_private_key_path")
+		}
+		parsed, err := url.Parse(wr.YKMURL)
+		if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "/mcp" || parsed.Host == "" {
+			return errors.New("work_router ykm_url must be a fixed MCP endpoint")
+		}
+		switch wr.YKMAuthMode {
+		case "cloudflare_access":
+			if wr.YKMURL != "https://mcp.fleiglabs.cc/mcp" || wr.YKMClientIDEnv == "" || wr.YKMClientSecretEnv == "" || wr.YKMLocalSecretEnv != "" {
+				return errors.New("cloudflare_access work_router requires HTTPS client ID/secret env names only")
+			}
+		case "local_secret":
+			if wr.YKMURL != "http://youknowme-mcp:8765/mcp" || wr.YKMLocalSecretEnv == "" || wr.YKMClientIDEnv != "" || wr.YKMClientSecretEnv != "" {
+				return errors.New("local_secret work_router requires a private local URL and local secret env name only")
+			}
+		default:
+			return errors.New("enabled work_router has unsupported ykm_auth_mode")
 		}
 	}
 
