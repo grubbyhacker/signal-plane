@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -53,6 +54,8 @@ func (store *Store) Close() error {
 	}
 	return nil
 }
+
+func (store *Store) Ready(ctx context.Context) error { return store.db.PingContext(ctx) }
 
 func (store *Store) ActivateRoute(ctx context.Context, definition RouteDefinition, registry *Registry, now time.Time) (RouteSnapshot, error) {
 	if registry == nil {
@@ -165,7 +168,40 @@ func (store *Store) MatchRoute(ctx context.Context, event Event) (RouteSnapshot,
 	return matches[0], nil
 }
 
+func (store *Store) DeliveryRecorded(ctx context.Context, event Event) (bool, error) {
+	var digest string
+	err := store.db.QueryRowContext(ctx, `SELECT event_digest FROM work_events WHERE source=? AND namespace=? AND source_delivery_id=?`, event.Source, event.Namespace, event.SourceDeliveryID).Scan(&digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if digest != event.Digest() {
+		return false, errors.New("source delivery id conflicts with different event content")
+	}
+	return true, nil
+}
+func (store *Store) RecordIngressFailure(ctx context.Context, event Event, classification string, attempts int, now time.Time) error {
+	if attempts < 1 || classification == "" || len(classification) > 80 {
+		return errors.New("invalid bounded ingress failure")
+	}
+	_, err := store.db.ExecContext(ctx, `INSERT INTO ingress_failures(source,namespace,source_delivery_id,event_digest,classification,attempts,recorded_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,namespace,source_delivery_id) DO UPDATE SET attempts=excluded.attempts,classification=excluded.classification,recorded_at=excluded.recorded_at`, event.Source, event.Namespace, event.SourceDeliveryID, event.Digest(), classification, attempts, millis(now))
+	return err
+}
+
 func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, now time.Time) (AdmissionResult, error) {
+	return store.admit(ctx, snapshotID, event, nil, now)
+}
+
+func (store *Store) AdmitRelease(ctx context.Context, snapshotID string, event Event, operation ReleaseOperation, now time.Time) (AdmissionResult, error) {
+	if err := operation.Validate(); err != nil {
+		return AdmissionResult{}, err
+	}
+	return store.admit(ctx, snapshotID, event, &operation, now)
+}
+
+func (store *Store) admit(ctx context.Context, snapshotID string, event Event, operation *ReleaseOperation, now time.Time) (AdmissionResult, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AdmissionResult{}, err
@@ -190,6 +226,12 @@ func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, n
 	if err == nil {
 		if storedDigest != eventDigest {
 			return AdmissionResult{}, errors.New("source delivery id conflicts with different event content")
+		}
+		if operation != nil {
+			stored, loadErr := loadReleaseOperation(ctx, tx, duplicateWorkID)
+			if loadErr != nil || stored != *operation {
+				return AdmissionResult{}, errors.New("duplicate delivery conflicts with durable release operation")
+			}
 		}
 		item, err := loadWorkItem(ctx, tx, duplicateWorkID)
 		return AdmissionResult{WorkItem: item, EventID: duplicateEventID, Duplicate: true}, err
@@ -221,6 +263,16 @@ func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, n
 	} else if err != nil {
 		return AdmissionResult{}, err
 	}
+	if operation != nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO release_operations(work_item_id,repository,repository_id,installation_id,release_id,tag,published_at,target_commitish,commit_sha,asset_id,asset_name,asset_size,asset_content_type,provider_digest,computed_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO NOTHING`, item.ID, operation.Repository, operation.RepositoryID, operation.InstallationID, operation.ReleaseID, operation.Tag, operation.PublishedAt, operation.TargetCommitish, operation.CommitSHA, operation.AssetID, operation.AssetName, operation.AssetSize, operation.AssetContentType, operation.ProviderDigest, operation.ComputedDigest)
+		if err != nil {
+			return AdmissionResult{}, err
+		}
+		stored, loadErr := loadReleaseOperation(ctx, tx, item.ID)
+		if loadErr != nil || stored != *operation {
+			return AdmissionResult{}, errors.New("work item conflicts with durable release operation")
+		}
+	}
 	eventID := newID("event")
 	_, err = tx.ExecContext(ctx, `INSERT INTO work_events(id,work_item_id,signal_id,source_delivery_id,event_digest,transport_stream,transport_sequence,source,namespace,object_kind,object_id,event_kind,action,actor_class,source_revision,correlation_id,causation_id,root_work_item_id,parent_work_item_id,originating_session,originating_turn,hop_count,expires_at,payload_digest,evidence_ref,admission_outcome,received_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, eventID, item.ID, event.SignalID, event.SourceDeliveryID, eventDigest, event.TransportStream, event.TransportSequence, event.Source, event.Namespace, event.ObjectKind, event.ObjectID, event.EventKind, event.Action, event.ActorClass, event.SourceRevision, event.CorrelationID, event.CausationID, event.RootWorkItemID, event.ParentWorkItemID, event.OriginatingSession, event.OriginatingTurn, event.HopCount, optionalMillis(event.ExpiresAt), event.PayloadDigest, event.EvidenceRef, "admitted", millis(event.ReceivedAt), millis(now))
 	if err != nil {
@@ -230,6 +282,48 @@ func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, n
 		return AdmissionResult{}, err
 	}
 	return AdmissionResult{WorkItem: item, EventID: eventID}, nil
+}
+
+func (store *Store) ReleaseOperation(ctx context.Context, workItemID string) (ReleaseOperation, error) {
+	return loadReleaseOperation(ctx, store.db, workItemID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func loadReleaseOperation(ctx context.Context, query rowQuerier, workItemID string) (ReleaseOperation, error) {
+	var value ReleaseOperation
+	err := query.QueryRowContext(ctx, `SELECT repository,repository_id,installation_id,release_id,tag,published_at,target_commitish,commit_sha,asset_id,asset_name,asset_size,asset_content_type,provider_digest,computed_digest FROM release_operations WHERE work_item_id=?`, workItemID).Scan(&value.Repository, &value.RepositoryID, &value.InstallationID, &value.ReleaseID, &value.Tag, &value.PublishedAt, &value.TargetCommitish, &value.CommitSHA, &value.AssetID, &value.AssetName, &value.AssetSize, &value.AssetContentType, &value.ProviderDigest, &value.ComputedDigest)
+	return value, err
+}
+
+func (store *Store) ContentResult(ctx context.Context, digest string) (string, string, bool, error) {
+	var external, result string
+	err := store.db.QueryRowContext(ctx, `SELECT external_correlation,result_digest FROM content_results WHERE computed_digest=?`, digest).Scan(&external, &result)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	return external, result, err == nil, err
+}
+
+func (store *Store) RecordContentResult(ctx context.Context, digest, external, result string, now time.Time) error {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO content_results(computed_digest,external_correlation,result_digest,recorded_at) VALUES(?,?,?,?) ON CONFLICT(computed_digest) DO NOTHING`, digest, external, result, millis(now)); err != nil {
+		return err
+	}
+	var storedExternal, storedResult string
+	if err = tx.QueryRowContext(ctx, `SELECT external_correlation,result_digest FROM content_results WHERE computed_digest=?`, digest).Scan(&storedExternal, &storedResult); err != nil {
+		return err
+	}
+	if storedExternal != external || storedResult != result {
+		return errors.New("content digest already has a conflicting durable result")
+	}
+	return tx.Commit()
 }
 
 func (store *Store) Claim(ctx context.Context, now time.Time) (WorkItem, ExecutorAttempt, bool, error) {
@@ -247,7 +341,7 @@ func (store *Store) Claim(ctx context.Context, now time.Time) (WorkItem, Executo
 		return WorkItem{}, ExecutorAttempt{}, false, err
 	}
 	var recovered ExecutorAttempt
-	err = tx.QueryRowContext(ctx, `SELECT id,work_item_id,attempt_number,executor_id,executor_kind,executor_version,idempotency_key,requested_operation_digest,state,retry_classification,external_correlation,result_digest,created_at FROM executor_attempts WHERE work_item_id=? AND state=? ORDER BY attempt_number DESC LIMIT 1`, item.ID, AttemptRecoverable).Scan(&recovered.ID, &recovered.WorkItemID, &recovered.AttemptNumber, &recovered.ExecutorID, &recovered.ExecutorKind, &recovered.ExecutorVersion, &recovered.IdempotencyKey, &recovered.RequestedOperationDigest, &recovered.State, &recovered.RetryClassification, &recovered.ExternalCorrelation, &recovered.ResultDigest, millisTime{target: &recovered.CreatedAt})
+	err = tx.QueryRowContext(ctx, `SELECT id,work_item_id,attempt_number,executor_id,executor_kind,executor_version,idempotency_key,operation_idempotency_key,requested_operation_digest,state,retry_classification,external_correlation,result_digest,created_at FROM executor_attempts WHERE work_item_id=? AND state=? ORDER BY attempt_number DESC LIMIT 1`, item.ID, AttemptRecoverable).Scan(&recovered.ID, &recovered.WorkItemID, &recovered.AttemptNumber, &recovered.ExecutorID, &recovered.ExecutorKind, &recovered.ExecutorVersion, &recovered.IdempotencyKey, &recovered.OperationIdempotencyKey, &recovered.RequestedOperationDigest, &recovered.State, &recovered.RetryClassification, &recovered.ExternalCorrelation, &recovered.ResultDigest, millisTime{target: &recovered.CreatedAt})
 	if err == nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,started_at=?,completed_at=NULL WHERE id=? AND state=?`, AttemptRunning, millis(now), recovered.ID, AttemptRecoverable); err != nil {
 			return WorkItem{}, ExecutorAttempt{}, false, err
@@ -279,7 +373,14 @@ func (store *Store) Claim(ctx context.Context, now time.Time) (WorkItem, Executo
 		return WorkItem{}, ExecutorAttempt{}, false, err
 	}
 	attempt := ExecutorAttempt{ID: newID("attempt"), WorkItemID: item.ID, AttemptNumber: number, ExecutorID: executorID, ExecutorKind: kind, ExecutorVersion: version, IdempotencyKey: fmt.Sprintf("executor:%s:%s:%d", item.ID, snapshotDigest, number), RequestedOperationDigest: snapshotDigest, State: AttemptRunning, CreatedAt: now.UTC()}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO executor_attempts(id,work_item_id,attempt_number,executor_id,executor_kind,executor_version,idempotency_key,requested_operation_digest,state,created_at,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, attempt.ID, attempt.WorkItemID, attempt.AttemptNumber, attempt.ExecutorID, attempt.ExecutorKind, attempt.ExecutorVersion, attempt.IdempotencyKey, attempt.RequestedOperationDigest, attempt.State, millis(now), millis(now)); err != nil {
+	var contentDigest string
+	if operationErr := tx.QueryRowContext(ctx, `SELECT computed_digest FROM release_operations WHERE work_item_id=?`, item.ID).Scan(&contentDigest); operationErr == nil {
+		attempt.OperationIdempotencyKey = "signal-plane:resume:v1:" + strings.TrimPrefix(contentDigest, "sha256:")
+		attempt.RequestedOperationDigest = contentDigest
+	} else if !errors.Is(operationErr, sql.ErrNoRows) {
+		return WorkItem{}, ExecutorAttempt{}, false, operationErr
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO executor_attempts(id,work_item_id,attempt_number,executor_id,executor_kind,executor_version,idempotency_key,operation_idempotency_key,requested_operation_digest,state,created_at,started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, attempt.ID, attempt.WorkItemID, attempt.AttemptNumber, attempt.ExecutorID, attempt.ExecutorKind, attempt.ExecutorVersion, attempt.IdempotencyKey, attempt.OperationIdempotencyKey, attempt.RequestedOperationDigest, attempt.State, millis(now), millis(now)); err != nil {
 		return WorkItem{}, ExecutorAttempt{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO serialization_leases(serialization_key,work_item_id,attempt_id,acquired_at) VALUES(?,?,?,?)`, item.SerializationKey, item.ID, attempt.ID, millis(now)); err != nil {

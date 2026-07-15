@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := future.Exec(`PRAGMA user_version=4`); err != nil {
+	if _, err := future.Exec(`PRAGMA user_version=5`); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.Close(); err != nil {
@@ -86,6 +87,44 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if store, err := Open(futurePath); err == nil {
 		store.Close()
 		t.Fatal("future schema version was accepted")
+	}
+}
+
+func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v3.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	statement := `CREATE TABLE executor_attempts (id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, executor_id TEXT NOT NULL, executor_kind TEXT NOT NULL, executor_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, requested_operation_digest TEXT NOT NULL, state TEXT NOT NULL, retry_classification TEXT NOT NULL DEFAULT '', external_correlation TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', sanitized_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, started_at INTEGER NOT NULL, completed_at INTEGER, UNIQUE(work_item_id,attempt_number)); PRAGMA user_version=3`
+	if _, err := db.Exec(statement); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`PRAGMA table_info(executor_attempts)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		found = found || name == "operation_idempotency_key"
+	}
+	if !found {
+		t.Fatal("v3 migration omitted operation idempotency evidence")
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
+		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
 
@@ -361,6 +400,85 @@ func TestGitHubAdapterRequiresAuthenticationAndPreservesCausality(t *testing.T) 
 	}
 	if event.Namespace != "example/widgets" || event.SourceRevision != "abc123" || event.CausationID != "cause-1" || event.ParentWorkItemID != "parent-1" || event.HopCount != 2 || event.PayloadDigest == "" || event.EvidenceRef != "jetstream://signals/1" {
 		t.Fatalf("normalized event lost identity or causality: %#v", event)
+	}
+}
+
+func TestReleaseOperationIsAtomicAndContentResultIsReplaySafe(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: "youknowme_upload_v1", Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	route := RouteDefinition{ID: "resume-release", SchemaVersion: 1, SemanticVersion: "1", ExecutorID: "youknowme_upload_v1", Admission: AdmissionPolicy{Sources: []string{"github"}, Namespaces: []string{"grubbyhacker/resume-builder"}, ObjectKinds: []string{"release"}, Events: []string{"release"}, Actions: []string{"published"}}, Concurrency: ConcurrencyPolicy{Serialization: SerializeObject}, Retry: RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
+	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := Event{SignalID: "signal-release", SourceDeliveryID: "delivery-release", TransportStream: "SIGNALS", TransportSequence: 1, Source: "github", Namespace: "grubbyhacker/resume-builder", ObjectKind: "release", ObjectID: "77", EventKind: "release", Action: "published", SourceRevision: "rev", PayloadDigest: "sha256:payload", EvidenceRef: "jetstream://SIGNALS/1", ReceivedAt: now}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	operation := ReleaseOperation{Repository: "grubbyhacker/resume-builder", RepositoryID: 42, InstallationID: 146625575, ReleaseID: 77, Tag: "v2026.07.14-abcdef0", PublishedAt: "2026-07-14T12:00:00Z", TargetCommitish: "abcdef0123456789abcdef0123456789abcdef01", CommitSHA: "abcdef0123456789abcdef0123456789abcdef01", AssetID: 9, AssetName: "Roger_Fleig_20260714.structured.md", AssetSize: 20, AssetContentType: "text/markdown", ProviderDigest: digest, ComputedDigest: digest}
+	admitted, err := store.AdmitRelease(ctx, snapshot.ID, event, operation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.ReleaseOperation(ctx, admitted.WorkItem.ID)
+	if err != nil || stored.ComputedDigest != digest {
+		t.Fatalf("stored=%#v err=%v", stored, err)
+	}
+	conflictOperation := operation
+	conflictOperation.AssetID = 99
+	conflictEvent := event
+	conflictEvent.SignalID = "signal-conflict"
+	conflictEvent.SourceDeliveryID = "delivery-conflict"
+	conflictEvent.TransportSequence = 2
+	if _, err := store.AdmitRelease(ctx, snapshot.ID, conflictEvent, conflictOperation, now); err == nil {
+		t.Fatal("same revision accepted conflicting durable operation")
+	}
+	_, attempt1, claimed, err := store.Claim(ctx, now)
+	if err != nil || !claimed || attempt1.OperationIdempotencyKey != "signal-plane:resume:v1:"+strings.TrimPrefix(digest, "sha256:") || attempt1.RequestedOperationDigest != digest {
+		t.Fatalf("attempt1=%#v claimed=%v err=%v", attempt1, claimed, err)
+	}
+	if err := store.Complete(ctx, attempt1.ID, ExecutorResult{Outcome: OutcomeRetryableFailure}, now); err != nil {
+		t.Fatal(err)
+	}
+	_, attempt2, claimed, err := store.Claim(ctx, now.Add(2*time.Second))
+	if err != nil || !claimed || attempt2.IdempotencyKey == attempt1.IdempotencyKey || attempt2.OperationIdempotencyKey != attempt1.OperationIdempotencyKey {
+		t.Fatalf("attempt2=%#v claimed=%v err=%v", attempt2, claimed, err)
+	}
+	if err := store.Complete(ctx, attempt2.ID, ExecutorResult{Outcome: OutcomeCompleted}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	secondOperation := operation
+	secondOperation.ReleaseID = 78
+	secondOperation.AssetID = 10
+	secondEvent := event
+	secondEvent.SignalID = "signal-release-2"
+	secondEvent.SourceDeliveryID = "delivery-release-2"
+	secondEvent.TransportSequence = 2
+	secondEvent.ObjectID = "78"
+	secondEvent.SourceRevision = "rev-2"
+	second, err := store.AdmitRelease(ctx, snapshot.ID, secondEvent, secondOperation, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, attempt3, claimed, err := store.Claim(ctx, now.Add(3*time.Second))
+	if err != nil || !claimed || item.ID != second.WorkItem.ID || attempt3.OperationIdempotencyKey != attempt1.OperationIdempotencyKey {
+		t.Fatalf("attempt3=%#v claimed=%v err=%v", attempt3, claimed, err)
+	}
+	if err := store.RecordContentResult(ctx, digest, "upl_1", "sha256:result", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordContentResult(ctx, digest, "upl_1", "sha256:result", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordContentResult(ctx, digest, "upl_2", "sha256:other", now); err == nil {
+		t.Fatal("conflicting durable content result accepted")
 	}
 }
 

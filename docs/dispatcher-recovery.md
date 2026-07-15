@@ -41,7 +41,7 @@ github-task-dispatcher recover \
 Execution performs these steps in order:
 
 1. Revalidates that the restored SQLite checkpoint equals `1234`, migrates the
-   database to supported schema version 2 if necessary, and writes an
+   database to the current supported schema if necessary, and writes an
    `incomplete` recovery marker with start sequence `1235`.
 2. Freezes the set of restored nonterminal jobs. Every one must be `launched`
    with a nonempty persisted broker run ID; pending/retry state cannot be
