@@ -20,6 +20,9 @@ def main() -> int:
         "docker buildx imagetools inspect \"$IMAGE_TAG\" --format '{{.Manifest.Digest}}'",
         "image=ghcr.io/grubbyhacker/signal-plane@${digest}",
         'signal_plane_image=${{ steps.deploy_image.outputs.image }}',
+        "VPS_OPS_GH_BROKER_FLEIGLABS_RELEASE_READER_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_FLEIGLABS_RELEASE_READER_APP_PEM }}",
+        "VPS_OPS_GH_BROKER_FLEIGLABS_RELEASE_READER_WEBHOOK_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_FLEIGLABS_RELEASE_READER_WEBHOOK_SECRET }}",
+        "VPS_OPS_SIGNAL_PLANE_YKM_CF_ACCESS_CLIENT_SECRET: ${{ secrets.VPS_OPS_SIGNAL_PLANE_YKM_CF_ACCESS_CLIENT_SECRET }}",
     )
     forbidden_deploy_fragments = (
         "VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
