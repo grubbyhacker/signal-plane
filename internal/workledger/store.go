@@ -207,7 +207,7 @@ func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, n
 			return AdmissionResult{}, err
 		}
 		if definition.Concurrency.Supersede {
-			_, err = tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?) AND work_item_id IN (SELECT id FROM work_items WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?))`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
+			_, err = tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?,?) AND work_item_id IN (SELECT id FROM work_items WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?))`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, AttemptRetryScheduled, definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
 			if err == nil {
 				_, err = tx.ExecContext(ctx, `DELETE FROM serialization_leases WHERE work_item_id IN (SELECT id FROM work_items WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?))`, definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
 			}
@@ -381,7 +381,7 @@ func (store *Store) RecoverInterrupted(ctx context.Context, now time.Time) (int6
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?) AND work_item_id IN (SELECT id FROM work_items WHERE state=?)`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, StateSuperseded); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?,?) AND work_item_id IN (SELECT id FROM work_items WHERE state=?)`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, AttemptRetryScheduled, StateSuperseded); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,sanitized_error='executor completion is ambiguous; reclaim with the same idempotency key' WHERE state=? AND work_item_id IN (SELECT id FROM work_items WHERE state=?)`, AttemptRecoverable, AttemptRunning, StateActive); err != nil {

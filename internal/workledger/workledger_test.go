@@ -231,9 +231,26 @@ func TestSupersedingActiveWorkTerminalizesAttemptAndReleasesLease(t *testing.T) 
 	if attemptState != AttemptSuperseded || !completedAt.Valid {
 		t.Fatalf("recovered orphan state=%q completed=%v", attemptState, completedAt.Valid)
 	}
-	item, _, claimed, err := store.Claim(ctx, now.Add(3*time.Second))
+	item, successorAttempt, claimed, err := store.Claim(ctx, now.Add(3*time.Second))
 	if err != nil || !claimed || item.ID != second.WorkItem.ID {
 		t.Fatalf("successor claim=%#v claimed=%v err=%v", item, claimed, err)
+	}
+	if err := store.Complete(ctx, successorAttempt.ID, ExecutorResult{Outcome: OutcomeRetryableFailure, RetryClassification: "transient"}, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.Admit(ctx, snapshot.ID, testEvent("delivery-active-3", 3, "rev-3"), now.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT state,completed_at FROM executor_attempts WHERE id=?`, successorAttempt.ID).Scan(&attemptState, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != AttemptSuperseded || !completedAt.Valid {
+		t.Fatalf("superseded retry attempt state=%q completed=%v", attemptState, completedAt.Valid)
+	}
+	item, _, claimed, err = store.Claim(ctx, now.Add(6*time.Second))
+	if err != nil || !claimed || item.ID != third.WorkItem.ID {
+		t.Fatalf("retry successor claim=%#v claimed=%v err=%v", item, claimed, err)
 	}
 }
 
