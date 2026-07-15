@@ -13,13 +13,32 @@ type Signal struct {
 }
 
 type Meta struct {
-	SignalID         string    `json:"signal_id"`
-	Source           string    `json:"source"`
-	RouteID          string    `json:"route_id"`
-	ReceivedAt       time.Time `json:"received_at"`
-	SourceEvent      string    `json:"source_event,omitempty"`
-	SourceAction     string    `json:"source_action,omitempty"`
-	SourceDeliveryID string    `json:"source_delivery_id,omitempty"`
+	SignalID           string         `json:"signal_id"`
+	Source             string         `json:"source"`
+	RouteID            string         `json:"route_id"`
+	ReceivedAt         time.Time      `json:"received_at"`
+	SourceEvent        string         `json:"source_event,omitempty"`
+	SourceAction       string         `json:"source_action,omitempty"`
+	SourceDeliveryID   string         `json:"source_delivery_id,omitempty"`
+	Namespace          string         `json:"namespace,omitempty"`
+	ObjectKind         string         `json:"object_kind,omitempty"`
+	ObjectID           string         `json:"object_id,omitempty"`
+	SourceRevision     string         `json:"source_revision,omitempty"`
+	ActorClass         string         `json:"actor_class,omitempty"`
+	CorrelationID      string         `json:"correlation_id,omitempty"`
+	CausationID        string         `json:"causation_id,omitempty"`
+	RootWorkItemID     string         `json:"root_work_item_id,omitempty"`
+	ParentWorkItemID   string         `json:"parent_work_item_id,omitempty"`
+	OriginatingSession string         `json:"originating_session_id,omitempty"`
+	OriginatingTurn    string         `json:"originating_turn_id,omitempty"`
+	HopCount           int            `json:"hop_count,omitempty"`
+	ExpiresAt          *time.Time     `json:"expires_at,omitempty"`
+	Authentication     Authentication `json:"authentication"`
+}
+
+type Authentication struct {
+	Method   string `json:"method"`
+	Verified bool   `json:"verified"`
 }
 
 func NewSignalID() string {

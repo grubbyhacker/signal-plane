@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -110,6 +111,15 @@ func (server *Server) handleRoute(w http.ResponseWriter, r *http.Request, route 
 			SourceEvent:      admission.event,
 			SourceAction:     admission.action,
 			SourceDeliveryID: admission.deliveryID,
+			Namespace:        admission.namespace,
+			ObjectKind:       admission.objectKind,
+			ObjectID:         admission.objectID,
+			SourceRevision:   admission.sourceRevision,
+			ActorClass:       admission.actorClass,
+			Authentication: envelope.Authentication{
+				Method:   admission.authMethod,
+				Verified: admission.authVerified,
+			},
 		},
 		Payload: append(json.RawMessage(nil), body...),
 	}
@@ -165,11 +175,18 @@ func firstNonSpace(body []byte) byte {
 }
 
 type admissionResult struct {
-	event        string
-	action       string
-	deliveryID   string
-	ignore       bool
-	ignoreReason string
+	event          string
+	action         string
+	deliveryID     string
+	ignore         bool
+	ignoreReason   string
+	namespace      string
+	objectKind     string
+	objectID       string
+	sourceRevision string
+	actorClass     string
+	authMethod     string
+	authVerified   bool
 }
 
 func (server *Server) admit(r *http.Request, route config.Route, body []byte) (admissionResult, error) {
@@ -184,6 +201,8 @@ func (server *Server) admit(r *http.Request, route config.Route, body []byte) (a
 }
 
 func admitManual(r *http.Request, route config.Route) (admissionResult, error) {
+	verified := false
+	method := "manual_test"
 	if route.ManualAuthTokenEnv != "" {
 		want := os.Getenv(route.ManualAuthTokenEnv)
 		if want == "" {
@@ -192,11 +211,15 @@ func admitManual(r *http.Request, route config.Route) (admissionResult, error) {
 		if !bearerOrHeaderMatches(r, want) {
 			return admissionResult{}, rejectedRequest{status: http.StatusUnauthorized, reason: "bad_manual_token"}
 		}
+		verified = true
+		method = "manual_bearer"
 	}
 	return admissionResult{
-		event:      headerDefault(r, "X-Signal-Event", "manual"),
-		action:     r.Header.Get("X-Signal-Action"),
-		deliveryID: r.Header.Get("X-Signal-Delivery"),
+		event:        headerDefault(r, "X-Signal-Event", "manual"),
+		action:       r.Header.Get("X-Signal-Action"),
+		deliveryID:   r.Header.Get("X-Signal-Delivery"),
+		authMethod:   method,
+		authVerified: verified,
 	}, nil
 }
 
@@ -216,12 +239,32 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 		Repository struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
+		Issue *struct {
+			Number    int64  `json:"number"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"issue"`
+		PullRequest *struct {
+			Number    int64  `json:"number"`
+			UpdatedAt string `json:"updated_at"`
+			Head      struct {
+				SHA string `json:"sha"`
+			} `json:"head"`
+		} `json:"pull_request"`
+		Release *struct {
+			ID        int64  `json:"id"`
+			TagName   string `json:"tag_name"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"release"`
+		Sender struct {
+			Type string `json:"type"`
+		} `json:"sender"`
 	}
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_github_payload"}
 	}
 	if len(route.Admission.Tuples) > 0 {
-		return admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
+		result, err := admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
+		return enrichGitHubAdmission(result, event, decoded.Repository.FullName, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
 	}
 	if !config.ContainsAllowed(route.Admission.Repositories, decoded.Repository.FullName) {
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
@@ -241,7 +284,44 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			ignoreReason: "action_filtered",
 		}, nil
 	}
-	return admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, nil
+	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, event, decoded.Repository.FullName, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
+}
+
+func enrichGitHubAdmission(result admissionResult, event, repository string, issue *struct {
+	Number    int64  `json:"number"`
+	UpdatedAt string `json:"updated_at"`
+}, pullRequest *struct {
+	Number    int64  `json:"number"`
+	UpdatedAt string `json:"updated_at"`
+	Head      struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+}, release *struct {
+	ID        int64  `json:"id"`
+	TagName   string `json:"tag_name"`
+	UpdatedAt string `json:"updated_at"`
+}, actorType string) admissionResult {
+	result.namespace = repository
+	result.objectKind = event
+	result.authMethod = "github_hmac_sha256"
+	result.authVerified = true
+	result.actorClass = strings.ToLower(actorType)
+	if issue != nil {
+		result.objectKind, result.objectID, result.sourceRevision = "issue", fmt.Sprint(issue.Number), issue.UpdatedAt
+	}
+	if pullRequest != nil {
+		result.objectKind, result.objectID, result.sourceRevision = "pull_request", fmt.Sprint(pullRequest.Number), pullRequest.Head.SHA
+		if result.sourceRevision == "" {
+			result.sourceRevision = pullRequest.UpdatedAt
+		}
+	}
+	if release != nil {
+		result.objectKind, result.objectID, result.sourceRevision = "release", fmt.Sprint(release.ID), release.UpdatedAt
+		if result.sourceRevision == "" {
+			result.sourceRevision = release.TagName
+		}
+	}
+	return result
 }
 
 func admitGitHubTuple(route config.Route, event, deliveryID, action, repository string) (admissionResult, error) {

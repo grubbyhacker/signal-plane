@@ -13,6 +13,13 @@ GitHub or manual test sender
   -> github-task-dispatcher (retained, disabled proof implementation)
 ```
 
+The repository now also contains the generalized durable work-ledger core. It
+stores immutable route snapshots, source-neutral work items and events, and
+typed executor attempts in the same additive SQLite schema used by the retained
+proof dispatcher. The registry accepts only compiled executor implementations;
+route JSON cannot select commands, URLs, images, credentials, or authority.
+No generalized production route is active in this slice.
+
 The gateway remains generic. Agent-specific selection and durable job state are
 isolated in `github-task-dispatcher`.
 
@@ -31,6 +38,11 @@ isolated in `github-task-dispatcher`.
   webhook, or broker authorization exists for that repository. It stores only
   delivery/job control data in SQLite WAL and calls the private broker's
   `codex-issue-implement` profile when exercised by tests.
+- `internal/workledger`: source-neutral admission, deduplication,
+  serialization, supersession, retry, and interrupted-attempt recovery behind
+  a SQLite store. GitHub is the first authenticated ingress adapter. The core
+  carries namespace/object identity plus correlation and causation without
+  assuming that every future source is GitHub.
 
 ## Service endpoints
 
@@ -124,9 +136,9 @@ route has been retired, and the remaining synthetic selector is not a
 production deployment target. Do not register a webhook, add gateway admission,
 or grant a broker identity access to `example/automation-target`.
 
-Future production routing and authority bootstrap follow the settled roadmap in
+Production routing and authority bootstrap follow the settled roadmap in
 `vps-ops/docs/repository-agent-automation-roadmap.md`; this proof dispatcher is
-not the generalized router.
+not the generalized router, and the generalized ledger has no active route yet.
 
 Pushes to `main` publish the deployment image to
 `ghcr.io/grubbyhacker/signal-plane:main`.
