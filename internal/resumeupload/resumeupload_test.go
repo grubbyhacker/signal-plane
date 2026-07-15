@@ -121,6 +121,15 @@ func TestYKMRedirectCannotForwardSecrets(t *testing.T) {
 	}
 }
 
+func TestYKMStatelessStreamableHTTP(t *testing.T) {
+	transport := &mcpTransport{stateless: true}
+	client := YKMClient{Config: YKMConfig{BaseURL: "http://youknowme-mcp:8765/mcp", AuthMode: YKMAuthLocal, LocalSecret: "secret"}, Client: &http.Client{Transport: transport}}
+	response, err := client.Upload(context.Background(), "resume_x.structured.md", "# Resume\n", "signal-plane:resume:v1:abc")
+	if err != nil || response.UploadID != "upl_1" || transport.calls != 3 {
+		t.Fatalf("response=%#v calls=%d err=%v", response, transport.calls, err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -128,8 +137,9 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 }
 
 type mcpTransport struct {
-	calls   int
-	headers http.Header
+	calls     int
+	headers   http.Header
+	stateless bool
 }
 
 func (transport *mcpTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -148,7 +158,7 @@ func (transport *mcpTransport) RoundTrip(request *http.Request) (*http.Response,
 	}
 	header := make(http.Header)
 	header.Set("content-type", "application/json")
-	if session != "" {
+	if session != "" && !transport.stateless {
 		header.Set("Mcp-Session-Id", session)
 	}
 	return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil

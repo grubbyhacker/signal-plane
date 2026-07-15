@@ -88,9 +88,6 @@ func (client *YKMClient) call(ctx context.Context, tool string, args any) (json.
 	if err != nil {
 		return nil, err
 	}
-	if session == "" {
-		return nil, errors.New("YouKnowMe MCP did not establish a session")
-	}
 	_, _, err = client.post(ctx, session, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
 	if err != nil {
 		return nil, err

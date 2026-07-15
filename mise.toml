@@ -23,6 +23,10 @@ run = "python3 scripts/validate-image-tag-contract.py"
 [tasks.test]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
 
+[tasks."staging:resume-release-proof"]
+description = "Run the guarded synthetic release proof against deployed local YouKnowMe"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test -count=1 -v -run '^TestStagingSyntheticReleaseToDeployedYouKnowMe$' ./internal/resumeupload"
+
 [tasks."proof:phase5-local"]
 description = "Run the deterministic versioned Phase 5 local integration proof"
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/dispatcher -run '^TestPhase5LocalV1Proof$' -count=1"
