@@ -126,6 +126,45 @@ func (store *Store) RetireRoute(ctx context.Context, snapshotID string, now time
 	return nil
 }
 
+// MatchRoute selects the sole active route whose source-neutral admission
+// policy accepts event. Zero or overlapping matches fail closed.
+func (store *Store) MatchRoute(ctx context.Context, event Event) (RouteSnapshot, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,definition_json,activated_at FROM route_snapshots WHERE retired_at IS NULL ORDER BY route_id,id`)
+	if err != nil {
+		return RouteSnapshot{}, err
+	}
+	defer rows.Close()
+	matches := make([]RouteSnapshot, 0, 1)
+	for rows.Next() {
+		var snapshot RouteSnapshot
+		var encoded string
+		var activated int64
+		if err := rows.Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &encoded, &activated); err != nil {
+			return RouteSnapshot{}, err
+		}
+		definition, err := DecodeRouteDefinition([]byte(encoded))
+		if err != nil {
+			return RouteSnapshot{}, fmt.Errorf("decode active route %q: %w", snapshot.RouteID, err)
+		}
+		if !definition.Admission.Matches(event) {
+			continue
+		}
+		snapshot.Admission, snapshot.Concurrency, snapshot.Retry = definition.Admission, definition.Concurrency, definition.Retry
+		snapshot.ActivatedAt = time.UnixMilli(activated).UTC()
+		matches = append(matches, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return RouteSnapshot{}, err
+	}
+	if len(matches) == 0 {
+		return RouteSnapshot{}, errors.New("no active route matches event")
+	}
+	if len(matches) != 1 {
+		return RouteSnapshot{}, fmt.Errorf("ambiguous active routes match event: %d", len(matches))
+	}
+	return matches[0], nil
+}
+
 func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, now time.Time) (AdmissionResult, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -168,7 +207,13 @@ func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, n
 			return AdmissionResult{}, err
 		}
 		if definition.Concurrency.Supersede {
-			_, err = tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,superseded_by_id=?,updated_at=?,terminal_at=? WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?)`, StateSuperseded, item.ID, millis(now), millis(now), definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
+			_, err = tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?,?) AND work_item_id IN (SELECT id FROM work_items WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?))`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, AttemptRetryScheduled, definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
+			if err == nil {
+				_, err = tx.ExecContext(ctx, `DELETE FROM serialization_leases WHERE work_item_id IN (SELECT id FROM work_items WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?))`, definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
+			}
+			if err == nil {
+				_, err = tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,superseded_by_id=?,updated_at=?,terminal_at=?,next_attempt_at=NULL WHERE route_id=? AND semantic_object_key=? AND id<>? AND state IN (?,?,?,?)`, StateSuperseded, item.ID, millis(now), millis(now), definition.ID, semanticKey, item.ID, StateObserved, StateAdmitted, StateActive, StateWaiting)
+			}
 			if err != nil {
 				return AdmissionResult{}, err
 			}
@@ -336,7 +381,10 @@ func (store *Store) RecoverInterrupted(ctx context.Context, now time.Time) (int6
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,sanitized_error='executor completion is ambiguous; reclaim with the same idempotency key' WHERE state=?`, AttemptRecoverable, AttemptRunning); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE state IN (?,?,?) AND work_item_id IN (SELECT id FROM work_items WHERE state=?)`, AttemptSuperseded, millis(now), AttemptRunning, AttemptRecoverable, AttemptRetryScheduled, StateSuperseded); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,sanitized_error='executor completion is ambiguous; reclaim with the same idempotency key' WHERE state=? AND work_item_id IN (SELECT id FROM work_items WHERE state=?)`, AttemptRecoverable, AttemptRunning, StateActive); err != nil {
 		return 0, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,next_attempt_at=?,updated_at=? WHERE state=?`, StateWaiting, millis(now), millis(now), StateActive)

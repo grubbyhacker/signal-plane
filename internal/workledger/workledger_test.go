@@ -115,6 +115,14 @@ func TestLedgerAdmissionDedupeSerializationSupersessionRetryAndRecovery(t *testi
 	if err != nil || !duplicate.Duplicate || duplicate.WorkItem.ID != first.WorkItem.ID {
 		t.Fatalf("duplicate admission = %#v, %v", duplicate, err)
 	}
+	redelivery := firstEvent
+	redelivery.SignalID = "signal-redelivery"
+	redelivery.TransportSequence = 3
+	redelivery.CorrelationID = "transport-correlation-redelivery"
+	duplicate, err = store.Admit(ctx, snapshot.ID, redelivery, now.Add(time.Second))
+	if err != nil || !duplicate.Duplicate || duplicate.WorkItem.ID != first.WorkItem.ID {
+		t.Fatalf("realistic redelivery admission = %#v, %v", duplicate, err)
+	}
 	mutated := firstEvent
 	mutated.PayloadDigest = "sha256:different"
 	if _, err := store.Admit(ctx, snapshot.ID, mutated, now.Add(time.Second)); err == nil {
@@ -162,6 +170,122 @@ func TestLedgerAdmissionDedupeSerializationSupersessionRetryAndRecovery(t *testi
 	}
 	if err := store.db.QueryRow(`SELECT state FROM work_items WHERE id=?`, second.WorkItem.ID).Scan(&state); err != nil || state != StateCompleted {
 		t.Fatalf("completed state = %q, %v", state, err)
+	}
+}
+
+func TestSupersedingActiveWorkTerminalizesAttemptAndReleasesLease(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	route := testRoute()
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: route.ExecutorID, Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Admit(ctx, snapshot.ID, testEvent("delivery-active-1", 1, "rev-1"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, claimed, err := store.Claim(ctx, now.Add(time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("claim active work: %#v %v %v", attempt, claimed, err)
+	}
+	second, err := store.Admit(ctx, snapshot.ID, testEvent("delivery-active-2", 2, "rev-2"), now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attemptState AttemptState
+	var completedAt sql.NullInt64
+	if err := store.db.QueryRow(`SELECT state,completed_at FROM executor_attempts WHERE id=?`, attempt.ID).Scan(&attemptState, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != AttemptSuperseded || !completedAt.Valid {
+		t.Fatalf("superseded attempt state=%q completed=%v", attemptState, completedAt.Valid)
+	}
+	var leases int
+	if err := store.db.QueryRow(`SELECT count(*) FROM serialization_leases WHERE work_item_id=?`, first.WorkItem.ID).Scan(&leases); err != nil || leases != 0 {
+		t.Fatalf("superseded lease count=%d err=%v", leases, err)
+	}
+	// Prove startup recovery also cleans an orphan produced by an older process
+	// that persisted supersession before terminalizing its attempt and lease.
+	if _, err := store.db.Exec(`UPDATE executor_attempts SET state=?,completed_at=NULL WHERE id=?`, AttemptRunning, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO serialization_leases(serialization_key,work_item_id,attempt_id,acquired_at) VALUES(?,?,?,?)`, first.WorkItem.SerializationKey, first.WorkItem.ID, attempt.ID, now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := store.RecoverInterrupted(ctx, now.Add(3*time.Second)); err != nil || recovered != 0 {
+		t.Fatalf("recover superseded orphan=%d err=%v", recovered, err)
+	}
+	if err := store.db.QueryRow(`SELECT state,completed_at FROM executor_attempts WHERE id=?`, attempt.ID).Scan(&attemptState, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != AttemptSuperseded || !completedAt.Valid {
+		t.Fatalf("recovered orphan state=%q completed=%v", attemptState, completedAt.Valid)
+	}
+	item, successorAttempt, claimed, err := store.Claim(ctx, now.Add(3*time.Second))
+	if err != nil || !claimed || item.ID != second.WorkItem.ID {
+		t.Fatalf("successor claim=%#v claimed=%v err=%v", item, claimed, err)
+	}
+	if err := store.Complete(ctx, successorAttempt.ID, ExecutorResult{Outcome: OutcomeRetryableFailure, RetryClassification: "transient"}, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.Admit(ctx, snapshot.ID, testEvent("delivery-active-3", 3, "rev-3"), now.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT state,completed_at FROM executor_attempts WHERE id=?`, successorAttempt.ID).Scan(&attemptState, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != AttemptSuperseded || !completedAt.Valid {
+		t.Fatalf("superseded retry attempt state=%q completed=%v", attemptState, completedAt.Valid)
+	}
+	item, _, claimed, err = store.Claim(ctx, now.Add(6*time.Second))
+	if err != nil || !claimed || item.ID != third.WorkItem.ID {
+		t.Fatalf("retry successor claim=%#v claimed=%v err=%v", item, claimed, err)
+	}
+}
+
+func TestRouteMatchingFailsClosedOnZeroAndAmbiguity(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	event := testEvent("delivery-match", 1, "rev-1")
+	if _, err := store.MatchRoute(ctx, event); err == nil {
+		t.Fatal("event without an active route matched")
+	}
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: "github.pr-check", Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	first := testRoute()
+	firstSnapshot, err := store.ActivateRoute(ctx, first, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched, err := store.MatchRoute(ctx, event)
+	if err != nil || matched.ID != firstSnapshot.ID {
+		t.Fatalf("sole route match=%#v err=%v", matched, err)
+	}
+	second := testRoute()
+	second.ID = "github-pr-check-overlap"
+	if _, err := store.ActivateRoute(ctx, second, registry, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MatchRoute(ctx, event); err == nil {
+		t.Fatal("overlapping active routes did not fail closed")
 	}
 }
 

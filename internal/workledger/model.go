@@ -116,9 +116,10 @@ type Event struct {
 
 func (event Event) Digest() string {
 	canonical := struct {
-		SignalID, SourceDeliveryID, Source, Namespace, ObjectKind, ObjectID string
-		EventKind, Action, SourceRevision, PayloadDigest                    string
-	}{event.SignalID, event.SourceDeliveryID, event.Source, event.Namespace, event.ObjectKind, event.ObjectID, event.EventKind, event.Action, event.SourceRevision, event.PayloadDigest}
+		Source, Namespace, ObjectKind, ObjectID       string
+		EventKind, Action, ActorClass, SourceRevision string
+		PayloadDigest                                 string
+	}{event.Source, event.Namespace, event.ObjectKind, event.ObjectID, event.EventKind, event.Action, event.ActorClass, event.SourceRevision, event.PayloadDigest}
 	encoded, _ := json.Marshal(canonical)
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
