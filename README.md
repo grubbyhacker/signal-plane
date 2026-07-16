@@ -20,6 +20,13 @@ proof dispatcher. The registry accepts only compiled executor implementations;
 route JSON cannot select commands, URLs, images, credentials, or authority.
 No generalized production route is active in this slice.
 
+The compiled `agent_session_v1` executor is likewise inactive until a
+deployment-owned coordinator route is enabled. Its fixed `general-writer-v1`
+authority profile is admitted by the broker before it creates an `agentd/v1`
+session, and its durable binding prevents a work item from silently moving to a
+different authority worker on replay. Route definitions still cannot choose a
+runtime, image, repository, credentials, or authority.
+
 The disabled-by-default `resume-release-router` is the first compiled
 deterministic executor. When deployment-owned configuration enables it, it
 admits only GitHub `release/published` events for
