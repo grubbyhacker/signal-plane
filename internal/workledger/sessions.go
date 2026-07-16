@@ -2,26 +2,40 @@ package workledger
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
 type SessionBinding struct {
-	WorkItemID, BindingKey, AuthorityProfile, AuthorityPolicyVersion, WorkerID, WorkerLineage, AgentdSessionID, CheckpointRef, EventCursor, State string
-	FenceEpoch                                                                                                                                    int64
-	CreatedAt, UpdatedAt                                                                                                                          time.Time
+	WorkItemID, BindingKey, AuthorityProfile, AuthorityPolicyVersion, WorkerID, WorkerLineage, AgentdSessionID, CheckpointRef, State string
+	EventCursor                                                                                                                      int64
+	FenceEpoch                                                                                                                       int64
+	CreatedAt, UpdatedAt                                                                                                             time.Time
 }
 
 type SessionLease struct {
 	WorkerID, AuthorityProfile, AuthorityPolicyVersion, WorkerLineage string
 	FenceEpoch                                                        int64
 }
-
+type Usage struct{ InputTokens, CachedInputTokens, OutputTokens, ReasoningOutputTokens, TotalTokens int64 }
 type CoordinatorEvent struct {
-	Cursor, WorkerID, Kind, EvidenceRef string
-	FenceEpoch                          int64
-	InputTokens, OutputTokens           int64
+	Cursor                      int64
+	WorkerID, Kind, EvidenceRef string
+	FenceEpoch                  int64
+	Usage                       Usage
+}
+
+func (u Usage) Valid() bool {
+	if u.InputTokens < 0 || u.CachedInputTokens < 0 || u.OutputTokens < 0 || u.ReasoningOutputTokens < 0 || u.TotalTokens < 0 {
+		return false
+	}
+	if u.InputTokens > math.MaxInt64-u.CachedInputTokens || u.InputTokens+u.CachedInputTokens > math.MaxInt64-u.OutputTokens || u.InputTokens+u.CachedInputTokens+u.OutputTokens > math.MaxInt64-u.ReasoningOutputTokens {
+		return false
+	}
+	return u.TotalTokens == u.InputTokens+u.CachedInputTokens+u.OutputTokens+u.ReasoningOutputTokens
 }
 
 func (store *Store) BindSession(ctx context.Context, workItemID, bindingKey, authorityProfile, workerID string, now time.Time) (SessionBinding, error) {
@@ -30,120 +44,167 @@ func (store *Store) BindSession(ctx context.Context, workItemID, bindingKey, aut
 	}
 	return store.BindSessionLease(ctx, workItemID, bindingKey, SessionLease{WorkerID: workerID, AuthorityProfile: authorityProfile, AuthorityPolicyVersion: "legacy-v1", WorkerLineage: workerID, FenceEpoch: 1}, now)
 }
-
 func (store *Store) BindSessionLease(ctx context.Context, workItemID, bindingKey string, lease SessionLease, now time.Time) (SessionBinding, error) {
-	if workItemID == "" || bindingKey == "" || lease.WorkerID == "" || lease.AuthorityProfile == "" || lease.AuthorityPolicyVersion == "" || lease.WorkerLineage == "" || lease.FenceEpoch <= 0 {
+	if workItemID == "" || bindingKey == "" || !validLease(lease) {
 		return SessionBinding{}, errors.New("session binding requires complete fenced broker lease")
 	}
 	_, err := store.db.ExecContext(ctx, `INSERT INTO session_bindings(work_item_id,binding_key,authority_profile,authority_policy_version,worker_id,worker_lineage,fence_epoch,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO NOTHING`, workItemID, bindingKey, lease.AuthorityProfile, lease.AuthorityPolicyVersion, lease.WorkerID, lease.WorkerLineage, lease.FenceEpoch, "active", millis(now), millis(now))
 	if err != nil {
 		return SessionBinding{}, err
 	}
-	binding, err := store.SessionBinding(ctx, workItemID)
+	b, err := store.SessionBinding(ctx, workItemID)
 	if err != nil {
 		return SessionBinding{}, err
 	}
-	if binding.BindingKey != bindingKey || binding.AuthorityProfile != lease.AuthorityProfile || binding.WorkerID != lease.WorkerID || binding.FenceEpoch != lease.FenceEpoch || binding.WorkerLineage != lease.WorkerLineage || binding.AuthorityPolicyVersion != lease.AuthorityPolicyVersion {
+	if b.BindingKey != bindingKey || b.AuthorityProfile != lease.AuthorityProfile || b.WorkerID != lease.WorkerID || b.FenceEpoch != lease.FenceEpoch || b.WorkerLineage != lease.WorkerLineage || b.AuthorityPolicyVersion != lease.AuthorityPolicyVersion {
 		return SessionBinding{}, fmt.Errorf("session binding conflicts with durable authority assignment")
 	}
-	return binding, nil
+	return b, nil
+}
+func validLease(l SessionLease) bool {
+	return l.WorkerID != "" && l.AuthorityProfile != "" && l.AuthorityPolicyVersion != "" && l.WorkerLineage != "" && l.FenceEpoch > 0
 }
 
 func (store *Store) SessionBinding(ctx context.Context, workItemID string) (SessionBinding, error) {
-	var binding SessionBinding
+	var b SessionBinding
 	var created, updated int64
-	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,authority_policy_version,worker_id,worker_lineage,fence_epoch,agentd_session_id,checkpoint_ref,event_cursor,state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&binding.WorkItemID, &binding.BindingKey, &binding.AuthorityProfile, &binding.AuthorityPolicyVersion, &binding.WorkerID, &binding.WorkerLineage, &binding.FenceEpoch, &binding.AgentdSessionID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated)
+	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,authority_policy_version,worker_id,worker_lineage,fence_epoch,agentd_session_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&b.WorkItemID, &b.BindingKey, &b.AuthorityProfile, &b.AuthorityPolicyVersion, &b.WorkerID, &b.WorkerLineage, &b.FenceEpoch, &b.AgentdSessionID, &b.CheckpointRef, &b.EventCursor, &b.State, &created, &updated)
 	if err != nil {
 		return SessionBinding{}, err
 	}
-	binding.CreatedAt, binding.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
-	return binding, nil
+	b.CreatedAt, b.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
+	return b, nil
 }
-
-func (store *Store) SetAgentdSession(ctx context.Context, workItemID, workerID string, fenceEpoch int64, sessionID string, now time.Time) error {
-	if sessionID == "" {
-		return errors.New("agentd session id is required")
+func (store *Store) SetAgentdSession(ctx context.Context, workItemID string, lease SessionLease, sessionID string, now time.Time) error {
+	if sessionID == "" || !validLease(lease) {
+		return errors.New("complete broker session identity is required")
 	}
-	r, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=?`, sessionID, millis(now), workItemID, workerID, fenceEpoch)
+	r, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=? AND authority_policy_version=? AND worker_lineage=?`, sessionID, millis(now), workItemID, lease.WorkerID, lease.FenceEpoch, lease.AuthorityPolicyVersion, lease.WorkerLineage)
 	if err != nil {
 		return err
 	}
 	n, _ := r.RowsAffected()
 	if n != 1 {
-		return errors.New("stale worker cannot set agentd session")
+		return errors.New("stale broker session cannot be recorded")
 	}
 	return nil
 }
 
-// RecordCoordinatorEvent atomically advances the durable cursor. Duplicate
-// cursors are no-ops only when they belong to the current fenced worker.
+// RecordCoordinatorEvent uses a SQLite immediate transaction: event insertion and
+// cursor CAS are one write critical section, including reassignment races.
 func (store *Store) RecordCoordinatorEvent(ctx context.Context, workItemID string, event CoordinatorEvent, now time.Time) (bool, error) {
-	if event.Cursor == "" || event.WorkerID == "" || event.FenceEpoch <= 0 || event.Kind == "" || event.InputTokens < 0 || event.OutputTokens < 0 {
+	if event.Cursor <= 0 || event.WorkerID == "" || event.FenceEpoch <= 0 || event.Kind == "" || !event.Usage.Valid() {
 		return false, errors.New("invalid normalized coordinator event")
 	}
-	tx, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	var bindingKey, workerID string
+	inserted := false
+	err := store.immediate(ctx, func(conn *sql.Conn) error {
+		var key, worker, policy, lineage string
+		var epoch, cursor int64
+		if err := conn.QueryRowContext(ctx, `SELECT binding_key,worker_id,authority_policy_version,worker_lineage,fence_epoch,CAST(event_cursor AS INTEGER) FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&key, &worker, &policy, &lineage, &epoch, &cursor); err != nil {
+			return err
+		}
+		if worker != event.WorkerID || epoch != event.FenceEpoch {
+			return errors.New("stale predecessor event rejected")
+		}
+		if event.Cursor <= cursor && cursor != 0 {
+			// Replays can start before the durable cursor after a restart, but
+			// only an already-recorded byte-for-byte normalized event is valid.
+			return store.matchCoordinatorEvent(ctx, conn, key, event)
+		}
+		r, err := conn.ExecContext(ctx, `INSERT INTO coordinator_events(binding_key,cursor,worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_key,cursor) DO NOTHING`, key, event.Cursor, event.WorkerID, event.FenceEpoch, event.Kind, event.EvidenceRef, event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.OutputTokens, event.Usage.ReasoningOutputTokens, event.Usage.TotalTokens, millis(now))
+		if err != nil {
+			return err
+		}
+		n, _ := r.RowsAffected()
+		if n == 0 {
+			return store.matchCoordinatorEvent(ctx, conn, key, event)
+		}
+		r, err = conn.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=? AND authority_policy_version=? AND worker_lineage=? AND event_cursor=?`, event.Cursor, millis(now), workItemID, event.WorkerID, event.FenceEpoch, policy, lineage, cursor)
+		if err != nil {
+			return err
+		}
+		n, _ = r.RowsAffected()
+		if n != 1 {
+			return errors.New("coordinator cursor CAS lost")
+		}
+		inserted = true
+		return nil
+	})
+	return inserted, err
+}
+func (store *Store) matchCoordinatorEvent(ctx context.Context, conn *sql.Conn, key string, e CoordinatorEvent) error {
+	var worker, kind, evidence string
 	var epoch int64
-	if err = tx.QueryRowContext(ctx, `SELECT binding_key,worker_id,fence_epoch FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&bindingKey, &workerID, &epoch); err != nil {
-		return false, err
+	var u Usage
+	if err := conn.QueryRowContext(ctx, `SELECT worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM coordinator_events WHERE binding_key=? AND cursor=?`, key, e.Cursor).Scan(&worker, &epoch, &kind, &evidence, &u.InputTokens, &u.CachedInputTokens, &u.OutputTokens, &u.ReasoningOutputTokens, &u.TotalTokens); err != nil {
+		return err
 	}
-	if workerID != event.WorkerID || epoch != event.FenceEpoch {
-		return false, errors.New("stale predecessor event rejected")
+	if worker != e.WorkerID || epoch != e.FenceEpoch || kind != e.Kind || evidence != e.EvidenceRef || u != e.Usage {
+		return errors.New("duplicate coordinator cursor conflicts with recorded event")
 	}
-	r, err := tx.ExecContext(ctx, `INSERT INTO coordinator_events(binding_key,cursor,worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,output_tokens,recorded_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_key,cursor) DO NOTHING`, bindingKey, event.Cursor, event.WorkerID, event.FenceEpoch, event.Kind, event.EvidenceRef, event.InputTokens, event.OutputTokens, millis(now))
+	return nil
+}
+func (store *Store) immediate(ctx context.Context, fn func(*sql.Conn) error) (err error) {
+	conn, err := store.db.Conn(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
-	n, _ := r.RowsAffected()
-	if n == 0 {
-		var worker, kind, evidence string
-		var epoch, input, output int64
-		if err = tx.QueryRowContext(ctx, `SELECT worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,output_tokens FROM coordinator_events WHERE binding_key=? AND cursor=?`, bindingKey, event.Cursor).Scan(&worker, &epoch, &kind, &evidence, &input, &output); err != nil {
-			return false, err
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		}
-		if worker != event.WorkerID || epoch != event.FenceEpoch || kind != event.Kind || evidence != event.EvidenceRef || input != event.InputTokens || output != event.OutputTokens {
-			return false, errors.New("duplicate coordinator cursor conflicts with recorded event")
-		}
-		return false, tx.Commit()
+	}()
+	if err = fn(conn); err != nil {
+		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=?`, event.Cursor, millis(now), workItemID, event.WorkerID, event.FenceEpoch); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	return err
 }
 
-// ReassignSession is the cutover CAS. Call it only with the broker's
-// replacement record; callers never select the successor worker themselves.
 func (store *Store) ReassignSession(ctx context.Context, workItemID, predecessorWorker string, predecessorEpoch int64, successor SessionLease, now time.Time) (SessionBinding, error) {
-	if successor.WorkerID == "" || successor.FenceEpoch <= predecessorEpoch || successor.AuthorityProfile == "" || successor.AuthorityPolicyVersion == "" || successor.WorkerLineage == "" {
-		return SessionBinding{}, errors.New("invalid broker successor lease")
+	if !validLease(successor) || successor.FenceEpoch != predecessorEpoch+1 {
+		return SessionBinding{}, errors.New("successor fence epoch must equal predecessor plus one")
 	}
-	tx, err := store.db.BeginTx(ctx, nil)
+	err := store.immediate(ctx, func(conn *sql.Conn) error {
+		var profile, policy, lineage, worker string
+		var epoch int64
+		err := conn.QueryRowContext(ctx, `SELECT authority_profile,authority_policy_version,worker_lineage,worker_id,fence_epoch FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&profile, &policy, &lineage, &worker, &epoch)
+		if err != nil {
+			return err
+		}
+		if worker == successor.WorkerID && epoch == successor.FenceEpoch {
+			if profile == successor.AuthorityProfile && policy == successor.AuthorityPolicyVersion && lineage == successor.WorkerLineage {
+				return nil
+			}
+			return errors.New("broker reassignment replay conflicts with durable successor")
+		}
+		if worker != predecessorWorker || epoch != predecessorEpoch {
+			return errors.New("reassignment predecessor CAS lost")
+		}
+		if profile != successor.AuthorityProfile || policy != successor.AuthorityPolicyVersion || lineage != successor.WorkerLineage {
+			return errors.New("successor changes authority policy or storage lineage")
+		}
+		r, err := conn.ExecContext(ctx, `UPDATE session_bindings SET worker_id=?,fence_epoch=?,state='active',updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=? AND authority_policy_version=? AND worker_lineage=?`, successor.WorkerID, successor.FenceEpoch, millis(now), workItemID, predecessorWorker, predecessorEpoch, policy, lineage)
+		if err != nil {
+			return err
+		}
+		n, _ := r.RowsAffected()
+		if n != 1 {
+			return errors.New("reassignment CAS lost")
+		}
+		return nil
+	})
 	if err != nil {
-		return SessionBinding{}, err
-	}
-	defer tx.Rollback()
-	var profile, policy, lineage string
-	if err = tx.QueryRowContext(ctx, `SELECT authority_profile,authority_policy_version,worker_lineage FROM session_bindings WHERE work_item_id=? AND worker_id=? AND fence_epoch=?`, workItemID, predecessorWorker, predecessorEpoch).Scan(&profile, &policy, &lineage); err != nil {
-		return SessionBinding{}, fmt.Errorf("reassignment predecessor CAS: %w", err)
-	}
-	if profile != successor.AuthorityProfile || policy != successor.AuthorityPolicyVersion || lineage != successor.WorkerLineage {
-		return SessionBinding{}, errors.New("successor changes authority policy or storage lineage")
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE session_bindings SET worker_id=?,fence_epoch=?,agentd_session_id='',state='active',updated_at=? WHERE work_item_id=? AND worker_id=? AND fence_epoch=?`, successor.WorkerID, successor.FenceEpoch, millis(now), workItemID, predecessorWorker, predecessorEpoch); err != nil {
-		return SessionBinding{}, err
-	}
-	if err = tx.Commit(); err != nil {
 		return SessionBinding{}, err
 	}
 	return store.SessionBinding(ctx, workItemID)
 }
 
-func (store *Store) CoordinatorUsage(ctx context.Context, workItemID string) (events, inputTokens, outputTokens int64, err error) {
-	err = store.db.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(e.input_tokens),0),coalesce(sum(e.output_tokens),0) FROM coordinator_events e JOIN session_bindings b ON b.binding_key=e.binding_key WHERE b.work_item_id=?`, workItemID).Scan(&events, &inputTokens, &outputTokens)
+func (store *Store) CoordinatorUsage(ctx context.Context, workItemID string) (usageEvents int64, usage Usage, err error) {
+	err = store.db.QueryRowContext(ctx, `SELECT count(*),coalesce(sum(e.input_tokens),0),coalesce(sum(e.cached_input_tokens),0),coalesce(sum(e.output_tokens),0),coalesce(sum(e.reasoning_output_tokens),0),coalesce(sum(e.total_tokens),0) FROM coordinator_events e JOIN session_bindings b ON b.binding_key=e.binding_key WHERE b.work_item_id=? AND e.event_kind='usage'`, workItemID).Scan(&usageEvents, &usage.InputTokens, &usage.CachedInputTokens, &usage.OutputTokens, &usage.ReasoningOutputTokens, &usage.TotalTokens)
 	return
 }

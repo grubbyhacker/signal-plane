@@ -1,6 +1,4 @@
-// Package agentsession contains the deliberately narrow PR 9 coordinator.
-// Concrete gh-agent-broker and agentd HTTP clients are intentionally not part
-// of this package until their independently reviewed contracts are available.
+// Package agentsession coordinates a durable broker-mediated agentd session.
 package agentsession
 
 import (
@@ -15,46 +13,48 @@ import (
 
 const ExecutorID = "agent_session_v1"
 const authorityProfile = "general-writer-v1"
-const runtimeAdapter = "codex_adapter_v1"
 
+// Broker is the only authority that addresses agentd. Signal Plane supplies
+// durable binding/evidence identifiers, never a worker, profile, or runtime.
 type Broker interface {
 	Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error)
-	// Reassign accepts only a lost predecessor identity and fence. The broker,
-	// not this coordinator, chooses and records the replacement worker.
 	Reassign(context.Context, ReassignRequest) (workledger.SessionLease, error)
+	CreateSession(context.Context, CreateSessionRequest) (BrokerSession, error)
+	SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error)
+	StreamEvents(context.Context, StreamEventsRequest) (BrokerEvents, error)
 }
 type AcquireRequest struct{ BindingKey, AuthorityProfile, IdempotencyKey string }
 type ReassignRequest struct {
 	BindingKey, PredecessorWorker string
 	PredecessorEpoch              int64
 }
-
-type Agentd interface {
-	CreateSession(context.Context, SessionRequest) (string, error)
-	SubmitTurn(context.Context, TurnRequest) (string, error)
-	StreamEvents(context.Context, EventRequest) ([]Event, error)
+type CreateSessionRequest struct{ BindingKey, ResumeSessionID, IdempotencyKey string }
+type SubmitTurnRequest struct{ BindingKey, SessionID, EvidenceRef, EvidenceDigest, IdempotencyKey string }
+type StreamEventsRequest struct {
+	BindingKey, SessionID string
+	Cursor                int64
 }
-type SessionRequest struct {
-	BindingKey, WorkerID, AuthorityProfile, RuntimeAdapter, IdempotencyKey string
-	FenceEpoch                                                             int64
+type BrokerSession struct {
+	SessionID string
+	Lease     workledger.SessionLease
 }
-type TurnRequest struct {
-	SessionID, BindingKey, WorkerID, EvidenceRef, EvidenceDigest, IdempotencyKey string
-	FenceEpoch                                                                   int64
+type BrokerTurn struct {
+	TurnID string
+	Lease  workledger.SessionLease
 }
-type EventRequest struct {
-	SessionID, BindingKey, WorkerID, Cursor string
-	FenceEpoch                              int64
+type BrokerEvents struct {
+	Lease  workledger.SessionLease
+	Events []Event
 }
 type Event struct {
-	Cursor, Kind, EvidenceRef string
-	InputTokens, OutputTokens int64
+	Cursor            int64
+	Kind, EvidenceRef string
+	Usage             workledger.Usage
 }
 
 type Executor struct {
 	Store  *workledger.Store
 	Broker Broker
-	Agentd Agentd
 	Now    func() time.Time
 }
 
@@ -69,58 +69,61 @@ func (e *Executor) now() time.Time {
 }
 
 func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorRequest) (workledger.ExecutorResult, error) {
-	if e.Store == nil || e.Broker == nil || e.Agentd == nil {
-		return workledger.ExecutorResult{}, errors.New("agent coordinator requires ledger, broker, and agentd contracts")
+	if e.Store == nil || e.Broker == nil {
+		return workledger.ExecutorResult{}, errors.New("agent coordinator requires ledger and broker contracts")
 	}
 	binding, err := e.acquire(ctx, request)
 	if err != nil {
-		return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "coordinator_acquire", SanitizedError: "authority session unavailable"}, nil
+		return retry("coordinator_acquire", "authority session unavailable"), nil
 	}
 	if binding.AgentdSessionID == "" {
-		sessionID, createErr := e.Agentd.CreateSession(ctx, SessionRequest{BindingKey: binding.BindingKey, WorkerID: binding.WorkerID, AuthorityProfile: binding.AuthorityProfile, RuntimeAdapter: runtimeAdapter, IdempotencyKey: binding.BindingKey, FenceEpoch: binding.FenceEpoch})
-		if createErr != nil || sessionID == "" {
-			return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "agentd_create", SanitizedError: "agent session create unavailable"}, nil
+		created, err := e.Broker.CreateSession(ctx, CreateSessionRequest{BindingKey: binding.BindingKey, ResumeSessionID: binding.AgentdSessionID, IdempotencyKey: binding.BindingKey})
+		if err != nil || created.SessionID == "" || !sameLease(binding, created.Lease) {
+			return retry("agentd_create", "broker session create unavailable"), nil
 		}
-		if err := e.Store.SetAgentdSession(ctx, request.WorkItem.ID, binding.WorkerID, binding.FenceEpoch, sessionID, e.now()); err != nil {
-			return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "coordinator_fence", SanitizedError: "session binding changed"}, nil
+		if err := e.Store.SetAgentdSession(ctx, request.WorkItem.ID, created.Lease, created.SessionID, e.now()); err != nil {
+			return retry("coordinator_fence", "session binding changed"), nil
 		}
-		binding.AgentdSessionID = sessionID
+		binding.AgentdSessionID = created.SessionID
 	}
-	turnID, err := e.Agentd.SubmitTurn(ctx, TurnRequest{SessionID: binding.AgentdSessionID, BindingKey: binding.BindingKey, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, EvidenceRef: request.WorkItem.ID, EvidenceDigest: request.Attempt.RequestedOperationDigest, IdempotencyKey: request.Attempt.IdempotencyKey})
-	if err != nil || turnID == "" {
-		return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "agentd_submit", SanitizedError: "agent turn submit unavailable"}, nil
+	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, SessionID: binding.AgentdSessionID, EvidenceRef: request.WorkItem.ID, EvidenceDigest: request.Attempt.RequestedOperationDigest, IdempotencyKey: request.Attempt.IdempotencyKey})
+	if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
+		return retry("agentd_submit", "broker turn submit unavailable"), nil
 	}
-	events, err := e.Agentd.StreamEvents(ctx, EventRequest{SessionID: binding.AgentdSessionID, BindingKey: binding.BindingKey, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, Cursor: binding.EventCursor})
-	if err != nil {
-		return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "agentd_events", SanitizedError: "agent event stream unavailable"}, nil
+	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, SessionID: binding.AgentdSessionID, Cursor: binding.EventCursor})
+	if err != nil || !sameLease(binding, batch.Lease) {
+		return retry("agentd_events", "broker event stream unavailable"), nil
 	}
-	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turnID}
-	for _, event := range events {
+	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turn.TurnID}
+	for _, event := range batch.Events {
 		if !validEvent(event) {
-			return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "agentd_protocol", SanitizedError: "agent event invalid"}, nil
+			return retry("agentd_protocol", "agent event invalid"), nil
 		}
-		_, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, InputTokens: event.InputTokens, OutputTokens: event.OutputTokens}, e.now())
-		if err != nil {
-			return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: "coordinator_fence", SanitizedError: "agent event rejected"}, nil
+		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, Usage: event.Usage}, e.now()); err != nil {
+			return retry("coordinator_fence", "agent event rejected"), nil
 		}
-		switch event.Kind {
-		case "runtime_succeeded":
-			result = workledger.ExecutorResult{Outcome: workledger.OutcomeCompleted, ExternalCorrelation: turnID, ResultDigest: event.EvidenceRef}
-		case "runtime_waiting":
-			result = workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turnID}
+		if event.Kind == "runtime_succeeded" {
+			result.ResultDigest = event.EvidenceRef
 		}
 	}
+	// Runtime success is durable evidence only. PR 10 owns semantic verification
+	// and is the only boundary allowed to complete the work item.
 	return result, nil
 }
-
+func retry(classification, message string) workledger.ExecutorResult {
+	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
+}
 func validEvent(e Event) bool {
-	return e.Cursor != "" && (e.Kind == "evidence" || e.Kind == "usage" || e.Kind == "runtime_succeeded" || e.Kind == "runtime_waiting") && e.InputTokens >= 0 && e.OutputTokens >= 0
+	return e.Cursor > 0 && (e.Kind == "evidence" || e.Kind == "usage" || e.Kind == "runtime_succeeded" || e.Kind == "runtime_waiting") && e.Usage.Valid()
+}
+func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
+	return l.WorkerID == b.WorkerID && l.FenceEpoch == b.FenceEpoch && l.AuthorityPolicyVersion == b.AuthorityPolicyVersion && l.WorkerLineage == b.WorkerLineage && l.AuthorityProfile == b.AuthorityProfile
 }
 
 func (e *Executor) acquire(ctx context.Context, request workledger.ExecutorRequest) (workledger.SessionBinding, error) {
-	binding, err := e.Store.SessionBinding(ctx, request.WorkItem.ID)
+	b, err := e.Store.SessionBinding(ctx, request.WorkItem.ID)
 	if err == nil {
-		return binding, nil
+		return b, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return workledger.SessionBinding{}, err
@@ -135,9 +138,6 @@ func (e *Executor) acquire(ctx context.Context, request workledger.ExecutorReque
 	return e.Store.BindSessionLease(ctx, request.WorkItem.ID, "session:"+request.WorkItem.ID, lease, e.now())
 }
 
-// ReassignAfterLoss performs the broker-recorded replacement followed by one
-// durable compare-and-swap. A process crash before CAS leaves the predecessor
-// intact; a crash after CAS fences every predecessor response.
 func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string) (workledger.SessionBinding, error) {
 	if e.Store == nil || e.Broker == nil {
 		return workledger.SessionBinding{}, errors.New("agent coordinator requires ledger and broker")

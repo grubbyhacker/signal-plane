@@ -112,7 +112,7 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := future.Exec(`PRAGMA user_version=7`); err != nil {
+	if _, err := future.Exec(`PRAGMA user_version=8`); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.Close(); err != nil {
@@ -157,7 +157,7 @@ func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
 		t.Fatal("v3 migration omitted operation idempotency evidence")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 7 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }
