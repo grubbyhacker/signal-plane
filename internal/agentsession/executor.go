@@ -27,6 +27,7 @@ type AcquireRequest struct{ BindingKey, AuthorityProfile, IdempotencyKey string 
 type ReassignRequest struct {
 	BindingKey, PredecessorWorker string
 	PredecessorEpoch              int64
+	IdempotencyKey                string
 }
 type CreateSessionRequest struct{ BindingKey, ResumeSessionID, IdempotencyKey string }
 type SubmitTurnRequest struct{ BindingKey, SessionID, EvidenceRef, EvidenceDigest, IdempotencyKey string }
@@ -102,7 +103,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, Usage: event.Usage}, e.now()); err != nil {
 			return retry("coordinator_fence", "agent event rejected"), nil
 		}
-		if event.Kind == "runtime_succeeded" {
+		if event.Kind == "attempt_completed" {
 			result.ResultDigest = event.EvidenceRef
 		}
 	}
@@ -114,7 +115,7 @@ func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
 func validEvent(e Event) bool {
-	return e.Cursor > 0 && (e.Kind == "evidence" || e.Kind == "usage" || e.Kind == "runtime_succeeded" || e.Kind == "runtime_waiting") && e.Usage.Valid()
+	return e.Cursor > 0 && (e.Kind == "evidence" || e.Kind == "usage" || e.Kind == "attempt_completed" || e.Kind == "runtime_waiting") && e.Usage.Valid()
 }
 func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
 	return l.WorkerID == b.WorkerID && l.FenceEpoch == b.FenceEpoch && l.AuthorityPolicyVersion == b.AuthorityPolicyVersion && l.WorkerLineage == b.WorkerLineage && l.AuthorityProfile == b.AuthorityProfile
@@ -146,7 +147,7 @@ func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string) (wo
 	if err != nil {
 		return workledger.SessionBinding{}, err
 	}
-	next, err := e.Broker.Reassign(ctx, ReassignRequest{BindingKey: previous.BindingKey, PredecessorWorker: previous.WorkerID, PredecessorEpoch: previous.FenceEpoch})
+	next, err := e.Broker.Reassign(ctx, ReassignRequest{BindingKey: previous.BindingKey, PredecessorWorker: previous.WorkerID, PredecessorEpoch: previous.FenceEpoch, IdempotencyKey: reassignmentIdempotencyKey(previous.BindingKey, previous.FenceEpoch)})
 	if err != nil {
 		return workledger.SessionBinding{}, err
 	}
@@ -154,4 +155,8 @@ func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string) (wo
 		return workledger.SessionBinding{}, fmt.Errorf("broker replacement did not change worker")
 	}
 	return e.Store.ReassignSession(ctx, workItemID, previous.WorkerID, previous.FenceEpoch, next, e.now())
+}
+
+func reassignmentIdempotencyKey(bindingKey string, predecessorEpoch int64) string {
+	return fmt.Sprintf("signal-plane:agent-session:reassign:v1:%s:%d", bindingKey, predecessorEpoch)
 }

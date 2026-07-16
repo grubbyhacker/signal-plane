@@ -19,6 +19,7 @@ type fakeBroker struct {
 	stream             StreamEventsRequest
 	events             []Event
 	err                error
+	seenReassign       map[string]workledger.SessionLease
 }
 
 func (f *fakeBroker) Acquire(_ context.Context, r AcquireRequest) (workledger.SessionLease, error) {
@@ -27,6 +28,16 @@ func (f *fakeBroker) Acquire(_ context.Context, r AcquireRequest) (workledger.Se
 }
 func (f *fakeBroker) Reassign(_ context.Context, r ReassignRequest) (workledger.SessionLease, error) {
 	f.reassign = r
+	if f.seenReassign == nil {
+		f.seenReassign = make(map[string]workledger.SessionLease)
+	}
+	if prior, ok := f.seenReassign[r.IdempotencyKey]; ok {
+		if prior != f.replacement {
+			return workledger.SessionLease{}, errors.New("idempotency key conflicts with successor")
+		}
+		return prior, f.err
+	}
+	f.seenReassign[r.IdempotencyKey] = f.replacement
 	return f.replacement, f.err
 }
 func (f *fakeBroker) CreateSession(_ context.Context, r CreateSessionRequest) (BrokerSession, error) {
@@ -75,14 +86,30 @@ func lease(worker string, epoch int64) workledger.SessionLease {
 	return workledger.SessionLease{WorkerID: worker, AuthorityProfile: authorityProfile, AuthorityPolicyVersion: "policy-v1", WorkerLineage: "volume-lineage-1", FenceEpoch: epoch}
 }
 func usage(in, cached, out, reason int64) workledger.Usage {
-	return workledger.Usage{InputTokens: in, CachedInputTokens: cached, OutputTokens: out, ReasoningOutputTokens: reason, TotalTokens: in + cached + out + reason}
+	return workledger.Usage{InputTokens: in, CachedInputTokens: cached, OutputTokens: out, ReasoningOutputTokens: reason, TotalTokens: in + out}
+}
+
+func TestAgentdV1TokenUsageTotalsAndBreakdowns(t *testing.T) {
+	valid := workledger.Usage{InputTokens: 11, CachedInputTokens: 3, OutputTokens: 7, ReasoningOutputTokens: 2, TotalTokens: 18}
+	if !valid.Valid() {
+		t.Fatal("valid agentd tokenUsage rejected")
+	}
+	for _, malformed := range []workledger.Usage{
+		{InputTokens: 11, CachedInputTokens: 3, OutputTokens: 7, ReasoningOutputTokens: 2, TotalTokens: 23},
+		{InputTokens: 2, CachedInputTokens: 3, OutputTokens: 7, TotalTokens: 9},
+		{InputTokens: 11, OutputTokens: 1, ReasoningOutputTokens: 2, TotalTokens: 12},
+	} {
+		if malformed.Valid() {
+			t.Fatalf("malformed agentd tokenUsage accepted: %+v", malformed)
+		}
+	}
 }
 
 func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 	ctx := context.Background()
 	store, item, attempt, now := coordinatorFixture(t)
 	defer store.Close()
-	broker := &fakeBroker{lease: lease("worker-1", 1), events: []Event{{Cursor: 1, Kind: "evidence", EvidenceRef: "artifact://one"}, {Cursor: 2, Kind: "usage", Usage: usage(3, 2, 5, 7)}, {Cursor: 3, Kind: "runtime_succeeded", EvidenceRef: "sha256:result"}}}
+	broker := &fakeBroker{lease: lease("worker-1", 1), events: []Event{{Cursor: 1, Kind: "evidence", EvidenceRef: "artifact://one"}, {Cursor: 2, Kind: "usage", Usage: usage(3, 2, 5, 5)}, {Cursor: 3, Kind: "attempt_completed", EvidenceRef: "sha256:result"}}}
 	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
 	result, err := ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
 	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ResultDigest != "sha256:result" {
@@ -95,7 +122,7 @@ func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 		t.Fatalf("runtime success did not leave work waiting: %v", err)
 	}
 	n, u, err := store.CoordinatorUsage(ctx, item.ID)
-	if err != nil || n != 1 || u != usage(3, 2, 5, 7) {
+	if err != nil || n != 1 || u != usage(3, 2, 5, 5) {
 		t.Fatalf("usage n=%d u=%+v err=%v", n, u, err)
 	}
 	if broker.create.BindingKey != "session:"+item.ID || broker.turns[0].IdempotencyKey != attempt.IdempotencyKey {
@@ -144,10 +171,22 @@ func TestReassignmentIsExactEpochIdempotentAndPreservesSession(t *testing.T) {
 	if err := store.SetAgentdSession(ctx, item.ID, lease("worker-1", 1), "logical-session", now); err != nil {
 		t.Fatal(err)
 	}
-	ex := &Executor{Store: store, Broker: &fakeBroker{replacement: lease("worker-2", 2)}, Now: func() time.Time { return now }}
+	broker := &fakeBroker{replacement: lease("worker-2", 2)}
+	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
 	b, err := ex.ReassignAfterLoss(ctx, item.ID)
 	if err != nil || b.AgentdSessionID != "logical-session" {
 		t.Fatalf("replacement lost resume identity: %+v %v", b, err)
+	}
+	wantKey := reassignmentIdempotencyKey("session:"+item.ID, 1)
+	if broker.reassign.IdempotencyKey != wantKey {
+		t.Fatalf("reassignment idempotency key=%q want %q", broker.reassign.IdempotencyKey, wantKey)
+	}
+	if _, err := broker.Reassign(ctx, ReassignRequest{BindingKey: "session:" + item.ID, PredecessorWorker: "worker-1", PredecessorEpoch: 1, IdempotencyKey: wantKey}); err != nil {
+		t.Fatalf("same-key same-successor replay denied: %v", err)
+	}
+	broker.replacement = lease("worker-3", 2)
+	if _, err := broker.Reassign(ctx, ReassignRequest{BindingKey: "session:" + item.ID, PredecessorWorker: "worker-1", PredecessorEpoch: 1, IdempotencyKey: wantKey}); err == nil {
+		t.Fatal("conflicting key/successor replay accepted")
 	}
 	if _, err := store.ReassignSession(ctx, item.ID, "worker-1", 1, lease("worker-2", 2), now); err != nil {
 		t.Fatalf("same broker successor not idempotent: %v", err)

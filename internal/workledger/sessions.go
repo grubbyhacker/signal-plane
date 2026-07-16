@@ -32,10 +32,10 @@ func (u Usage) Valid() bool {
 	if u.InputTokens < 0 || u.CachedInputTokens < 0 || u.OutputTokens < 0 || u.ReasoningOutputTokens < 0 || u.TotalTokens < 0 {
 		return false
 	}
-	if u.InputTokens > math.MaxInt64-u.CachedInputTokens || u.InputTokens+u.CachedInputTokens > math.MaxInt64-u.OutputTokens || u.InputTokens+u.CachedInputTokens+u.OutputTokens > math.MaxInt64-u.ReasoningOutputTokens {
+	if u.CachedInputTokens > u.InputTokens || u.ReasoningOutputTokens > u.OutputTokens || u.InputTokens > math.MaxInt64-u.OutputTokens {
 		return false
 	}
-	return u.TotalTokens == u.InputTokens+u.CachedInputTokens+u.OutputTokens+u.ReasoningOutputTokens
+	return u.TotalTokens == u.InputTokens+u.OutputTokens
 }
 
 func (store *Store) BindSession(ctx context.Context, workItemID, bindingKey, authorityProfile, workerID string, now time.Time) (SessionBinding, error) {
