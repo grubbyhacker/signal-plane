@@ -27,7 +27,8 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS content_results (computed_digest TEXT PRIMARY KEY, external_correlation TEXT NOT NULL, result_digest TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ingress_failures (source TEXT NOT NULL, namespace TEXT NOT NULL, source_delivery_id TEXT NOT NULL, event_digest TEXT NOT NULL, classification TEXT NOT NULL, attempts INTEGER NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(source,namespace,source_delivery_id))`,
 		`CREATE TABLE IF NOT EXISTS session_bindings (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), binding_key TEXT NOT NULL UNIQUE, authority_profile TEXT NOT NULL, worker_id TEXT NOT NULL DEFAULT '', checkpoint_ref TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK(state IN ('pending','active','checkpointed','terminated','failed')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
-		`PRAGMA user_version=5`,
+		`CREATE TABLE IF NOT EXISTS coordinator_events (binding_key TEXT NOT NULL REFERENCES session_bindings(binding_key), cursor INTEGER NOT NULL CHECK(cursor>0), worker_id TEXT NOT NULL, fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), event_kind TEXT NOT NULL, evidence_ref TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens>=0), cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cached_input_tokens>=0), output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens>=0), reasoning_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_output_tokens>=0), total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens>=0), recorded_at INTEGER NOT NULL, PRIMARY KEY(binding_key,cursor))`,
+		`PRAGMA user_version=7`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -35,6 +36,31 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	if err := ensureMigrationColumn(ctx, tx, "executor_attempts", "operation_idempotency_key", `operation_idempotency_key TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"authority_policy_version", `authority_policy_version TEXT NOT NULL DEFAULT ''`},
+		{"worker_lineage", `worker_lineage TEXT NOT NULL DEFAULT ''`},
+		{"fence_epoch", `fence_epoch INTEGER NOT NULL DEFAULT 1`},
+		{"agentd_session_id", `agentd_session_id TEXT NOT NULL DEFAULT ''`},
+		{"event_cursor", `event_cursor INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if err := ensureMigrationColumn(ctx, tx, "session_bindings", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"cached_input_tokens", `cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cached_input_tokens>=0)`},
+		{"reasoning_output_tokens", `reasoning_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_output_tokens>=0)`},
+		{"total_tokens", `total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens>=0)`},
+	} {
+		if err := ensureMigrationColumn(ctx, tx, "coordinator_events", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	// v6 stored the cursor as TEXT with an empty-string default. Normalize that
+	// legacy sentinel before the int64 cursor reader takes over.
+	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=0 WHERE CAST(event_cursor AS TEXT)=''`); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
