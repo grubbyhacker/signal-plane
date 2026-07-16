@@ -47,6 +47,40 @@ func TestRegistryAndRouteDecoderRejectUnboundedExecution(t *testing.T) {
 	}
 }
 
+func TestSessionBindingIsDurableAndRejectsConflictingWorker(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	route := testRoute()
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: route.ExecutorID, Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := store.Admit(ctx, snapshot.ID, testEvent("session-delivery", 1, "session-rev"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.BindSession(ctx, admission.WorkItem.ID, "session:"+admission.WorkItem.ID, "general-writer-v1", "worker-1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := store.BindSession(ctx, admission.WorkItem.ID, first.BindingKey, "general-writer-v1", "worker-1", now.Add(time.Second))
+	if err != nil || replay.WorkerID != "worker-1" {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	if _, err := store.BindSession(ctx, admission.WorkItem.ID, first.BindingKey, "general-writer-v1", "worker-2", now); err == nil {
+		t.Fatal("conflicting worker assignment accepted")
+	}
+}
+
 func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "migration.db")
@@ -78,7 +112,7 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := future.Exec(`PRAGMA user_version=5`); err != nil {
+	if _, err := future.Exec(`PRAGMA user_version=6`); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.Close(); err != nil {
@@ -123,7 +157,7 @@ func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
 		t.Fatal("v3 migration omitted operation idempotency evidence")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 4 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 5 {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
 }

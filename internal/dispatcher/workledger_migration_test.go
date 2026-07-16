@@ -35,7 +35,7 @@ func TestOpenStoreMigratesLegacyProofDatabaseToGeneralLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	for _, table := range []string{"deliveries", "jobs", "recovery_runs", "route_snapshots", "work_items", "work_events", "executor_attempts", "serialization_leases", "release_operations", "content_results", "ingress_failures"} {
+	for _, table := range []string{"deliveries", "jobs", "recovery_runs", "route_snapshots", "work_items", "work_events", "executor_attempts", "serialization_leases", "release_operations", "content_results", "ingress_failures", "session_bindings"} {
 		var count int
 		if err := store.db.QueryRowContext(context.Background(), `SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table %s missing: count=%d err=%v", table, count, err)
