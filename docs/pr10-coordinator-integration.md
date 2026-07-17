@@ -9,8 +9,9 @@ choose runtime credentials, or claim a lifecycle proof.
 `internal/agentsession.HTTPBroker` is the concrete authenticated HTTP adapter
 for the broker's coordinator v1 endpoints. Requests use fixed paths and strict
 JSON decoding. Session acquisition, creation, turn submission, event streaming,
-reassignment, and reassignment-status reads preserve the complete authority and
-fencing identity:
+checkpoint, resume, cancel, status, reassignment, and reassignment-status reads
+use only the broker-defined fixed operations and preserve the complete authority
+and fencing identity:
 
 - authority profile and profile version
 - policy digest
@@ -39,7 +40,11 @@ Reassignment is a durable saga recorded in SQLite:
 
 The broker rebind idempotency key is retained separately from Signal Plane's
 request idempotency key. A restart can reconcile the broker status and resume
-the saga. No broker command may route while the newest reassignment is short of
+the saga. Reassignment calls carry the predecessor fence epoch, so replay after
+coordinator commit resolves the durable transition instead of deriving a new
+generation from the mutable successor binding. Broker conflicts and legacy
+unresolved adoptions are persisted as escalated transitions with bounded error
+codes. No broker command may route while the newest reassignment is short of
 `coordinator_committed`; the routing barrier prevents a stale worker or an
 unconfirmed successor from receiving work.
 
@@ -60,6 +65,9 @@ The repository task permits one durable continuation. A second continuation
 request exhausts the budget and moves the work item to failed escalation rather
 than opening an unbounded agent loop. Workspace cleanup remains an agentd
 responsibility and is therefore outside this repository's janitor boundary.
+Verifier results carry the exact executor-attempt identity. A canonical receipt
+for that attempt makes exact replay idempotent, including after terminal commit,
+while a different result for the same attempt fails closed.
 
 ## Deliberately deferred
 

@@ -233,6 +233,135 @@ type brokerSessionResponse struct {
 	Result  json.RawMessage `json:"result"`
 }
 
+type BrokerSessionStatus struct {
+	Version, SessionID, CoordinatorBinding, AuthorityBinding string
+	WorkerID, StorageLineageID, SessionLineageID, Phase      string
+	FenceEpoch, NextCursor                                   int64
+	Workspace                                                BrokerSessionWorkspace
+	Conversation                                             *BrokerConversation
+	ActiveTurnID                                             string
+	TurnIDs                                                  []string
+}
+
+type BrokerSessionWorkspace struct {
+	WorkspaceRef, BranchRef, CheckpointRef string
+	UID, GID                               int
+}
+
+type BrokerConversation struct {
+	AdapterKind, AdapterVersion, BackendThreadRef string
+}
+
+func (broker *HTTPBroker) Checkpoint(ctx context.Context, bindingKey, checkpointRef string) (BrokerSessionStatus, error) {
+	if !boundedOpaque(checkpointRef) {
+		return BrokerSessionStatus{}, errors.New("checkpoint reference is invalid")
+	}
+	return broker.sessionStatusCommand(ctx, "checkpoint", map[string]any{"session_binding": bindingKey, "checkpoint_ref": checkpointRef})
+}
+
+func (broker *HTTPBroker) Resume(ctx context.Context, bindingKey string) (BrokerSessionStatus, error) {
+	return broker.sessionStatusCommand(ctx, "resume", map[string]any{"session_binding": bindingKey})
+}
+
+func (broker *HTTPBroker) Status(ctx context.Context, bindingKey string) (BrokerSessionStatus, error) {
+	return broker.sessionStatusCommand(ctx, "status", map[string]any{"session_binding": bindingKey})
+}
+
+func (broker *HTTPBroker) Cancel(ctx context.Context, bindingKey, turnID string) (BrokerTurn, error) {
+	if !boundedOpaque(bindingKey) || !boundedID(turnID) {
+		return BrokerTurn{}, errors.New("turn identity is invalid")
+	}
+	var response brokerSessionResponse
+	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/cancel", map[string]any{"session_binding": bindingKey, "turn_id": turnID}, &response); err != nil {
+		return BrokerTurn{}, err
+	}
+	lease, err := response.validate()
+	if err != nil {
+		return BrokerTurn{}, err
+	}
+	var turn struct {
+		SessionID string `json:"sessionId"`
+		TurnID    string `json:"turnId"`
+		Phase     string `json:"phase"`
+	}
+	if err := decodeStrict(response.Result, &turn); err != nil || !boundedID(turn.SessionID) || turn.TurnID != turnID || turn.Phase == "" {
+		return BrokerTurn{}, errors.New("broker cancel result is invalid")
+	}
+	return BrokerTurn{TurnID: turn.TurnID, Lease: lease}, nil
+}
+
+func (broker *HTTPBroker) sessionStatusCommand(ctx context.Context, operation string, input map[string]any) (BrokerSessionStatus, error) {
+	bindingKey, _ := input["session_binding"].(string)
+	if !boundedOpaque(bindingKey) {
+		return BrokerSessionStatus{}, errors.New("session binding is invalid")
+	}
+	var response brokerSessionResponse
+	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/"+operation, input, &response); err != nil {
+		return BrokerSessionStatus{}, err
+	}
+	lease, err := response.validate()
+	if err != nil {
+		return BrokerSessionStatus{}, err
+	}
+	// The agentd status wire uses lower camel case outside the workspace object.
+	type statusWire struct {
+		Version            string `json:"version"`
+		SessionID          string `json:"sessionId"`
+		CoordinatorBinding string `json:"coordinatorBinding"`
+		AuthorityBinding   string `json:"authorityBinding"`
+		WorkerID           string `json:"workerId"`
+		StorageLineageID   string `json:"storageLineageId"`
+		FenceEpoch         int64  `json:"fenceEpoch"`
+		SessionLineageID   string `json:"sessionLineageId"`
+		Workspace          struct {
+			WorkspaceRef  string `json:"workspaceRef"`
+			UID           int    `json:"uid"`
+			GID           int    `json:"gid"`
+			BranchRef     string `json:"branchRef,omitempty"`
+			CheckpointRef string `json:"checkpointRef,omitempty"`
+		} `json:"workspace"`
+		Phase        string `json:"phase"`
+		Conversation *struct {
+			AdapterKind      string `json:"adapterKind"`
+			AdapterVersion   string `json:"adapterVersion"`
+			BackendThreadRef string `json:"backendThreadRef"`
+		} `json:"conversation,omitempty"`
+		ActiveTurnID string   `json:"activeTurnId,omitempty"`
+		TurnIDs      []string `json:"turnIds"`
+		NextCursor   int64    `json:"nextCursor"`
+	}
+	var status statusWire
+	if err := decodeStrict(response.Result, &status); err != nil || status.Version != "agentd/v1" || !boundedID(status.SessionID) || status.CoordinatorBinding != bindingKey || status.AuthorityBinding != lease.AuthorityProfile || status.WorkerID != lease.WorkerID || status.StorageLineageID != lease.WorkerStorageLineageID || status.FenceEpoch != lease.WorkerFenceEpoch || status.SessionLineageID != lease.SessionLineageID || (status.Phase != "active" && status.Phase != "terminated") || !boundedOpaque(status.Workspace.WorkspaceRef) || status.Workspace.UID < 0 || status.Workspace.GID < 0 || status.TurnIDs == nil || status.NextCursor < 1 {
+		return BrokerSessionStatus{}, errors.New("broker session status is inconsistent")
+	}
+	if (status.Workspace.BranchRef != "" && !boundedOpaque(status.Workspace.BranchRef)) || (status.Workspace.CheckpointRef != "" && !boundedOpaque(status.Workspace.CheckpointRef)) || (status.ActiveTurnID != "" && !boundedID(status.ActiveTurnID)) {
+		return BrokerSessionStatus{}, errors.New("broker session status has invalid references")
+	}
+	for _, turnID := range status.TurnIDs {
+		if !boundedID(turnID) {
+			return BrokerSessionStatus{}, errors.New("broker session status has invalid turn identity")
+		}
+	}
+	if status.Conversation != nil && (!boundedID(status.Conversation.AdapterKind) || !boundedID(status.Conversation.AdapterVersion) || !boundedOpaque(status.Conversation.BackendThreadRef)) {
+		return BrokerSessionStatus{}, errors.New("broker session status has invalid conversation identity")
+	}
+	value := BrokerSessionStatus{Version: status.Version, SessionID: status.SessionID, CoordinatorBinding: status.CoordinatorBinding, AuthorityBinding: status.AuthorityBinding, WorkerID: status.WorkerID, StorageLineageID: status.StorageLineageID, FenceEpoch: status.FenceEpoch, SessionLineageID: status.SessionLineageID, Phase: status.Phase, Workspace: BrokerSessionWorkspace{WorkspaceRef: status.Workspace.WorkspaceRef, UID: status.Workspace.UID, GID: status.Workspace.GID, BranchRef: status.Workspace.BranchRef, CheckpointRef: status.Workspace.CheckpointRef}, ActiveTurnID: status.ActiveTurnID, TurnIDs: status.TurnIDs, NextCursor: status.NextCursor}
+	if status.Conversation != nil {
+		value.Conversation = &BrokerConversation{AdapterKind: status.Conversation.AdapterKind, AdapterVersion: status.Conversation.AdapterVersion, BackendThreadRef: status.Conversation.BackendThreadRef}
+	}
+	if operation == "checkpoint" && value.Workspace.CheckpointRef != input["checkpoint_ref"] {
+		return BrokerSessionStatus{}, errors.New("broker checkpoint result is inconsistent")
+	}
+	return value, nil
+}
+
+func boundedID(value string) bool {
+	return value != "" && len(value) <= 128 && !strings.ContainsAny(value, "\r\n")
+}
+func boundedOpaque(value string) bool {
+	return value != "" && len(value) <= 512 && !strings.ContainsAny(value, "\r\n")
+}
+
 func (response brokerSessionResponse) validate() (workledger.SessionLease, error) {
 	lease, err := response.Lease.normalized()
 	if err != nil || response.Version != brokerCoordinatorVersion || len(response.Result) == 0 {

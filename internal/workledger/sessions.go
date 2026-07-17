@@ -2,6 +2,7 @@ package workledger
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -54,9 +55,9 @@ type Reassignment struct {
 }
 
 type VerifierResult struct {
-	VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-	HeadRevision, Outcome                                              string
-	ReasonCodes, EvidenceRefs                                          []string
+	AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
+	HeadRevision, Outcome                                                         string
+	ReasonCodes, EvidenceRefs                                                     []string
 }
 
 func (u Usage) Valid() bool {
@@ -235,19 +236,32 @@ func (store *Store) immediate(ctx context.Context, fn func(*sql.Conn) error) (er
 	return err
 }
 
-func (store *Store) BeginReassignment(ctx context.Context, workItemID, idempotencyKey string, now time.Time) (Reassignment, error) {
+func (store *Store) BeginReassignment(ctx context.Context, workItemID string, predecessorEpoch int64, idempotencyKey string, now time.Time) (Reassignment, error) {
+	transition, err := store.Reassignment(ctx, workItemID, predecessorEpoch)
+	if err == nil {
+		if transition.IdempotencyKey != idempotencyKey {
+			return Reassignment{}, errors.New("reassignment idempotency identity conflicts with durable request")
+		}
+		return transition, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Reassignment{}, err
+	}
 	binding, err := store.SessionBinding(ctx, workItemID)
 	if err != nil {
 		return Reassignment{}, err
 	}
-	if err := store.RoutingReady(ctx, workItemID); err != nil {
-		return store.Reassignment(ctx, workItemID, binding.WorkerFenceEpoch)
+	if binding.WorkerFenceEpoch != predecessorEpoch {
+		return Reassignment{}, errors.New("reassignment predecessor epoch conflicts with active binding")
 	}
-	_, err = store.db.ExecContext(ctx, `INSERT INTO coordinator_reassignments(work_item_id,predecessor_fence_epoch,idempotency_key,phase,session_lineage_id,authority_profile,profile_version,policy_digest,storage_lineage_id,predecessor_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id,predecessor_fence_epoch) DO NOTHING`, workItemID, binding.WorkerFenceEpoch, idempotencyKey, ReassignmentRequested, binding.SessionLineageID, binding.AuthorityProfile, binding.ProfileVersion, binding.PolicyDigest, binding.WorkerStorageLineageID, binding.WorkerID, millis(now), millis(now))
+	if err := store.RoutingReady(ctx, workItemID); err != nil {
+		return Reassignment{}, err
+	}
+	_, err = store.db.ExecContext(ctx, `INSERT INTO coordinator_reassignments(work_item_id,predecessor_fence_epoch,idempotency_key,phase,session_lineage_id,authority_profile,profile_version,policy_digest,storage_lineage_id,predecessor_worker_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id,predecessor_fence_epoch) DO NOTHING`, workItemID, predecessorEpoch, idempotencyKey, ReassignmentRequested, binding.SessionLineageID, binding.AuthorityProfile, binding.ProfileVersion, binding.PolicyDigest, binding.WorkerStorageLineageID, binding.WorkerID, millis(now), millis(now))
 	if err != nil {
 		return Reassignment{}, err
 	}
-	transition, err := store.Reassignment(ctx, workItemID, binding.WorkerFenceEpoch)
+	transition, err = store.Reassignment(ctx, workItemID, predecessorEpoch)
 	if err != nil {
 		return Reassignment{}, err
 	}
@@ -255,6 +269,21 @@ func (store *Store) BeginReassignment(ctx context.Context, workItemID, idempoten
 		return Reassignment{}, errors.New("reassignment transition conflicts with durable request")
 	}
 	return transition, nil
+}
+
+func (store *Store) EscalateReassignment(ctx context.Context, workItemID string, predecessorEpoch int64, brokerState, errorCode string, now time.Time) error {
+	if !regexp.MustCompile(`^[a-z0-9_]{1,128}$`).MatchString(errorCode) {
+		return errors.New("bounded reassignment error code is required")
+	}
+	result, err := store.db.ExecContext(ctx, `UPDATE coordinator_reassignments SET phase=?,broker_state=?,error_code=?,updated_at=? WHERE work_item_id=? AND predecessor_fence_epoch=? AND phase<>?`, ReassignmentEscalated, brokerState, errorCode, millis(now), workItemID, predecessorEpoch, ReassignmentCoordinatorCommitted)
+	if err != nil {
+		return err
+	}
+	changed, _ := result.RowsAffected()
+	if changed != 1 {
+		return errors.New("reassignment escalation conflicts with committed transition")
+	}
+	return nil
 }
 
 func (store *Store) Reassignment(ctx context.Context, workItemID string, predecessorEpoch int64) (Reassignment, error) {
@@ -269,7 +298,7 @@ func (store *Store) RecordBrokerReassignment(ctx context.Context, workItemID str
 	if !validLease(successor) || successor.WorkerFenceEpoch != predecessorEpoch+1 || brokerState == "" {
 		return errors.New("complete broker successor is required")
 	}
-	result, err := store.db.ExecContext(ctx, `UPDATE coordinator_reassignments SET phase=?,successor_worker_id=?,successor_fence_epoch=?,broker_state=?,updated_at=? WHERE work_item_id=? AND predecessor_fence_epoch=? AND phase IN (?,?) AND session_lineage_id=? AND authority_profile=? AND profile_version=? AND policy_digest=? AND storage_lineage_id=?`, ReassignmentBrokerCommitted, successor.WorkerID, successor.WorkerFenceEpoch, brokerState, millis(now), workItemID, predecessorEpoch, ReassignmentRequested, ReassignmentBrokerCommitted, successor.SessionLineageID, successor.AuthorityProfile, successor.ProfileVersion, successor.PolicyDigest, successor.WorkerStorageLineageID)
+	result, err := store.db.ExecContext(ctx, `UPDATE coordinator_reassignments SET phase=?,successor_worker_id=?,successor_fence_epoch=?,broker_state=?,updated_at=? WHERE work_item_id=? AND predecessor_fence_epoch=? AND phase IN (?,?) AND session_lineage_id=? AND authority_profile=? AND profile_version=? AND policy_digest=? AND storage_lineage_id=? AND (successor_worker_id='' OR successor_worker_id=?) AND (successor_fence_epoch=0 OR successor_fence_epoch=?)`, ReassignmentBrokerCommitted, successor.WorkerID, successor.WorkerFenceEpoch, brokerState, millis(now), workItemID, predecessorEpoch, ReassignmentRequested, ReassignmentBrokerCommitted, successor.SessionLineageID, successor.AuthorityProfile, successor.ProfileVersion, successor.PolicyDigest, successor.WorkerStorageLineageID, successor.WorkerID, successor.WorkerFenceEpoch)
 	if err != nil {
 		return err
 	}
@@ -337,7 +366,7 @@ func (store *Store) ReassignSession(ctx context.Context, workItemID, predecessor
 		return SessionBinding{}, errors.New("reassignment predecessor changed")
 	}
 	key := fmt.Sprintf("legacy-reassign:%s:%d", workItemID, predecessorEpoch)
-	transition, err := store.BeginReassignment(ctx, workItemID, key, now)
+	transition, err := store.BeginReassignment(ctx, workItemID, predecessorEpoch, key, now)
 	if err != nil {
 		return SessionBinding{}, err
 	}
@@ -365,7 +394,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	if result.Outcome != "satisfied" && result.Outcome != "missing_or_stale" && result.Outcome != "continuation" && result.Outcome != "escalated" {
 		return errors.New("unknown verifier outcome")
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(result.HeadRevision) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || result.TaskEvidenceDigest == "" || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 || len(result.ReasonCodes) > 32 {
+	if result.AttemptID == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(result.HeadRevision) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || result.TaskEvidenceDigest == "" || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 || len(result.ReasonCodes) > 32 {
 		return errors.New("verifier result identity is incomplete")
 	}
 	if result.Outcome == "satisfied" && len(result.ReasonCodes) != 0 {
@@ -381,6 +410,12 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	slices.Sort(evidence)
 	reasonJSON, _ := json.Marshal(reasons)
 	evidenceJSON, _ := json.Marshal(evidence)
+	identityJSON, _ := json.Marshal(struct {
+		AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
+		HeadRevision, Outcome                                                         string
+		ReasonCodes, EvidenceRefs                                                     []string
+	}{result.AttemptID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, reasons, evidence})
+	resultDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(identityJSON))
 	return store.immediate(ctx, func(conn *sql.Conn) error {
 		var verifierID, contract, digest, taskEvidence, state string
 		var continuations int
@@ -390,6 +425,28 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		}
 		if verifierID != result.VerifierID || contract != result.CompletionContract || digest != result.ContractDigest || taskEvidence != result.TaskEvidenceDigest {
 			return errors.New("stale verifier result rejected")
+		}
+		var priorAttemptID string
+		err = conn.QueryRowContext(ctx, `SELECT attempt_id FROM verifier_results WHERE work_item_id=?`, workItemID).Scan(&priorAttemptID)
+		if err == nil && priorAttemptID == "" {
+			return errors.New("legacy verifier result has no replay identity")
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var attemptState, receiptDigest string
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM executor_attempts WHERE id=? AND work_item_id=?`, result.AttemptID, workItemID).Scan(&attemptState); err != nil || (attemptState != string(AttemptSucceeded) && attemptState != string(AttemptRetryScheduled)) {
+			return errors.New("verifier result requires its completed waiting attempt")
+		}
+		err = conn.QueryRowContext(ctx, `SELECT result_digest FROM verifier_result_receipts WHERE work_item_id=? AND attempt_id=?`, workItemID, result.AttemptID).Scan(&receiptDigest)
+		if err == nil {
+			if receiptDigest == resultDigest {
+				return nil
+			}
+			return errors.New("verifier replay conflicts with durable result identity")
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 		if state != string(StateWaiting) {
 			return errors.New("verifier result requires waiting work")
@@ -407,7 +464,10 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 				continuations++
 			}
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
+		if _, err = conn.ExecContext(ctx, `INSERT INTO verifier_result_receipts(work_item_id,attempt_id,result_digest,recorded_at) VALUES(?,?,?,?)`, workItemID, result.AttemptID, resultDigest, millis(now)); err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
 		if err != nil {
 			return err
 		}

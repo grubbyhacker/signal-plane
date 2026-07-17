@@ -22,6 +22,7 @@ type fakeBroker struct {
 	err                error
 	seenReassign       map[string]workledger.SessionLease
 	statusState        string
+	statusErrorCode    string
 }
 
 func (f *fakeBroker) Acquire(_ context.Context, r AcquireRequest) (workledger.SessionLease, error) {
@@ -47,7 +48,7 @@ func (f *fakeBroker) ReassignmentStatus(_ context.Context, r ReassignmentStatusR
 	if state == "" {
 		state = "confirmed"
 	}
-	return BrokerReassignmentStatus{Lease: f.replacement, PredecessorWorker: f.reassign.PredecessorWorker, PredecessorEpoch: r.PredecessorEpoch, RebindIdempotencyKey: "broker-rebind-key", State: state}, f.err
+	return BrokerReassignmentStatus{Lease: f.replacement, PredecessorWorker: f.reassign.PredecessorWorker, PredecessorEpoch: r.PredecessorEpoch, RebindIdempotencyKey: "broker-rebind-key", State: state, ErrorCode: f.statusErrorCode}, f.err
 }
 func (f *fakeBroker) CreateSession(_ context.Context, r CreateSessionRequest) (BrokerSession, error) {
 	f.create = r
@@ -176,8 +177,9 @@ func TestCursorOrderingDuplicatesAndRestartReplay(t *testing.T) {
 
 func TestReassignmentIsExactEpochIdempotentAndPreservesSession(t *testing.T) {
 	ctx := context.Background()
-	store, item, _, now := coordinatorFixture(t)
-	defer store.Close()
+	path := filepath.Join(t.TempDir(), "committed-reassignment-restart.db")
+	store, item, _, now := coordinatorFixtureAt(t, path)
+	t.Cleanup(func() { _ = store.Close() })
 	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +188,7 @@ func TestReassignmentIsExactEpochIdempotentAndPreservesSession(t *testing.T) {
 	}
 	broker := &fakeBroker{replacement: lease("worker-2", 2)}
 	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	b, err := ex.ReassignAfterLoss(ctx, item.ID)
+	b, err := ex.ReassignAfterLoss(ctx, item.ID, 1)
 	if err != nil || b.AgentdSessionID != "logical-session" {
 		t.Fatalf("replacement lost resume identity: %+v %v", b, err)
 	}
@@ -194,6 +196,23 @@ func TestReassignmentIsExactEpochIdempotentAndPreservesSession(t *testing.T) {
 	if broker.reassign.IdempotencyKey != wantKey {
 		t.Fatalf("reassignment idempotency key=%q want %q", broker.reassign.IdempotencyKey, wantKey)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex.Store = store
+	broker.err = errors.New("broker must not be called for committed replay")
+	replayed, err := ex.ReassignAfterLoss(ctx, item.ID, 1)
+	if err != nil || replayed.WorkerID != "worker-2" || replayed.WorkerFenceEpoch != 2 {
+		t.Fatalf("committed replay derived a new generation: binding=%+v err=%v", replayed, err)
+	}
+	if _, err := store.Reassignment(ctx, item.ID, 2); err == nil {
+		t.Fatal("committed replay created a successor-generation transition")
+	}
+	broker.err = nil
 	if _, err := broker.Reassign(ctx, ReassignRequest{BindingKey: "session:" + item.ID, PredecessorWorker: "worker-1", PredecessorEpoch: 1, IdempotencyKey: wantKey}); err != nil {
 		t.Fatalf("same-key same-successor replay denied: %v", err)
 	}
@@ -280,15 +299,16 @@ func TestBrokerFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	ex := &Executor{Store: store, Broker: &fakeBroker{err: errors.New("down")}}
-	if _, err := ex.ReassignAfterLoss(context.Background(), item.ID); err == nil {
+	if _, err := ex.ReassignAfterLoss(context.Background(), item.ID, 1); err == nil {
 		t.Fatal("broker failure reassigned")
 	}
 }
 
 func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testing.T) {
 	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
-	defer store.Close()
+	path := filepath.Join(t.TempDir(), "reassignment-restart.db")
+	store, item, attempt, now := coordinatorFixtureAt(t, path)
+	t.Cleanup(func() { _ = store.Close() })
 	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
 		t.Fatal(err)
 	}
@@ -297,9 +317,21 @@ func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testin
 	}
 	broker := &fakeBroker{lease: lease("worker-1", 1), replacement: lease("worker-2", 2), statusState: "pending"}
 	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	if _, err := executor.ReassignAfterLoss(ctx, item.ID); err == nil {
+	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
 		t.Fatal("pending broker adoption was committed")
 	}
+	pending, err := store.Reassignment(ctx, item.ID, 1)
+	if err != nil || pending.Phase != workledger.ReassignmentBrokerCommitted {
+		t.Fatalf("broker-committed crash point was not durable: transition=%+v err=%v", pending, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.Store = store
 	if err := store.RoutingReady(ctx, item.ID); err == nil {
 		t.Fatal("routing remained open during reassignment")
 	}
@@ -308,7 +340,7 @@ func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testin
 		t.Fatalf("routing barrier result=%+v turns=%d err=%v", result, len(broker.turns), err)
 	}
 	broker.statusState = "confirmed"
-	binding, err := executor.ReassignAfterLoss(ctx, item.ID)
+	binding, err := executor.ReassignAfterLoss(ctx, item.ID, 1)
 	if err != nil || binding.WorkerID != "worker-2" || binding.WorkerFenceEpoch != 2 {
 		t.Fatalf("binding=%+v err=%v", binding, err)
 	}
@@ -318,6 +350,43 @@ func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testin
 	transition, err := store.Reassignment(ctx, item.ID, 1)
 	if err != nil || transition.Phase != workledger.ReassignmentCoordinatorCommitted || transition.RebindIdempotencyKey != "broker-rebind-key" {
 		t.Fatalf("transition=%+v err=%v", transition, err)
+	}
+}
+
+func TestVerifierReceiptSurvivesRestartWithoutConsumingContinuationTwice(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "verifier-restart.db")
+	store, item, attempt, now := coordinatorFixtureAt(t, path)
+	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/restart"}}
+	if err := (&Executor{Store: store, Now: func() time.Time { return now }}).RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	executor := &Executor{Store: store, Now: func() time.Time { return now }}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
+		t.Fatalf("exact verifier replay after restart failed: %v", err)
+	}
+	conflict := result
+	conflict.HeadRevision = strings.Repeat("c", 40)
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
+		t.Fatal("conflicting verifier replay after restart was accepted")
+	}
+	if _, _, ok, err := store.Claim(ctx, now); err != nil || !ok {
+		t.Fatalf("exact replay consumed the continuation twice: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -339,9 +408,17 @@ func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
 	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
+	}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+		t.Fatalf("exact verifier replay was not idempotent: %v", err)
+	}
+	conflict := continuation
+	conflict.EvidenceRefs = []string{"evidence://verification/conflict"}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
+		t.Fatal("conflicting verifier replay was accepted")
 	}
 	_, secondAttempt, ok, err := store.Claim(ctx, now)
 	if err != nil || !ok {
@@ -356,12 +433,37 @@ func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
 		t.Fatal("stale verifier evidence accepted")
 	}
 	satisfied := continuation
+	satisfied.AttemptID = secondAttempt.ID
 	satisfied.Outcome, satisfied.ReasonCodes, satisfied.EvidenceRefs = "satisfied", nil, []string{"evidence://verification/2"}
 	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
 		t.Fatal(err)
 	}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
+		t.Fatalf("terminal verifier replay was not idempotent: %v", err)
+	}
 	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
 		t.Fatalf("satisfied work remained claimable: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestReassignmentConflictIsDurablyEscalated(t *testing.T) {
+	ctx := context.Background()
+	store, item, _, now := coordinatorFixture(t)
+	defer store.Close()
+	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
+		t.Fatal(err)
+	}
+	broker := &fakeBroker{replacement: lease("worker-2", 2), statusState: "conflict", statusErrorCode: "agentd_rebind_conflict"}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
+		t.Fatal("broker conflict was not surfaced")
+	}
+	transition, err := store.Reassignment(ctx, item.ID, 1)
+	if err != nil || transition.Phase != workledger.ReassignmentEscalated || transition.BrokerState != "conflict" || transition.ErrorCode != "agentd_rebind_conflict" {
+		t.Fatalf("conflict was not durable: transition=%+v err=%v", transition, err)
+	}
+	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
+		t.Fatal("durably escalated replay was accepted")
 	}
 }
 
@@ -377,7 +479,7 @@ func TestNamedVerifierCannotSatisfyWithoutDurableRuntimeCompletion(t *testing.T)
 		t.Fatal(err)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	result := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://verification/1"}}
+	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://verification/1"}}
 	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err == nil {
 		t.Fatal("verifier satisfied work without a durable attempt_completed event")
 	}
@@ -401,7 +503,7 @@ func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) 
 		t.Fatal(err)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
 	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
 	}
@@ -412,6 +514,7 @@ func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) 
 	if err := store.Complete(ctx, secondAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
 		t.Fatal(err)
 	}
+	continuation.AttemptID = secondAttempt.ID
 	continuation.EvidenceRefs = []string{"evidence://verification/2"}
 	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
