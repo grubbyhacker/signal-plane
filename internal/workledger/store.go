@@ -65,10 +65,21 @@ func (store *Store) ActivateRoute(ctx context.Context, definition RouteDefinitio
 	if err != nil {
 		return RouteSnapshot{}, err
 	}
-	return store.saveRoute(ctx, definition, executor.Descriptor(), now)
+	var task *TaskDescriptor
+	if executor.Descriptor().Kind == ExecutorAgentSession {
+		descriptor, parameters, err := registry.ResolveTask(definition.Task, definition.Admission)
+		if err != nil {
+			return RouteSnapshot{}, err
+		}
+		definition.Task = &TaskSelection{Kind: descriptor.Kind, Parameters: parameters}
+		task = &descriptor
+	} else if definition.Task != nil {
+		return RouteSnapshot{}, errors.New("only an agent_session executor may select a registered task kind")
+	}
+	return store.saveRoute(ctx, definition, executor.Descriptor(), task, now)
 }
 
-func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, executor ExecutorDescriptor, now time.Time) (RouteSnapshot, error) {
+func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, executor ExecutorDescriptor, task *TaskDescriptor, now time.Time) (RouteSnapshot, error) {
 	if err := definition.Validate(); err != nil {
 		return RouteSnapshot{}, err
 	}
@@ -78,7 +89,7 @@ func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, e
 	if err := executor.Validate(); err != nil {
 		return RouteSnapshot{}, err
 	}
-	digest, err := activationDigest(definition, executor)
+	digest, err := activationDigest(definition, executor, task)
 	if err != nil {
 		return RouteSnapshot{}, err
 	}
@@ -87,6 +98,12 @@ func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, e
 		return RouteSnapshot{}, err
 	}
 	snapshot := RouteSnapshot{ID: newID("route"), RouteID: definition.ID, SchemaVersion: definition.SchemaVersion, SemanticVersion: definition.SemanticVersion, Digest: digest, ExecutorID: executor.ID, ExecutorKind: executor.Kind, ExecutorVersion: executor.Version, Admission: definition.Admission, Concurrency: definition.Concurrency, Retry: definition.Retry, ActivatedAt: now.UTC()}
+	if task != nil {
+		snapshot.TaskKind, snapshot.TaskVersion = task.Kind, task.Version
+		snapshot.CompletionContract, snapshot.VerifierID = task.CompletionContract, task.VerifierID
+		snapshot.TaskContractDigest = task.ContractDigest
+		snapshot.TaskParameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return RouteSnapshot{}, err
@@ -94,8 +111,12 @@ func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, e
 	defer tx.Rollback()
 	var existing RouteSnapshot
 	var activated int64
-	err = tx.QueryRowContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,activated_at FROM route_snapshots WHERE route_id=? AND digest=? AND retired_at IS NULL`, definition.ID, digest).Scan(&existing.ID, &existing.RouteID, &existing.SchemaVersion, &existing.SemanticVersion, &existing.Digest, &existing.ExecutorID, &existing.ExecutorKind, &existing.ExecutorVersion, &activated)
+	err = tx.QueryRowContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,task_kind,task_version,completion_contract,verifier_id,task_contract_digest,activated_at FROM route_snapshots WHERE route_id=? AND digest=? AND retired_at IS NULL`, definition.ID, digest).Scan(&existing.ID, &existing.RouteID, &existing.SchemaVersion, &existing.SemanticVersion, &existing.Digest, &existing.ExecutorID, &existing.ExecutorKind, &existing.ExecutorVersion, &existing.TaskKind, &existing.TaskVersion, &existing.CompletionContract, &existing.VerifierID, &existing.TaskContractDigest, &activated)
 	if err == nil {
+		existing.Admission, existing.Concurrency, existing.Retry = definition.Admission, definition.Concurrency, definition.Retry
+		if definition.Task != nil {
+			existing.TaskParameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+		}
 		existing.ActivatedAt = time.UnixMilli(activated).UTC()
 		if err := tx.Commit(); err != nil {
 			return RouteSnapshot{}, err
@@ -106,7 +127,7 @@ func (store *Store) saveRoute(ctx context.Context, definition RouteDefinition, e
 		return RouteSnapshot{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE route_snapshots SET retired_at=? WHERE route_id=? AND retired_at IS NULL`, millis(now), snapshot.RouteID); err == nil {
-		_, err = tx.ExecContext(ctx, `INSERT INTO route_snapshots(id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,definition_json,activated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, snapshot.ID, snapshot.RouteID, snapshot.SchemaVersion, snapshot.SemanticVersion, snapshot.Digest, snapshot.ExecutorID, snapshot.ExecutorKind, snapshot.ExecutorVersion, string(encoded), millis(now))
+		_, err = tx.ExecContext(ctx, `INSERT INTO route_snapshots(id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,task_kind,task_version,completion_contract,verifier_id,task_contract_digest,definition_json,activated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, snapshot.ID, snapshot.RouteID, snapshot.SchemaVersion, snapshot.SemanticVersion, snapshot.Digest, snapshot.ExecutorID, snapshot.ExecutorKind, snapshot.ExecutorVersion, snapshot.TaskKind, snapshot.TaskVersion, snapshot.CompletionContract, snapshot.VerifierID, snapshot.TaskContractDigest, string(encoded), millis(now))
 	}
 	if err != nil {
 		return RouteSnapshot{}, fmt.Errorf("save route snapshot: %w", err)
@@ -132,7 +153,7 @@ func (store *Store) RetireRoute(ctx context.Context, snapshotID string, now time
 // MatchRoute selects the sole active route whose source-neutral admission
 // policy accepts event. Zero or overlapping matches fail closed.
 func (store *Store) MatchRoute(ctx context.Context, event Event) (RouteSnapshot, error) {
-	rows, err := store.db.QueryContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,definition_json,activated_at FROM route_snapshots WHERE retired_at IS NULL ORDER BY route_id,id`)
+	rows, err := store.db.QueryContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,task_kind,task_version,completion_contract,verifier_id,task_contract_digest,definition_json,activated_at FROM route_snapshots WHERE retired_at IS NULL ORDER BY route_id,id`)
 	if err != nil {
 		return RouteSnapshot{}, err
 	}
@@ -142,7 +163,7 @@ func (store *Store) MatchRoute(ctx context.Context, event Event) (RouteSnapshot,
 		var snapshot RouteSnapshot
 		var encoded string
 		var activated int64
-		if err := rows.Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &encoded, &activated); err != nil {
+		if err := rows.Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &snapshot.TaskKind, &snapshot.TaskVersion, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.TaskContractDigest, &encoded, &activated); err != nil {
 			return RouteSnapshot{}, err
 		}
 		definition, err := DecodeRouteDefinition([]byte(encoded))
@@ -153,6 +174,9 @@ func (store *Store) MatchRoute(ctx context.Context, event Event) (RouteSnapshot,
 			continue
 		}
 		snapshot.Admission, snapshot.Concurrency, snapshot.Retry = definition.Admission, definition.Concurrency, definition.Retry
+		if definition.Task != nil {
+			snapshot.TaskParameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+		}
 		snapshot.ActivatedAt = time.UnixMilli(activated).UTC()
 		matches = append(matches, snapshot)
 	}
@@ -244,7 +268,7 @@ func (store *Store) admit(ctx context.Context, snapshotID string, event Event, o
 	err = tx.QueryRowContext(ctx, `SELECT id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,state,state_version,superseded_by_id,latest_executor_correlation,created_at,updated_at,terminal_at,next_attempt_at FROM work_items WHERE route_snapshot_id=? AND semantic_object_key=? AND source_revision=? ORDER BY created_at DESC LIMIT 1`, snapshot.ID, semanticKey, event.SourceRevision).Scan(workItemScan(&item)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		item = WorkItem{ID: newID("work"), RouteSnapshotID: snapshot.ID, RouteID: definition.ID, SemanticObjectKey: semanticKey, Source: event.Source, Namespace: event.Namespace, ObjectKind: event.ObjectKind, ObjectID: event.ObjectID, SourceRevision: event.SourceRevision, SerializationKey: serializationKey(definition, event), State: StateAdmitted, StateVersion: 1, CreatedAt: now.UTC(), UpdatedAt: now.UTC()}
-		_, err = tx.ExecContext(ctx, `INSERT INTO work_items(id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,state,state_version,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ID, item.RouteSnapshotID, item.RouteID, item.SemanticObjectKey, item.Source, item.Namespace, item.ObjectKind, item.ObjectID, item.SourceRevision, item.SerializationKey, item.State, item.StateVersion, millis(now), millis(now), millis(now))
+		_, err = tx.ExecContext(ctx, `INSERT INTO work_items(id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,task_evidence_digest,state,state_version,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ID, item.RouteSnapshotID, item.RouteID, item.SemanticObjectKey, item.Source, item.Namespace, item.ObjectKind, item.ObjectID, item.SourceRevision, item.SerializationKey, event.PayloadDigest, item.State, item.StateVersion, millis(now), millis(now), millis(now))
 		if err != nil {
 			return AdmissionResult{}, err
 		}
@@ -504,12 +528,15 @@ func loadSnapshot(ctx context.Context, tx *sql.Tx, id string) (RouteSnapshot, Ro
 	var encoded string
 	var activated int64
 	var retired sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,definition_json,activated_at,retired_at FROM route_snapshots WHERE id=?`, id).Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &encoded, &activated, &retired)
+	err := tx.QueryRowContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,task_kind,task_version,completion_contract,verifier_id,task_contract_digest,definition_json,activated_at,retired_at FROM route_snapshots WHERE id=?`, id).Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &snapshot.TaskKind, &snapshot.TaskVersion, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.TaskContractDigest, &encoded, &activated, &retired)
 	if err != nil {
 		return RouteSnapshot{}, RouteDefinition{}, err
 	}
 	definition, err := DecodeRouteDefinition([]byte(encoded))
 	snapshot.Admission, snapshot.Concurrency, snapshot.Retry, snapshot.ActivatedAt = definition.Admission, definition.Concurrency, definition.Retry, time.UnixMilli(activated).UTC()
+	if definition.Task != nil {
+		snapshot.TaskParameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+	}
 	if retired.Valid {
 		value := time.UnixMilli(retired.Int64).UTC()
 		snapshot.RetiredAt = &value
@@ -588,17 +615,23 @@ func newID(prefix string) string {
 	return prefix + "-" + hex.EncodeToString(value[:])
 }
 
-func activationDigest(definition RouteDefinition, descriptor ExecutorDescriptor) (string, error) {
+func activationDigest(definition RouteDefinition, descriptor ExecutorDescriptor, task *TaskDescriptor) (string, error) {
 	if err := definition.Validate(); err != nil {
 		return "", err
 	}
 	if err := descriptor.Validate(); err != nil {
 		return "", err
 	}
+	if task != nil {
+		if err := task.Validate(); err != nil {
+			return "", err
+		}
+	}
 	encoded, err := json.Marshal(struct {
 		Route    RouteDefinition    `json:"route"`
 		Executor ExecutorDescriptor `json:"executor"`
-	}{definition, descriptor})
+		Task     *TaskDescriptor    `json:"task,omitempty"`
+	}{definition, descriptor, task})
 	if err != nil {
 		return "", err
 	}

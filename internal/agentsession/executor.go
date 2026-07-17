@@ -18,22 +18,27 @@ const authorityProfile = "general-writer-v1"
 // durable binding/evidence identifiers, never a worker, profile, or runtime.
 type Broker interface {
 	Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error)
-	Reassign(context.Context, ReassignRequest) (workledger.SessionLease, error)
+	Reassign(context.Context, ReassignRequest) (BrokerReassignment, error)
+	ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error)
 	CreateSession(context.Context, CreateSessionRequest) (BrokerSession, error)
 	SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error)
 	StreamEvents(context.Context, StreamEventsRequest) (BrokerEvents, error)
 }
 type AcquireRequest struct{ BindingKey, AuthorityProfile, IdempotencyKey string }
 type ReassignRequest struct {
-	BindingKey, PredecessorWorker string
-	PredecessorEpoch              int64
-	IdempotencyKey                string
+	BindingKey, SessionLineageID, PredecessorWorker string
+	PredecessorEpoch                                int64
+	IdempotencyKey                                  string
 }
-type CreateSessionRequest struct{ BindingKey, ResumeSessionID, IdempotencyKey string }
-type SubmitTurnRequest struct{ BindingKey, SessionID, EvidenceRef, EvidenceDigest, IdempotencyKey string }
+type ReassignmentStatusRequest struct {
+	BindingKey       string
+	PredecessorEpoch int64
+}
+type CreateSessionRequest struct{ BindingKey string }
+type SubmitTurnRequest struct{ BindingKey, Prompt, IdempotencyKey string }
 type StreamEventsRequest struct {
-	BindingKey, SessionID string
-	Cursor                int64
+	BindingKey string
+	Cursor     int64
 }
 type BrokerSession struct {
 	SessionID string
@@ -46,6 +51,17 @@ type BrokerTurn struct {
 type BrokerEvents struct {
 	Lease  workledger.SessionLease
 	Events []Event
+}
+type BrokerReassignment struct {
+	Lease workledger.SessionLease
+	State string
+}
+type BrokerReassignmentStatus struct {
+	Lease                workledger.SessionLease
+	PredecessorWorker    string
+	PredecessorEpoch     int64
+	RebindIdempotencyKey string
+	State, ErrorCode     string
 }
 type Event struct {
 	Cursor            int64
@@ -73,12 +89,15 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	if e.Store == nil || e.Broker == nil {
 		return workledger.ExecutorResult{}, errors.New("agent coordinator requires ledger and broker contracts")
 	}
+	if err := e.Store.RoutingReady(ctx, request.WorkItem.ID); err != nil {
+		return retry("coordinator_reassignment", "session reassignment is incomplete"), nil
+	}
 	binding, err := e.acquire(ctx, request)
 	if err != nil {
 		return retry("coordinator_acquire", "authority session unavailable"), nil
 	}
 	if binding.AgentdSessionID == "" {
-		created, err := e.Broker.CreateSession(ctx, CreateSessionRequest{BindingKey: binding.BindingKey, ResumeSessionID: binding.AgentdSessionID, IdempotencyKey: binding.BindingKey})
+		created, err := e.Broker.CreateSession(ctx, CreateSessionRequest{BindingKey: binding.BindingKey})
 		if err != nil || created.SessionID == "" || !sameLease(binding, created.Lease) {
 			return retry("agentd_create", "broker session create unavailable"), nil
 		}
@@ -87,11 +106,15 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		}
 		binding.AgentdSessionID = created.SessionID
 	}
-	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, SessionID: binding.AgentdSessionID, EvidenceRef: request.WorkItem.ID, EvidenceDigest: request.Attempt.RequestedOperationDigest, IdempotencyKey: request.Attempt.IdempotencyKey})
+	prompt, err := e.registeredPrompt(ctx, request)
+	if err != nil {
+		return retry("registered_task", "registered task snapshot unavailable"), nil
+	}
+	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, Prompt: prompt, IdempotencyKey: request.Attempt.IdempotencyKey})
 	if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
 		return retry("agentd_submit", "broker turn submit unavailable"), nil
 	}
-	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, SessionID: binding.AgentdSessionID, Cursor: binding.EventCursor})
+	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, Cursor: binding.EventCursor})
 	if err != nil || !sameLease(binding, batch.Lease) {
 		return retry("agentd_events", "broker event stream unavailable"), nil
 	}
@@ -100,7 +123,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		if !validEvent(event) {
 			return retry("agentd_protocol", "agent event invalid"), nil
 		}
-		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, FenceEpoch: binding.FenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, Usage: event.Usage}, e.now()); err != nil {
+		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, Usage: event.Usage}, e.now()); err != nil {
 			return retry("coordinator_fence", "agent event rejected"), nil
 		}
 		if event.Kind == "attempt_completed" {
@@ -115,10 +138,10 @@ func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
 func validEvent(e Event) bool {
-	return e.Cursor > 0 && (e.Kind == "evidence" || e.Kind == "usage" || e.Kind == "attempt_completed" || e.Kind == "runtime_waiting") && e.Usage.Valid()
+	return e.Cursor > 0 && knownAgentdEvent(e.Kind) && e.EvidenceRef != "" && e.Usage.Valid()
 }
 func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
-	return l.WorkerID == b.WorkerID && l.FenceEpoch == b.FenceEpoch && l.AuthorityPolicyVersion == b.AuthorityPolicyVersion && l.WorkerLineage == b.WorkerLineage && l.AuthorityProfile == b.AuthorityProfile
+	return l.WorkerID == b.WorkerID && l.WorkerFenceEpoch == b.WorkerFenceEpoch && l.ProfileVersion == b.ProfileVersion && l.PolicyDigest == b.PolicyDigest && l.SessionLineageID == b.SessionLineageID && l.WorkerStorageLineageID == b.WorkerStorageLineageID && l.AuthorityProfile == b.AuthorityProfile
 }
 
 func (e *Executor) acquire(ctx context.Context, request workledger.ExecutorRequest) (workledger.SessionBinding, error) {
@@ -139,7 +162,7 @@ func (e *Executor) acquire(ctx context.Context, request workledger.ExecutorReque
 	return e.Store.BindSessionLease(ctx, request.WorkItem.ID, "session:"+request.WorkItem.ID, lease, e.now())
 }
 
-func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string) (workledger.SessionBinding, error) {
+func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string, predecessorEpoch int64) (workledger.SessionBinding, error) {
 	if e.Store == nil || e.Broker == nil {
 		return workledger.SessionBinding{}, errors.New("agent coordinator requires ledger and broker")
 	}
@@ -147,14 +170,65 @@ func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string) (wo
 	if err != nil {
 		return workledger.SessionBinding{}, err
 	}
-	next, err := e.Broker.Reassign(ctx, ReassignRequest{BindingKey: previous.BindingKey, PredecessorWorker: previous.WorkerID, PredecessorEpoch: previous.FenceEpoch, IdempotencyKey: reassignmentIdempotencyKey(previous.BindingKey, previous.FenceEpoch)})
+	key := reassignmentIdempotencyKey(previous.BindingKey, predecessorEpoch)
+	transition, err := e.Store.BeginReassignment(ctx, workItemID, predecessorEpoch, key, e.now())
 	if err != nil {
 		return workledger.SessionBinding{}, err
 	}
-	if next.WorkerID == previous.WorkerID {
-		return workledger.SessionBinding{}, fmt.Errorf("broker replacement did not change worker")
+	if transition.Phase == workledger.ReassignmentCoordinatorCommitted {
+		if previous.WorkerID != transition.SuccessorWorkerID || previous.WorkerFenceEpoch != transition.SuccessorFenceEpoch || previous.SessionLineageID != transition.SessionLineageID || previous.WorkerStorageLineageID != transition.StorageLineageID {
+			return workledger.SessionBinding{}, errors.New("committed reassignment conflicts with active binding")
+		}
+		return previous, nil
 	}
-	return e.Store.ReassignSession(ctx, workItemID, previous.WorkerID, previous.FenceEpoch, next, e.now())
+	if transition.Phase == workledger.ReassignmentEscalated {
+		return workledger.SessionBinding{}, fmt.Errorf("reassignment is durably escalated: %s", transition.ErrorCode)
+	}
+	if transition.Phase == workledger.ReassignmentRequested {
+		brokerResult, err := e.Broker.Reassign(ctx, ReassignRequest{BindingKey: previous.BindingKey, SessionLineageID: transition.SessionLineageID, PredecessorWorker: transition.PredecessorWorkerID, PredecessorEpoch: transition.PredecessorFenceEpoch, IdempotencyKey: key})
+		if err != nil {
+			return workledger.SessionBinding{}, err
+		}
+		if brokerResult.Lease.WorkerID == transition.PredecessorWorkerID {
+			return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, brokerResult.State, "successor_worker_unchanged")
+		}
+		if err := e.Store.RecordBrokerReassignment(ctx, workItemID, predecessorEpoch, brokerResult.Lease, brokerResult.State, e.now()); err != nil {
+			return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, brokerResult.State, "broker_successor_conflict")
+		}
+	}
+	status, err := e.Broker.ReassignmentStatus(ctx, ReassignmentStatusRequest{BindingKey: previous.BindingKey, PredecessorEpoch: predecessorEpoch})
+	if err != nil {
+		return workledger.SessionBinding{}, err
+	}
+	if status.RebindIdempotencyKey == "" || status.PredecessorWorker != transition.PredecessorWorkerID || status.PredecessorEpoch != predecessorEpoch {
+		return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, status.State, "broker_status_identity_conflict")
+	}
+	if status.State != "confirmed" {
+		if status.State == "conflict" || status.State == "legacy_unresolved" {
+			code := status.ErrorCode
+			if code == "" {
+				code = "broker_" + status.State
+			}
+			return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, status.State, code)
+		}
+		return workledger.SessionBinding{}, fmt.Errorf("broker reassignment adoption is %s", status.State)
+	}
+	if transition.Phase == workledger.ReassignmentRequested || transition.Phase == workledger.ReassignmentBrokerCommitted {
+		if err := e.Store.RecordBrokerReassignment(ctx, workItemID, predecessorEpoch, status.Lease, status.State, e.now()); err != nil {
+			return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, status.State, "broker_successor_conflict")
+		}
+	}
+	if err := e.Store.RecordAgentdAdopted(ctx, workItemID, predecessorEpoch, status.State, status.RebindIdempotencyKey, e.now()); err != nil {
+		return workledger.SessionBinding{}, e.escalateReassignment(ctx, workItemID, predecessorEpoch, status.State, "agentd_adoption_conflict")
+	}
+	return e.Store.CommitReassignment(ctx, workItemID, predecessorEpoch, e.now())
+}
+
+func (e *Executor) escalateReassignment(ctx context.Context, workItemID string, predecessorEpoch int64, brokerState, code string) error {
+	if err := e.Store.EscalateReassignment(ctx, workItemID, predecessorEpoch, brokerState, code, e.now()); err != nil {
+		return fmt.Errorf("reassignment conflict %s could not be persisted: %w", code, err)
+	}
+	return fmt.Errorf("reassignment durably escalated: %s", code)
 }
 
 func reassignmentIdempotencyKey(bindingKey string, predecessorEpoch int64) string {

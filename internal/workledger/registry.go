@@ -2,8 +2,11 @@ package workledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -52,12 +55,61 @@ type Executor interface {
 	Execute(context.Context, ExecutorRequest) (ExecutorResult, error)
 }
 
+type TaskDescriptor struct {
+	Kind               string
+	Version            string
+	CompletionContract string
+	VerifierID         string
+	ContractDigest     string
+}
+
+type WorkTaskSnapshot struct {
+	TaskDescriptor
+	Parameters         json.RawMessage
+	TaskEvidenceDigest string
+}
+
+func (store *Store) WorkTaskSnapshot(ctx context.Context, workItemID string) (WorkTaskSnapshot, error) {
+	var snapshot WorkTaskSnapshot
+	var definitionJSON string
+	err := store.db.QueryRowContext(ctx, `SELECT s.task_kind,s.task_version,s.completion_contract,s.verifier_id,s.task_contract_digest,s.definition_json,w.task_evidence_digest FROM work_items w JOIN route_snapshots s ON s.id=w.route_snapshot_id WHERE w.id=?`, workItemID).Scan(&snapshot.Kind, &snapshot.Version, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.ContractDigest, &definitionJSON, &snapshot.TaskEvidenceDigest)
+	if err != nil {
+		return WorkTaskSnapshot{}, err
+	}
+	definition, err := DecodeRouteDefinition([]byte(definitionJSON))
+	if err != nil || definition.Task == nil {
+		return WorkTaskSnapshot{}, errors.New("work item has no registered task snapshot")
+	}
+	snapshot.Parameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+	return snapshot, nil
+}
+
+func (descriptor TaskDescriptor) Validate() error {
+	if !identifierPattern.MatchString(descriptor.Kind) ||
+		strings.TrimSpace(descriptor.Version) == "" ||
+		!identifierPattern.MatchString(descriptor.CompletionContract) ||
+		!identifierPattern.MatchString(descriptor.VerifierID) ||
+		!regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(descriptor.ContractDigest) {
+		return errors.New("task kind requires registered identifiers and version")
+	}
+	return nil
+}
+
+type TaskKind interface {
+	Descriptor() TaskDescriptor
+	CanonicalizeParameters(json.RawMessage) (json.RawMessage, error)
+	ValidateAdmission(AdmissionPolicy) error
+}
+
 type Registry struct {
 	mu        sync.RWMutex
 	executors map[string]Executor
+	tasks     map[string]TaskKind
 }
 
-func NewRegistry() *Registry { return &Registry{executors: make(map[string]Executor)} }
+func NewRegistry() *Registry {
+	return &Registry{executors: make(map[string]Executor), tasks: make(map[string]TaskKind)}
+}
 
 func (registry *Registry) Register(executor Executor) error {
 	if executor == nil {
@@ -74,6 +126,43 @@ func (registry *Registry) Register(executor Executor) error {
 	}
 	registry.executors[descriptor.ID] = executor
 	return nil
+}
+
+func (registry *Registry) RegisterTask(task TaskKind) error {
+	if task == nil {
+		return errors.New("task kind is required")
+	}
+	descriptor := task.Descriptor()
+	if err := descriptor.Validate(); err != nil {
+		return err
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, exists := registry.tasks[descriptor.Kind]; exists {
+		return fmt.Errorf("task kind %q is already registered", descriptor.Kind)
+	}
+	registry.tasks[descriptor.Kind] = task
+	return nil
+}
+
+func (registry *Registry) ResolveTask(selection *TaskSelection, admission AdmissionPolicy) (TaskDescriptor, json.RawMessage, error) {
+	if selection == nil {
+		return TaskDescriptor{}, nil, errors.New("registered task selection is required")
+	}
+	registry.mu.RLock()
+	task, exists := registry.tasks[selection.Kind]
+	registry.mu.RUnlock()
+	if !exists {
+		return TaskDescriptor{}, nil, fmt.Errorf("task kind %q is not registered", selection.Kind)
+	}
+	if err := task.ValidateAdmission(admission); err != nil {
+		return TaskDescriptor{}, nil, err
+	}
+	parameters, err := task.CanonicalizeParameters(selection.Parameters)
+	if err != nil {
+		return TaskDescriptor{}, nil, err
+	}
+	return task.Descriptor(), parameters, nil
 }
 
 func (registry *Registry) Resolve(id string) (Executor, error) {
