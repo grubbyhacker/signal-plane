@@ -2,6 +2,7 @@ package agentsession
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"reflect"
 	"regexp"
+	"sort"
+	"strings"
 
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
@@ -20,6 +23,13 @@ const (
 	NeutralRepositoryID          = "neutral/pr10-proof"
 	repositoryContractDocument   = `{"budget":{"maxContinuations":1,"maxModelTurns":2,"maxRuntimeMs":1200000,"maxTotalTokens":250000,"perTurnTimeoutMs":600000,"wallClockDeadlineMs":1800000},"completionContract":"repository_state_v1","parameterSchema":"neutral_repository_change_v1","reasonCodes":["base_revision_mismatch","branch_mismatch","evidence_ambiguous","forbidden_action","head_not_advanced","head_not_reachable","ignored_state","untracked_state","validation_missing","validation_stale","worktree_dirty"],"taskKind":"repository_change_v1","verifierId":"repository_state_v1","version":"1.0.0"}`
 )
+
+var repositoryVerifierReasons = map[string]struct{}{
+	"base_revision_mismatch": {}, "branch_mismatch": {}, "evidence_ambiguous": {},
+	"forbidden_action": {}, "head_not_advanced": {}, "head_not_reachable": {},
+	"ignored_state": {}, "untracked_state": {}, "validation_missing": {},
+	"validation_stale": {}, "worktree_dirty": {},
+}
 
 type RepositoryChangeParameters struct {
 	RepositoryID        string `json:"repositoryId"`
@@ -81,4 +91,43 @@ func NeutralRepositoryTaskSelection(baseRevision, branchRef string) *workledger.
 		ValidationSelection: "required",
 	})
 	return &workledger.TaskSelection{Kind: RepositoryChangeTaskKind, Parameters: parameters}
+}
+
+func (e *Executor) registeredPrompt(ctx context.Context, request workledger.ExecutorRequest) (string, error) {
+	snapshot, err := e.Store.WorkTaskSnapshot(ctx, request.WorkItem.ID)
+	if err != nil {
+		return "", err
+	}
+	if snapshot.Kind != RepositoryChangeTaskKind || snapshot.CompletionContract != RepositoryCompletionContract || snapshot.VerifierID != RepositoryCompletionContract {
+		return "", errors.New("unsupported registered task snapshot")
+	}
+	var parameters RepositoryChangeParameters
+	if err := json.Unmarshal(snapshot.Parameters, &parameters); err != nil {
+		return "", err
+	}
+	lines := []string{
+		"Execute registered task " + snapshot.Kind + ".",
+		"Repository catalog identity: " + parameters.RepositoryID + ".",
+		"Immutable base revision: " + parameters.BaseRevision + ".",
+		"Broker-projected branch: " + parameters.BranchRef + ".",
+		"Required validation selection: " + parameters.ValidationSelection + ".",
+		"Completion contract: " + snapshot.CompletionContract + ".",
+		"Contract digest: " + snapshot.ContractDigest + ".",
+		"Task evidence digest: " + snapshot.TaskEvidenceDigest + ".",
+	}
+	// Sorting makes the prompt stable if additional declarative facts are added.
+	sort.Strings(lines[1:5])
+	return strings.Join(lines, "\n"), nil
+}
+
+func (e *Executor) RecordRepositoryVerifierResult(ctx context.Context, workItemID string, result workledger.VerifierResult) error {
+	if e.Store == nil || result.VerifierID != RepositoryCompletionContract || result.CompletionContract != RepositoryCompletionContract {
+		return errors.New("registered repository verifier is required")
+	}
+	for _, reason := range result.ReasonCodes {
+		if _, ok := repositoryVerifierReasons[reason]; !ok {
+			return fmt.Errorf("unregistered verifier reason %q", reason)
+		}
+	}
+	return e.Store.RecordVerifierResult(ctx, workItemID, result, 1, e.now())
 }

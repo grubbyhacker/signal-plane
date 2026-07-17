@@ -21,25 +21,33 @@ type fakeBroker struct {
 	events             []Event
 	err                error
 	seenReassign       map[string]workledger.SessionLease
+	statusState        string
 }
 
 func (f *fakeBroker) Acquire(_ context.Context, r AcquireRequest) (workledger.SessionLease, error) {
 	f.acquire = r
 	return f.lease, f.err
 }
-func (f *fakeBroker) Reassign(_ context.Context, r ReassignRequest) (workledger.SessionLease, error) {
+func (f *fakeBroker) Reassign(_ context.Context, r ReassignRequest) (BrokerReassignment, error) {
 	f.reassign = r
 	if f.seenReassign == nil {
 		f.seenReassign = make(map[string]workledger.SessionLease)
 	}
 	if prior, ok := f.seenReassign[r.IdempotencyKey]; ok {
 		if prior != f.replacement {
-			return workledger.SessionLease{}, errors.New("idempotency key conflicts with successor")
+			return BrokerReassignment{}, errors.New("idempotency key conflicts with successor")
 		}
-		return prior, f.err
+		return BrokerReassignment{Lease: prior, State: "broker_committed"}, f.err
 	}
 	f.seenReassign[r.IdempotencyKey] = f.replacement
-	return f.replacement, f.err
+	return BrokerReassignment{Lease: f.replacement, State: "broker_committed"}, f.err
+}
+func (f *fakeBroker) ReassignmentStatus(_ context.Context, r ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	state := f.statusState
+	if state == "" {
+		state = "confirmed"
+	}
+	return BrokerReassignmentStatus{Lease: f.replacement, PredecessorWorker: f.reassign.PredecessorWorker, PredecessorEpoch: r.PredecessorEpoch, RebindIdempotencyKey: "broker-rebind-key", State: state}, f.err
 }
 func (f *fakeBroker) CreateSession(_ context.Context, r CreateSessionRequest) (BrokerSession, error) {
 	f.create = r
@@ -87,7 +95,7 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 	return store, item, attempt, now
 }
 func lease(worker string, epoch int64) workledger.SessionLease {
-	return workledger.SessionLease{WorkerID: worker, AuthorityProfile: authorityProfile, AuthorityPolicyVersion: "policy-v1", WorkerLineage: "volume-lineage-1", FenceEpoch: epoch}
+	return workledger.SessionLease{WorkerID: worker, AuthorityProfile: authorityProfile, ProfileVersion: "profile-v1", PolicyDigest: strings.Repeat("a", 64), SessionLineageID: strings.Repeat("1", 32), WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: epoch}
 }
 func usage(in, cached, out, reason int64) workledger.Usage {
 	return workledger.Usage{InputTokens: in, CachedInputTokens: cached, OutputTokens: out, ReasoningOutputTokens: reason, TotalTokens: in + out}
@@ -113,7 +121,7 @@ func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 	ctx := context.Background()
 	store, item, attempt, now := coordinatorFixture(t)
 	defer store.Close()
-	broker := &fakeBroker{lease: lease("worker-1", 1), events: []Event{{Cursor: 1, Kind: "evidence", EvidenceRef: "artifact://one"}, {Cursor: 2, Kind: "usage", Usage: usage(3, 2, 5, 5)}, {Cursor: 3, Kind: "attempt_completed", EvidenceRef: "sha256:result"}}}
+	broker := &fakeBroker{lease: lease("worker-1", 1), events: []Event{{Cursor: 1, Kind: "attempt_started", EvidenceRef: "sha256:start"}, {Cursor: 2, Kind: "attempt_completed", EvidenceRef: "sha256:result", Usage: usage(3, 2, 5, 5)}}}
 	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
 	result, err := ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
 	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ResultDigest != "sha256:result" {
@@ -141,26 +149,27 @@ func TestCursorOrderingDuplicatesAndRestartReplay(t *testing.T) {
 	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
 		t.Fatal(err)
 	}
-	one := workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", FenceEpoch: 1, Kind: "usage", Usage: usage(1, 0, 2, 0)}
+	one := workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: usage(1, 0, 2, 0)}
 	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, one, now); err != nil || !ok {
 		t.Fatal(ok, err)
 	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", FenceEpoch: 1, Kind: "evidence"}, now); err != nil {
-		t.Fatalf("gaps are explicitly permitted: %v", err)
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}, now); err == nil {
+		t.Fatal("cursor gap accepted")
 	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 2, WorkerID: "worker-1", FenceEpoch: 1, Kind: "evidence"}, now); err == nil {
-		t.Fatal("out of order accepted")
+	second := workledger.CoordinatorEvent{Cursor: 2, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, second, now); err != nil {
+		t.Fatalf("contiguous cursor rejected: %v", err)
 	}
 	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, one, now); err != nil || ok {
 		t.Fatalf("restart replay before cursor=%v %v", ok, err)
 	}
-	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", FenceEpoch: 1, Kind: "evidence"}, now); err != nil || ok {
+	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, second, now); err != nil || ok {
 		t.Fatalf("restart duplicate=%v %v", ok, err)
 	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", FenceEpoch: 1, Kind: "usage", Usage: usage(1, 0, 0, 0)}, now); err == nil {
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 2, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: usage(1, 0, 0, 0)}, now); err == nil {
 		t.Fatal("duplicate conflict accepted")
 	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 4, WorkerID: "worker-1", FenceEpoch: 1, Kind: "usage", Usage: workledger.Usage{InputTokens: 1, TotalTokens: 2}}, now); err == nil {
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: workledger.Usage{InputTokens: 1, TotalTokens: 2}}, now); err == nil {
 		t.Fatal("inconsistent total accepted")
 	}
 }
@@ -221,7 +230,7 @@ func TestConcurrentEventAndReassignmentFencesOneSide(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := other.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", FenceEpoch: 1, Kind: "evidence"}, now)
+		_, err := other.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}, now)
 		errs <- err
 	}()
 	go func() {
@@ -244,7 +253,7 @@ func TestConcurrentEventAndReassignmentFencesOneSide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.WorkerID == "worker-2" && b.FenceEpoch != 2 {
+	if b.WorkerID == "worker-2" && b.WorkerFenceEpoch != 2 {
 		t.Fatalf("torn reassignment binding: %+v", b)
 	}
 	if b.EventCursor != 0 && b.EventCursor != 1 {
@@ -273,5 +282,144 @@ func TestBrokerFailure(t *testing.T) {
 	ex := &Executor{Store: store, Broker: &fakeBroker{err: errors.New("down")}}
 	if _, err := ex.ReassignAfterLoss(context.Background(), item.ID); err == nil {
 		t.Fatal("broker failure reassigned")
+	}
+}
+
+func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAgentdSession(ctx, item.ID, lease("worker-1", 1), "agentd-session-1", now); err != nil {
+		t.Fatal(err)
+	}
+	broker := &fakeBroker{lease: lease("worker-1", 1), replacement: lease("worker-2", 2), statusState: "pending"}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	if _, err := executor.ReassignAfterLoss(ctx, item.ID); err == nil {
+		t.Fatal("pending broker adoption was committed")
+	}
+	if err := store.RoutingReady(ctx, item.ID); err == nil {
+		t.Fatal("routing remained open during reassignment")
+	}
+	result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+	if err != nil || result.RetryClassification != "coordinator_reassignment" || len(broker.turns) != 0 {
+		t.Fatalf("routing barrier result=%+v turns=%d err=%v", result, len(broker.turns), err)
+	}
+	broker.statusState = "confirmed"
+	binding, err := executor.ReassignAfterLoss(ctx, item.ID)
+	if err != nil || binding.WorkerID != "worker-2" || binding.WorkerFenceEpoch != 2 {
+		t.Fatalf("binding=%+v err=%v", binding, err)
+	}
+	if err := store.RoutingReady(ctx, item.ID); err != nil {
+		t.Fatalf("confirmed reassignment did not reopen routing: %v", err)
+	}
+	transition, err := store.Reassignment(ctx, item.ID, 1)
+	if err != nil || transition.Phase != workledger.ReassignmentCoordinatorCommitted || transition.RebindIdempotencyKey != "broker-rebind-key" {
+		t.Fatalf("transition=%+v err=%v", transition, err)
+	}
+}
+
+func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &Executor{Store: store, Now: func() time.Time { return now }}
+	continuation := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+		t.Fatal(err)
+	}
+	_, secondAttempt, ok, err := store.Claim(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("bounded continuation was not claimable: ok=%v err=%v", ok, err)
+	}
+	if err := store.Complete(ctx, secondAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	stale := continuation
+	stale.TaskEvidenceDigest = "sha256:stale"
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, stale); err == nil {
+		t.Fatal("stale verifier evidence accepted")
+	}
+	satisfied := continuation
+	satisfied.Outcome, satisfied.ReasonCodes, satisfied.EvidenceRefs = "satisfied", nil, []string{"evidence://verification/2"}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
+		t.Fatalf("satisfied work remained claimable: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestNamedVerifierCannotSatisfyWithoutDurableRuntimeCompletion(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &Executor{Store: store, Now: func() time.Time { return now }}
+	result := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://verification/1"}}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err == nil {
+		t.Fatal("verifier satisfied work without a durable attempt_completed event")
+	}
+}
+
+func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &Executor{Store: store, Now: func() time.Time { return now }}
+	continuation := workledger.VerifierResult{VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+		t.Fatal(err)
+	}
+	_, secondAttempt, ok, err := store.Claim(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("first continuation was not claimable: ok=%v err=%v", ok, err)
+	}
+	if err := store.Complete(ctx, secondAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	continuation.EvidenceRefs = []string{"evidence://verification/2"}
+	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
+		t.Fatalf("exhausted continuation remained claimable: ok=%v err=%v", ok, err)
+	}
+	if err := store.WakeWaiting(ctx, item.ID, now); err == nil {
+		t.Fatal("exhausted continuation remained waiting instead of escalating")
 	}
 }

@@ -63,6 +63,27 @@ type TaskDescriptor struct {
 	ContractDigest     string
 }
 
+type WorkTaskSnapshot struct {
+	TaskDescriptor
+	Parameters         json.RawMessage
+	TaskEvidenceDigest string
+}
+
+func (store *Store) WorkTaskSnapshot(ctx context.Context, workItemID string) (WorkTaskSnapshot, error) {
+	var snapshot WorkTaskSnapshot
+	var definitionJSON string
+	err := store.db.QueryRowContext(ctx, `SELECT s.task_kind,s.task_version,s.completion_contract,s.verifier_id,s.task_contract_digest,s.definition_json,w.task_evidence_digest FROM work_items w JOIN route_snapshots s ON s.id=w.route_snapshot_id WHERE w.id=?`, workItemID).Scan(&snapshot.Kind, &snapshot.Version, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.ContractDigest, &definitionJSON, &snapshot.TaskEvidenceDigest)
+	if err != nil {
+		return WorkTaskSnapshot{}, err
+	}
+	definition, err := DecodeRouteDefinition([]byte(definitionJSON))
+	if err != nil || definition.Task == nil {
+		return WorkTaskSnapshot{}, errors.New("work item has no registered task snapshot")
+	}
+	snapshot.Parameters = append(json.RawMessage(nil), definition.Task.Parameters...)
+	return snapshot, nil
+}
+
 func (descriptor TaskDescriptor) Validate() error {
 	if !identifierPattern.MatchString(descriptor.Kind) ||
 		strings.TrimSpace(descriptor.Version) == "" ||
