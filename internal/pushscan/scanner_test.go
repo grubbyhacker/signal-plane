@@ -15,14 +15,16 @@ import (
 )
 
 type fakeBroker struct {
-	material      Material
-	materialErr   error
-	respondErr    error
-	materialCalls int
-	respondCalls  int
-	requests      []ResponseRequest
-	keys          []string
-	now           time.Time
+	material         Material
+	materialErr      error
+	respondErr       error
+	respondAlwaysErr error
+	materialCalls    int
+	respondCalls     int
+	respondSuccesses int
+	requests         []ResponseRequest
+	keys             []string
+	now              time.Time
 }
 
 func (broker *fakeBroker) Material(_ context.Context, _ MaterialRequest) (Material, error) {
@@ -34,11 +36,15 @@ func (broker *fakeBroker) Respond(_ context.Context, key string, request Respons
 	broker.respondCalls++
 	broker.keys = append(broker.keys, key)
 	broker.requests = append(broker.requests, request)
+	if broker.respondAlwaysErr != nil {
+		return ResponseResult{}, broker.respondAlwaysErr
+	}
 	if broker.respondErr != nil {
 		err := broker.respondErr
 		broker.respondErr = nil
 		return ResponseResult{}, err
 	}
+	broker.respondSuccesses++
 	actions := []ActionResult{{Action: "halt_issuance", State: "halted", CompletedAt: broker.now}}
 	if request.Binding != nil {
 		actions = append(actions, ActionResult{Action: "fence_worker_session", State: "fence_requested", CompletedAt: broker.now.Add(time.Second)})
@@ -46,9 +52,15 @@ func (broker *fakeBroker) Respond(_ context.Context, key string, request Respons
 	return ResponseResult{Version: WireVersion, FindingID: request.FindingID, IdempotentReplay: broker.respondCalls > 1, Actions: actions}, nil
 }
 
-type captureSink struct{ events []SecurityEvent }
+type captureSink struct {
+	events []SecurityEvent
+	err    error
+}
 
 func (sink *captureSink) Publish(_ context.Context, event SecurityEvent) error {
+	if sink.err != nil {
+		return sink.err
+	}
 	sink.events = append(sink.events, event)
 	return nil
 }
@@ -90,23 +102,97 @@ func TestPushScannerExactFingerprintIsDurableSanitizedAndIdempotent(t *testing.T
 	}
 }
 
-func TestPushScannerPersistsPendingBeforeResponseAndReconcilesReplay(t *testing.T) {
+func TestPushScannerReconcilesAlertAndResponseIndependentlyAcrossRestartAndDeadline(t *testing.T) {
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	token := "AbCDef0123456789SecretTokenValue/plus+"
-	scanner, store, broker, sink := testScanner(t, now, token)
-	broker.respondErr = errors.New("connection lost after request")
+	databasePath := filepath.Join(t.TempDir(), "scanner.db")
+	store, err := OpenStore(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	identity := testIdentity("delivery-crash-seam", now)
-	if _, err := scanner.Process(context.Background(), identity); err == nil {
+	broker := &fakeBroker{material: testMaterial(identity.DeliveryID, token), now: now.Add(10 * time.Second), respondAlwaysErr: errors.New("broker unavailable")}
+	sink := &captureSink{}
+	scanner := configuredTestScanner(store, broker, sink, now)
+	registerTestFingerprint(t, store, scanner.FingerprintKey, token, now.Add(-time.Minute), now.Add(time.Hour), "active")
+	result, err := scanner.Process(context.Background(), identity)
+	if err == nil || result.Status != "response_pending" {
 		t.Fatal("expected response seam failure")
 	}
 	pending, ok, err := store.Result(context.Background(), identity.DeliveryID)
 	pendingEvents, pendingEventErr := store.PendingEvents(context.Background())
-	if err != nil || pendingEventErr != nil || !ok || pending.Status != "response_pending" || pending.AlertState != "alert_requested" || len(pendingEvents) != 1 || len(sink.events) != 0 {
+	if err != nil || pendingEventErr != nil || !ok || pending.Status != "response_pending" || pending.AlertState != "alert_requested" || len(pendingEvents) != 0 || len(sink.events) != 1 {
 		t.Fatalf("pending=%#v ok=%v err=%v pending_events=%d pending_event_err=%v published=%d", pending, ok, err, len(pendingEvents), pendingEventErr, len(sink.events))
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restartedStore, err := OpenStore(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restartedStore.Close() })
+	afterDeadline := now.Add(6 * time.Minute)
+	restarted := configuredTestScanner(restartedStore, broker, sink, afterDeadline)
+	maintenanceNow := afterDeadline
+	maintenance := &Maintenance{Scanner: restarted, ReconcileInterval: 5 * time.Second, FingerprintPruneInterval: time.Hour, Clock: func() time.Time { return maintenanceNow }}
+	if err := maintenance.Startup(context.Background()); err == nil {
+		t.Fatal("expected broker outage during restart reconciliation")
+	}
+	pending, ok, err = restartedStore.Result(context.Background(), identity.DeliveryID)
+	if err != nil || !ok || pending.Status != "response_pending" || pending.SLOState != "breached" || !pending.SLOBreached || len(sink.events) != 1 {
+		t.Fatalf("overdue pending=%#v ok=%v err=%v events=%d", pending, ok, err, len(sink.events))
+	}
+	broker.respondAlwaysErr = nil
+	broker.now = afterDeadline.Add(10 * time.Second)
+	maintenanceNow = maintenanceNow.Add(5 * time.Second)
+	if err := maintenance.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, ok, err = restartedStore.Result(context.Background(), identity.DeliveryID)
+	var responseAttempts int
+	attemptErr := restartedStore.db.QueryRow(`SELECT response_attempt_count FROM push_scan_results WHERE delivery_id=?`, identity.DeliveryID).Scan(&responseAttempts)
+	if err != nil || attemptErr != nil || !ok || result.Status != "finding_high" || result.SLOState != "breached" || !result.SLOBreached || broker.materialCalls != 1 || broker.respondCalls != 3 || broker.respondSuccesses != 1 || responseAttempts != 3 || broker.keys[0] != broker.keys[1] || broker.keys[1] != broker.keys[2] || len(sink.events) != 1 {
+		t.Fatalf("result=%#v ok=%v err=%v material=%d respond=%d successes=%d keys=%v events=%d", result, ok, err, broker.materialCalls, broker.respondCalls, broker.respondSuccesses, broker.keys, len(sink.events))
+	}
+}
+
+func TestPushScannerStartupReconciliationFlushesOutboxWithoutRepeatingResponse(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	token := "AbCDef0123456789SecretTokenValue/plus+"
+	databasePath := filepath.Join(t.TempDir(), "scanner.db")
+	store, err := OpenStore(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testIdentity("delivery-outbox-restart", now)
+	broker := &fakeBroker{material: testMaterial(identity.DeliveryID, token), now: now.Add(10 * time.Second)}
+	sink := &captureSink{err: errors.New("event bus unavailable")}
+	scanner := configuredTestScanner(store, broker, sink, now)
+	registerTestFingerprint(t, store, scanner.FingerprintKey, token, now.Add(-time.Minute), now.Add(time.Hour), "active")
 	result, err := scanner.Process(context.Background(), identity)
-	if err != nil || result.Status != "finding_high" || broker.materialCalls != 1 || broker.respondCalls != 2 || broker.keys[0] != broker.keys[1] || len(sink.events) != 1 {
-		t.Fatalf("result=%#v err=%v material=%d respond=%d keys=%v events=%d", result, err, broker.materialCalls, broker.respondCalls, broker.keys, len(sink.events))
+	if err == nil || result.Status != "finding_high" || broker.respondSuccesses != 1 {
+		t.Fatalf("result=%#v err=%v response_successes=%d", result, err, broker.respondSuccesses)
+	}
+	if pending, err := store.PendingEvents(context.Background()); err != nil || len(pending) != 1 {
+		t.Fatalf("pending events=%d err=%v", len(pending), err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restartedStore, err := OpenStore(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restartedStore.Close()
+	recoveredSink := &captureSink{}
+	restarted := configuredTestScanner(restartedStore, broker, recoveredSink, now.Add(time.Minute))
+	maintenance := &Maintenance{Scanner: restarted, ReconcileInterval: 5 * time.Second, FingerprintPruneInterval: time.Hour, Clock: func() time.Time { return now.Add(time.Minute) }}
+	if err := maintenance.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := restartedStore.PendingEvents(context.Background()); err != nil || len(pending) != 0 || len(recoveredSink.events) != 1 || broker.respondSuccesses != 1 || broker.respondCalls != 1 {
+		t.Fatalf("pending=%d err=%v events=%d response_calls=%d successes=%d", len(pending), err, len(recoveredSink.events), broker.respondCalls, broker.respondSuccesses)
 	}
 }
 
@@ -272,8 +358,13 @@ func testScannerWithoutRegistration(t *testing.T, now time.Time, token string) (
 	id := testIdentity("delivery-exact", now)
 	broker := &fakeBroker{material: testMaterial(id.DeliveryID, token), now: now.Add(10 * time.Second)}
 	sink := &captureSink{}
-	scanner := &Scanner{Store: store, Broker: broker, EventSink: sink, FingerprintKey: []byte("0123456789abcdef0123456789abcdef"), Bounds: Bounds{MaxCommits: 100, MaxPaths: 300, MaxBlobBytes: 1 << 20, MaxTotalBytes: 16 << 20, MaxCandidates: 4096, MaxDecodeDepth: 2}, Repositories: []string{id.Repository}, Refs: []string{id.Ref}, Profile: "general-writer-v1", ProfileGeneration: 1, CanaryAttribution: Attribution{Profile: "general-writer-v1", ProfileGeneration: 1, LogicalSessionID: "canary-logical", SessionLineageID: "canary-session", WorkerID: "canary-worker", WorkerStorageLineage: "canary-storage", WorkerFenceEpoch: 1}, Clock: func() time.Time { return now }}
+	scanner := configuredTestScanner(store, broker, sink, now)
 	return scanner, store, broker, sink
+}
+
+func configuredTestScanner(store *Store, broker *fakeBroker, sink *captureSink, now time.Time) *Scanner {
+	id := testIdentity("delivery-exact", now)
+	return &Scanner{Store: store, Broker: broker, EventSink: sink, FingerprintKey: []byte("0123456789abcdef0123456789abcdef"), Bounds: Bounds{MaxCommits: 100, MaxPaths: 300, MaxBlobBytes: 1 << 20, MaxTotalBytes: 16 << 20, MaxCandidates: 4096, MaxDecodeDepth: 2}, Repositories: []string{id.Repository}, Refs: []string{id.Ref}, Profile: "general-writer-v1", ProfileGeneration: 1, CanaryAttribution: Attribution{Profile: "general-writer-v1", ProfileGeneration: 1, LogicalSessionID: "canary-logical", SessionLineageID: "canary-session", WorkerID: "canary-worker", WorkerStorageLineage: "canary-storage", WorkerFenceEpoch: 1}, Clock: func() time.Time { return now }}
 }
 
 func registerTestFingerprint(t *testing.T, store *Store, key []byte, token string, issued, expires time.Time, state string) {

@@ -30,23 +30,25 @@ type Config struct {
 }
 
 type PushScannerConfig struct {
-	Enabled           bool              `yaml:"enabled"`
-	Addr              string            `yaml:"addr"`
-	Subject           string            `yaml:"subject"`
-	Durable           string            `yaml:"durable"`
-	DatabasePath      string            `yaml:"database_path"`
-	BrokerURL         string            `yaml:"broker_url"`
-	BrokerTokenEnv    string            `yaml:"broker_token_env"`
-	FingerprintKeyEnv string            `yaml:"fingerprint_key_env"`
-	HolderTokenEnv    string            `yaml:"holder_token_env"`
-	EventSubject      string            `yaml:"event_subject"`
-	Repositories      []string          `yaml:"repositories"`
-	Refs              []string          `yaml:"refs"`
-	Profile           string            `yaml:"profile"`
-	ProfileGeneration int64             `yaml:"profile_generation"`
-	CanaryAttribution CanaryAttribution `yaml:"canary_attribution"`
-	ForensicRetention string            `yaml:"forensic_retention"`
-	Bounds            PushScannerBounds `yaml:"bounds"`
+	Enabled                  bool              `yaml:"enabled"`
+	Addr                     string            `yaml:"addr"`
+	Subject                  string            `yaml:"subject"`
+	Durable                  string            `yaml:"durable"`
+	DatabasePath             string            `yaml:"database_path"`
+	BrokerURL                string            `yaml:"broker_url"`
+	BrokerTokenEnv           string            `yaml:"broker_token_env"`
+	FingerprintKeyEnv        string            `yaml:"fingerprint_key_env"`
+	HolderTokenEnv           string            `yaml:"holder_token_env"`
+	EventSubject             string            `yaml:"event_subject"`
+	Repositories             []string          `yaml:"repositories"`
+	Refs                     []string          `yaml:"refs"`
+	Profile                  string            `yaml:"profile"`
+	ProfileGeneration        int64             `yaml:"profile_generation"`
+	CanaryAttribution        CanaryAttribution `yaml:"canary_attribution"`
+	ForensicRetention        string            `yaml:"forensic_retention"`
+	ReconcileInterval        string            `yaml:"reconcile_interval"`
+	FingerprintPruneInterval string            `yaml:"fingerprint_prune_interval"`
+	Bounds                   PushScannerBounds `yaml:"bounds"`
 }
 
 type CanaryAttribution struct {
@@ -219,6 +221,12 @@ func applyEnv(cfg *Config) {
 	if cfg.PushScanner.ForensicRetention == "" {
 		cfg.PushScanner.ForensicRetention = "168h"
 	}
+	if cfg.PushScanner.ReconcileInterval == "" {
+		cfg.PushScanner.ReconcileInterval = "5s"
+	}
+	if cfg.PushScanner.FingerprintPruneInterval == "" {
+		cfg.PushScanner.FingerprintPruneInterval = "1h"
+	}
 	if cfg.PushScanner.Bounds.MaxCommits == 0 {
 		cfg.PushScanner.Bounds.MaxCommits = 100
 	}
@@ -317,6 +325,12 @@ func (cfg Config) Validate() error {
 		}
 		if retention, err := time.ParseDuration(ps.ForensicRetention); err != nil || retention <= 0 {
 			return errors.New("push_scanner forensic_retention is invalid")
+		}
+		if interval, err := time.ParseDuration(ps.ReconcileInterval); err != nil || interval <= 0 || interval > 30*time.Second {
+			return errors.New("push_scanner reconcile_interval must be positive and at most 30s")
+		}
+		if interval, err := time.ParseDuration(ps.FingerprintPruneInterval); err != nil || interval <= 0 || interval > 24*time.Hour {
+			return errors.New("push_scanner fingerprint_prune_interval must be positive and at most 24h")
 		}
 		b := ps.Bounds
 		if b.MaxCommits <= 0 || b.MaxCommits > 100 || b.MaxPaths <= 0 || b.MaxPaths > 300 || b.MaxBlobBytes <= 0 || b.MaxBlobBytes > 1<<20 || b.MaxTotalBytes <= 0 || b.MaxTotalBytes > 16<<20 || b.MaxCandidates <= 0 || b.MaxCandidates > 4096 || b.MaxDecodeDepth < 1 || b.MaxDecodeDepth > 4 {

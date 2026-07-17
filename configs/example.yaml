@@ -60,6 +60,8 @@ push_scanner:
     worker_storage_lineage_id: "22222222222222222222222222222222"
     worker_fence_epoch: 1
   forensic_retention: 168h
+  reconcile_interval: 5s
+  fingerprint_prune_interval: 1h
   bounds:
     max_commits: 100
     max_paths: 300

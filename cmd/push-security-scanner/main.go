@@ -72,7 +72,16 @@ func main() {
 		Bounds:            scanBounds,
 	}
 	ctx := context.Background()
+	reconcileInterval, _ := time.ParseDuration(cfg.PushScanner.ReconcileInterval)
+	fingerprintPruneInterval, _ := time.ParseDuration(cfg.PushScanner.FingerprintPruneInterval)
+	maintenance := &pushscan.Maintenance{Scanner: scanner, ReconcileInterval: reconcileInterval, FingerprintPruneInterval: fingerprintPruneInterval}
+	if err := maintenance.Startup(ctx); err != nil {
+		logger.Error("push scanner startup maintenance incomplete; durable retry remains active", "error", err)
+	}
 	for {
+		if err := maintenance.RunDue(ctx); err != nil {
+			logger.Error("push scanner periodic maintenance incomplete; durable retry remains active", "error", err)
+		}
 		message, err := consumer.Fetch(2 * time.Second)
 		if errors.Is(err, nats.ErrTimeout) {
 			continue
@@ -97,10 +106,14 @@ func main() {
 			_ = message.Term()
 			continue
 		}
-		if _, err := scanner.Process(ctx, identity); err != nil {
-			logger.Error("push scan failed", "delivery_id", identity.DeliveryID, "error", err)
-			_ = message.NakWithDelay(scanRetryDelay(err))
-			continue
+		result, processErr := scanner.Process(ctx, identity)
+		if processErr != nil {
+			if result.DeliveryID == "" {
+				logger.Error("push scan failed before durable result", "delivery_id", identity.DeliveryID, "error", processErr)
+				_ = message.NakWithDelay(scanRetryDelay(processErr))
+				continue
+			}
+			logger.Error("push scan durable side effect pending reconciliation", "delivery_id", identity.DeliveryID, "error", processErr)
 		}
 		if err := message.AckSync(); err != nil {
 			logger.Error("push delivery ack failed", "delivery_id", identity.DeliveryID, "error", err)

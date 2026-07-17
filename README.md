@@ -68,7 +68,10 @@ isolated in `github-task-dispatcher`.
   catalog-bounded GitHub pushes. It obtains bounded read-only material from the
   broker, matches HMAC-SHA-256 fingerprints and a configured synthetic canary,
   records sanitized findings through a transactional outbox, and requests
-  idempotent issuance halt and worker fencing for live high findings.
+  idempotent issuance halt and worker fencing for live high findings. Its
+  startup/periodic maintenance loop flushes alerts and retries pending broker
+  responses independently, marks missed SLO deadlines without new webhook
+  traffic, and prunes retained fingerprints on a separate configured cadence.
 
 ## Service endpoints
 

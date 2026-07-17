@@ -61,13 +61,10 @@ func (s *Scanner) Process(ctx context.Context, identity PushIdentity) (Result, e
 		return Result{}, err
 	}
 	if existing, ok, err := s.Store.Result(ctx, identity.DeliveryID); err != nil || ok {
-		if err == nil && existing.Status == "response_pending" {
-			existing, err = s.completeResponse(ctx, identity, existing)
+		if err != nil {
+			return existing, err
 		}
-		if err == nil {
-			err = s.flushEvents(ctx)
-		}
-		return existing, err
+		return s.runSideEffects(ctx, identity, existing)
 	}
 	result := Result{DeliveryID: identity.DeliveryID, ScanStartedAt: now, ReceiptAt: receiptAt, Profile: s.Profile, ProfileGeneration: s.ProfileGeneration, SLOState: "not_applicable"}
 	result.SLODeadline = receiptAt.Add(5 * time.Minute)
@@ -78,9 +75,6 @@ func (s *Scanner) Process(ctx context.Context, identity PushIdentity) (Result, e
 			return Result{}, err
 		}
 		return result, nil
-	}
-	if err := s.Store.PruneFingerprints(ctx, now); err != nil {
-		return Result{}, err
 	}
 	request := MaterialRequest{Version: WireVersion, DeliveryID: identity.DeliveryID, Repository: identity.Repository, Ref: identity.Ref, Before: identity.Before, After: identity.After}
 	material, materialErr := s.Broker.Material(ctx, request)
@@ -132,28 +126,79 @@ func (s *Scanner) Process(ctx context.Context, identity PushIdentity) (Result, e
 	if err := s.Store.RecordResult(ctx, result, event); err != nil {
 		return Result{}, err
 	}
+	return s.runSideEffects(ctx, identity, result)
+}
+
+func (s *Scanner) runSideEffects(ctx context.Context, identity PushIdentity, result Result) (Result, error) {
+	var sideEffectErrors []error
+	if err := s.flushEvents(ctx); err != nil {
+		sideEffectErrors = append(sideEffectErrors, fmt.Errorf("flush security event outbox: %w", err))
+	}
 	if result.Status == "response_pending" {
-		result, err = s.completeResponse(ctx, identity, result)
+		completed, err := s.completeResponse(ctx, identity, result)
 		if err != nil {
-			return Result{}, err
+			sideEffectErrors = append(sideEffectErrors, fmt.Errorf("complete pending broker response: %w", err))
+		} else {
+			result = completed
 		}
 	}
-	if err := s.flushEvents(ctx); err != nil {
-		return result, err
+	return result, errors.Join(sideEffectErrors...)
+}
+
+// Reconcile advances durable side effects without requiring another webhook or
+// JetStream delivery. Alert publication and broker response are independent;
+// one failure never prevents an attempt of the other.
+func (s *Scanner) Reconcile(ctx context.Context) error {
+	if s.Store == nil || s.Broker == nil {
+		return errors.New("push scanner reconciliation dependencies are incomplete")
 	}
-	return result, nil
+	var reconciliationErrors []error
+	if err := s.flushEvents(ctx); err != nil {
+		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("flush security event outbox: %w", err))
+	}
+	if err := s.Store.MarkOverdueResponses(ctx, s.now()); err != nil {
+		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("mark overdue responses: %w", err))
+	}
+	deliveryIDs, err := s.Store.PendingResponseDeliveryIDs(ctx)
+	if err != nil {
+		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("list pending responses: %w", err))
+		return errors.Join(reconciliationErrors...)
+	}
+	for _, deliveryID := range deliveryIDs {
+		identity, identityErr := s.Store.PushIdentity(ctx, deliveryID)
+		result, ok, resultErr := s.Store.Result(ctx, deliveryID)
+		if identityErr != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("load pending response identity %s: %w", deliveryID, identityErr))
+			continue
+		}
+		if resultErr != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("load pending response result %s: %w", deliveryID, resultErr))
+			continue
+		}
+		if !ok {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("load pending response result %s: result missing", deliveryID))
+			continue
+		}
+		if _, err := s.completeResponse(ctx, identity, result); err != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("complete pending response %s: %w", deliveryID, err))
+		}
+	}
+	return errors.Join(reconciliationErrors...)
 }
 
 func (s *Scanner) completeResponse(ctx context.Context, identity PushIdentity, result Result) (Result, error) {
+	if err := s.Store.RecordResponseAttempt(ctx, result.DeliveryID, s.now()); err != nil {
+		return result, err
+	}
 	attribution := Attribution{FingerprintID: result.FingerprintID, Profile: result.Profile, ProfileGeneration: result.ProfileGeneration, LogicalSessionID: result.LogicalSessionID, SessionLineageID: result.SessionLineageID, WorkerID: result.WorkerID, WorkerStorageLineage: result.WorkerStorageLineage, WorkerFenceEpoch: result.WorkerFenceEpoch}
 	finding := Finding{ID: result.FindingID, Severity: result.Severity, ReasonCode: result.ReasonCode, Attribution: attribution}
 	response, err := s.Broker.Respond(ctx, "push-tripwire:"+finding.ID, responseRequest(identity, finding))
 	if err != nil {
-		return Result{}, err
+		return result, err
 	}
 	halted, fenceRequested, fenced, fenceState, err := validateResponse(response, finding)
 	if err != nil {
-		return Result{}, err
+		return result, err
 	}
 	result.HaltedAt, result.FenceRequestedAt, result.FencedAt, result.FenceState = halted, fenceRequested, fenced, fenceState
 	result.TerminalAt = maxTime(result.TerminalAt, halted, fenceRequested, fenced)
@@ -165,7 +210,7 @@ func (s *Scanner) completeResponse(ctx context.Context, identity PushIdentity, r
 	}
 	result.Status = "finding_" + result.Severity
 	if err := s.Store.CompleteResponse(ctx, result); err != nil {
-		return Result{}, err
+		return result, err
 	}
 	return result, nil
 }

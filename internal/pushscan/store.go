@@ -26,7 +26,7 @@ func OpenStore(path string) (*Store, error) {
 	for _, statement := range []string{
 		`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS push_scan_receipts (delivery_id TEXT PRIMARY KEY, stream_sequence INTEGER NOT NULL, repository TEXT NOT NULL, ref TEXT NOT NULL, before_sha TEXT NOT NULL, after_sha TEXT NOT NULL, head_timestamp INTEGER, source_timestamp INTEGER, received_at INTEGER NOT NULL, receipt_at INTEGER NOT NULL, consumer_observed_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS push_scan_results (delivery_id TEXT PRIMARY KEY REFERENCES push_scan_receipts(delivery_id), finding_id TEXT NOT NULL, status TEXT NOT NULL, severity TEXT NOT NULL, reason_code TEXT NOT NULL, fingerprint_id TEXT NOT NULL, profile TEXT NOT NULL, logical_session_id TEXT NOT NULL, session_lineage_id TEXT NOT NULL, worker_id TEXT NOT NULL, worker_storage_lineage_id TEXT NOT NULL, worker_fence_epoch INTEGER NOT NULL, profile_generation INTEGER NOT NULL, scan_started_at INTEGER NOT NULL, material_completed_at INTEGER NOT NULL, finding_at INTEGER, response_requested_at INTEGER, halted_at INTEGER, fence_requested_at INTEGER, fenced_at INTEGER, fence_state TEXT NOT NULL, alert_state TEXT NOT NULL, alert_requested_at INTEGER, terminal_at INTEGER NOT NULL, slo_deadline_at INTEGER NOT NULL, slo_breached INTEGER NOT NULL, slo_state TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS push_scan_results (delivery_id TEXT PRIMARY KEY REFERENCES push_scan_receipts(delivery_id), finding_id TEXT NOT NULL, status TEXT NOT NULL, severity TEXT NOT NULL, reason_code TEXT NOT NULL, fingerprint_id TEXT NOT NULL, profile TEXT NOT NULL, logical_session_id TEXT NOT NULL, session_lineage_id TEXT NOT NULL, worker_id TEXT NOT NULL, worker_storage_lineage_id TEXT NOT NULL, worker_fence_epoch INTEGER NOT NULL, profile_generation INTEGER NOT NULL, scan_started_at INTEGER NOT NULL, material_completed_at INTEGER NOT NULL, finding_at INTEGER, response_requested_at INTEGER, response_last_attempt_at INTEGER, response_attempt_count INTEGER NOT NULL DEFAULT 0, halted_at INTEGER, fence_requested_at INTEGER, fenced_at INTEGER, fence_state TEXT NOT NULL, alert_state TEXT NOT NULL, alert_requested_at INTEGER, terminal_at INTEGER NOT NULL, slo_deadline_at INTEGER NOT NULL, slo_breached INTEGER NOT NULL, slo_state TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS push_scan_token_fingerprints (fingerprint_id TEXT PRIMARY KEY, fingerprint BLOB NOT NULL UNIQUE, profile TEXT NOT NULL, logical_session_id TEXT NOT NULL, session_lineage_id TEXT NOT NULL, worker_id TEXT NOT NULL, worker_storage_lineage_id TEXT NOT NULL, worker_fence_epoch INTEGER NOT NULL, profile_generation INTEGER NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, retained_until INTEGER NOT NULL, state TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS push_scan_security_events (event_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL REFERENCES push_scan_receipts(delivery_id), payload_json TEXT NOT NULL, published_at INTEGER)`,
 	} {
@@ -215,6 +215,65 @@ func (s *Store) CompleteResponse(ctx context.Context, result Result) error {
 		return errors.New("pending response state was not advanced")
 	}
 	return nil
+}
+
+func (s *Store) RecordResponseAttempt(ctx context.Context, deliveryID string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE push_scan_results SET response_last_attempt_at=?,response_attempt_count=response_attempt_count+1 WHERE delivery_id=? AND status='response_pending'`, now.UnixMilli(), deliveryID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errors.New("pending response attempt state is unavailable")
+	}
+	return nil
+}
+
+func (s *Store) MarkOverdueResponses(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE push_scan_results SET slo_breached=1,slo_state='breached',terminal_at=MAX(terminal_at,?) WHERE status='response_pending' AND slo_state!='breached' AND slo_deadline_at<?`, now.UnixMilli(), now.UnixMilli())
+	return err
+}
+
+func (s *Store) PendingResponseDeliveryIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT delivery_id FROM push_scan_results WHERE status='response_pending' ORDER BY COALESCE(response_last_attempt_at,response_requested_at),delivery_id LIMIT 64`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var deliveryIDs []string
+	for rows.Next() {
+		var deliveryID string
+		if err := rows.Scan(&deliveryID); err != nil {
+			return nil, err
+		}
+		deliveryIDs = append(deliveryIDs, deliveryID)
+	}
+	return deliveryIDs, rows.Err()
+}
+
+func (s *Store) PushIdentity(ctx context.Context, deliveryID string) (PushIdentity, error) {
+	var identity PushIdentity
+	var streamSequence int64
+	var head, source sql.NullInt64
+	var received int64
+	err := s.db.QueryRowContext(ctx, `SELECT delivery_id,stream_sequence,repository,ref,before_sha,after_sha,head_timestamp,source_timestamp,received_at FROM push_scan_receipts WHERE delivery_id=?`, deliveryID).Scan(&identity.DeliveryID, &streamSequence, &identity.Repository, &identity.Ref, &identity.Before, &identity.After, &head, &source, &received)
+	if err != nil {
+		return PushIdentity{}, err
+	}
+	identity.StreamSequence = uint64(streamSequence)
+	identity.ReceivedAt = time.UnixMilli(received).UTC()
+	if head.Valid {
+		value := time.UnixMilli(head.Int64).UTC()
+		identity.HeadTime = &value
+	}
+	if source.Valid {
+		value := time.UnixMilli(source.Int64).UTC()
+		identity.SourceTime = &value
+	}
+	return identity, nil
 }
 
 func (s *Store) PendingEvents(ctx context.Context) ([]SecurityEvent, error) {
