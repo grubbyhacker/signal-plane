@@ -24,6 +24,11 @@ type Meta struct {
 	ObjectKind         string         `json:"object_kind,omitempty"`
 	ObjectID           string         `json:"object_id,omitempty"`
 	SourceRevision     string         `json:"source_revision,omitempty"`
+	SourceRef          string         `json:"source_ref,omitempty"`
+	SourceBefore       string         `json:"source_before_revision,omitempty"`
+	SourceAfter        string         `json:"source_after_revision,omitempty"`
+	SourceHeadTime     *time.Time     `json:"source_head_timestamp,omitempty"`
+	SourceTimestamp    *time.Time     `json:"source_timestamp,omitempty"`
 	ActorClass         string         `json:"actor_class,omitempty"`
 	CorrelationID      string         `json:"correlation_id,omitempty"`
 	CausationID        string         `json:"causation_id,omitempty"`
