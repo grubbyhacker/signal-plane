@@ -39,6 +39,9 @@ routes:
 	if cfg.Routes[0].MaxBodyBytes != DefaultMaxBody {
 		t.Fatalf("max body = %d", cfg.Routes[0].MaxBodyBytes)
 	}
+	if cfg.PushScanner.ReconcileInterval != "5s" || cfg.PushScanner.FingerprintPruneInterval != "1h" {
+		t.Fatalf("push scanner maintenance defaults = reconcile %q prune %q", cfg.PushScanner.ReconcileInterval, cfg.PushScanner.FingerprintPruneInterval)
+	}
 }
 
 func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
@@ -122,6 +125,17 @@ func TestValidateAdmissionTuples(t *testing.T) {
 	if err := base.Validate(); err != nil {
 		t.Fatalf("valid tuples rejected: %v", err)
 	}
+	push := base
+	push.Routes = append([]Route(nil), base.Routes...)
+	push.Routes[0].Admission.Tuples = []AdmissionTuple{{Repository: "owner/repo", Event: "push"}}
+	push.Routes[0].GitHub.PushRefs = []string{"refs/heads/agent/proof"}
+	if err := push.Validate(); err != nil {
+		t.Fatalf("valid actionless push tuple rejected: %v", err)
+	}
+	push.Routes[0].Admission.Tuples[0].Actions = []string{"created"}
+	if err := push.Validate(); err == nil {
+		t.Fatal("push tuple with action was accepted")
+	}
 	tests := []struct {
 		name   string
 		mutate func(*Config)
@@ -146,5 +160,28 @@ func TestValidateAdmissionTuples(t *testing.T) {
 				t.Fatal("expected tuple validation error")
 			}
 		})
+	}
+}
+
+func TestValidateEnabledPushScannerRequiresReviewedPrivateContract(t *testing.T) {
+	cfg := Config{Gateway: GatewayConfig{Addr: ":8080"}, NATS: NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}}, Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}}}
+	cfg.PushScanner = PushScannerConfig{Enabled: true, Subject: "signals.github.webhook", Durable: "push-security-scanner", DatabasePath: "scanner.db", BrokerURL: "http://broker:8080/v1/security/push-tripwire", BrokerTokenEnv: "BROKER_TOKEN", FingerprintKeyEnv: "FINGERPRINT_KEY", HolderTokenEnv: "HOLDER_TOKEN", EventSubject: "signals.security.push-tripwire", Repositories: []string{"owner/repo"}, Refs: []string{"refs/heads/agent/proof"}, Profile: "general-writer-v1", ProfileGeneration: 1, ForensicRetention: "168h", ReconcileInterval: "5s", FingerprintPruneInterval: "1h", CanaryAttribution: CanaryAttribution{LogicalSessionID: "logical", SessionLineageID: "session", WorkerID: "worker", WorkerStorageLineage: "storage", WorkerFenceEpoch: 1}, Bounds: PushScannerBounds{MaxCommits: 100, MaxPaths: 300, MaxBlobBytes: 1 << 20, MaxTotalBytes: 16 << 20, MaxCandidates: 4096, MaxDecodeDepth: 2}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid scanner config rejected: %v", err)
+	}
+	missingHolder := cfg
+	missingHolder.PushScanner.HolderTokenEnv = ""
+	if err := missingHolder.Validate(); err == nil {
+		t.Fatal("scanner without holder token env was accepted")
+	}
+	tooManyPaths := cfg
+	tooManyPaths.PushScanner.Bounds.MaxPaths = 301
+	if err := tooManyPaths.Validate(); err == nil {
+		t.Fatal("scanner bounds beyond broker contract were accepted")
+	}
+	tooSlow := cfg
+	tooSlow.PushScanner.ReconcileInterval = "31s"
+	if err := tooSlow.Validate(); err == nil {
+		t.Fatal("scanner reconciliation beyond reviewed SLO cadence was accepted")
 	}
 }

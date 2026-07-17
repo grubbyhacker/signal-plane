@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -191,6 +192,58 @@ func TestGitHubRoutePublishesAllowedEvent(t *testing.T) {
 	}
 	if preserved["action"] != "opened" {
 		t.Fatalf("payload action = %v", preserved["action"])
+	}
+}
+
+func TestSignedPushAdmissionPublishesImmutableIdentityAndDeletionEvidence(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	ref := "refs/heads/agent/hermes-agent-infra/pr10-security-proof"
+	route := config.Route{ID: "github-local", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 4096, PublishSubject: "signals.github.webhook", GitHub: config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", PushRefs: []string{ref}}, Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{{Repository: "grubbyhacker/gh-agent-broker", Event: "push"}}}}
+	before, after := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	tests := []struct {
+		name, after, head string
+	}{
+		{name: "ordinary push", after: after, head: `,"head_commit":{"timestamp":"2026-07-16T18:30:00.123Z"}`},
+		{name: "ref deletion remains admitted evidence", after: strings.Repeat("0", 40)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &capturePublisher{}
+			server := New(slog.Default(), []config.Route{route}, publisher)
+			body := []byte(`{"ref":"` + ref + `","before":"` + before + `","after":"` + tt.after + `","repository":{"full_name":"grubbyhacker/gh-agent-broker","pushed_at":1784226600}` + tt.head + `,"sender":{"type":"Bot"}}`)
+			request := httptest.NewRequest(http.MethodPost, route.Path, bytes.NewReader(body))
+			request.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+			request.Header.Set("X-GitHub-Event", "push")
+			request.Header.Set("X-GitHub-Delivery", "push-"+strings.ReplaceAll(tt.name, " ", "-"))
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusAccepted {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			meta := publisher.signal.Meta
+			if meta.SourceRef != ref || meta.SourceBefore != before || meta.SourceAfter != tt.after || meta.SourceRevision != tt.after || meta.SourceTimestamp == nil || !meta.Authentication.Verified || meta.Authentication.Method != "github_hmac_sha256" {
+				t.Fatalf("push metadata = %#v", meta)
+			}
+			if tt.head != "" && meta.SourceHeadTime == nil {
+				t.Fatal("head timestamp was not normalized")
+			}
+		})
+	}
+}
+
+func TestSignedPushAdmissionRejectsDisallowedRefBeforePublish(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	publisher := &capturePublisher{}
+	route := config.Route{ID: "github-local", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 4096, PublishSubject: "signals.github.webhook", GitHub: config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", PushRefs: []string{"refs/heads/allowed"}}, Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{{Repository: "grubbyhacker/gh-agent-broker", Event: "push"}}}}
+	body := []byte(`{"ref":"refs/heads/disallowed","before":"` + strings.Repeat("a", 40) + `","after":"` + strings.Repeat("b", 40) + `","repository":{"full_name":"grubbyhacker/gh-agent-broker"}}`)
+	request := httptest.NewRequest(http.MethodPost, route.Path, bytes.NewReader(body))
+	request.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+	request.Header.Set("X-GitHub-Event", "push")
+	request.Header.Set("X-GitHub-Delivery", "push-disallowed")
+	recorder := httptest.NewRecorder()
+	New(slog.Default(), []config.Route{route}, publisher).Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || publisher.subject != "" {
+		t.Fatalf("status=%d published=%q body=%s", recorder.Code, publisher.subject, recorder.Body.String())
 	}
 }
 

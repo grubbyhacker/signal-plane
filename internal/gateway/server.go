@@ -115,6 +115,11 @@ func (server *Server) handleRoute(w http.ResponseWriter, r *http.Request, route 
 			ObjectKind:       admission.objectKind,
 			ObjectID:         admission.objectID,
 			SourceRevision:   admission.sourceRevision,
+			SourceRef:        admission.sourceRef,
+			SourceBefore:     admission.sourceBefore,
+			SourceAfter:      admission.sourceAfter,
+			SourceHeadTime:   admission.sourceHeadTime,
+			SourceTimestamp:  admission.sourceTimestamp,
 			ActorClass:       admission.actorClass,
 			Authentication: envelope.Authentication{
 				Method:   admission.authMethod,
@@ -175,18 +180,23 @@ func firstNonSpace(body []byte) byte {
 }
 
 type admissionResult struct {
-	event          string
-	action         string
-	deliveryID     string
-	ignore         bool
-	ignoreReason   string
-	namespace      string
-	objectKind     string
-	objectID       string
-	sourceRevision string
-	actorClass     string
-	authMethod     string
-	authVerified   bool
+	event           string
+	action          string
+	deliveryID      string
+	ignore          bool
+	ignoreReason    string
+	namespace       string
+	objectKind      string
+	objectID        string
+	sourceRevision  string
+	sourceRef       string
+	sourceBefore    string
+	sourceAfter     string
+	sourceHeadTime  *time.Time
+	sourceTimestamp *time.Time
+	actorClass      string
+	authMethod      string
+	authVerified    bool
 }
 
 func (server *Server) admit(r *http.Request, route config.Route, body []byte) (admissionResult, error) {
@@ -238,6 +248,7 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 		Action     string `json:"action"`
 		Repository struct {
 			FullName string `json:"full_name"`
+			PushedAt int64  `json:"pushed_at"`
 		} `json:"repository"`
 		Issue *struct {
 			Number    int64  `json:"number"`
@@ -255,6 +266,12 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			TagName   string `json:"tag_name"`
 			UpdatedAt string `json:"updated_at"`
 		} `json:"release"`
+		Ref        string `json:"ref"`
+		Before     string `json:"before"`
+		After      string `json:"after"`
+		HeadCommit *struct {
+			Timestamp string `json:"timestamp"`
+		} `json:"head_commit"`
 		Sender struct {
 			Type string `json:"type"`
 		} `json:"sender"`
@@ -262,9 +279,17 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_github_payload"}
 	}
+	if event == "push" {
+		if !config.ContainsAllowed(route.GitHub.PushRefs, decoded.Ref) {
+			return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "ref_not_allowed"}
+		}
+		if !validGitHubSHA(decoded.Before) || !validGitHubSHA(decoded.After) || !strings.HasPrefix(decoded.Ref, "refs/heads/") {
+			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_push_identity"}
+		}
+	}
 	if len(route.Admission.Tuples) > 0 {
 		result, err := admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
-		return enrichGitHubAdmission(result, event, decoded.Repository.FullName, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
+		return enrichGitHubAdmission(result, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, decoded.Repository.PushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
 	}
 	if !config.ContainsAllowed(route.Admission.Repositories, decoded.Repository.FullName) {
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
@@ -284,10 +309,12 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			ignoreReason: "action_filtered",
 		}, nil
 	}
-	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, event, decoded.Repository.FullName, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
+	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, decoded.Repository.PushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
 }
 
-func enrichGitHubAdmission(result admissionResult, event, repository string, issue *struct {
+func enrichGitHubAdmission(result admissionResult, route config.Route, event, repository, ref, before, after string, pushedAt int64, headCommit *struct {
+	Timestamp string `json:"timestamp"`
+}, issue *struct {
 	Number    int64  `json:"number"`
 	UpdatedAt string `json:"updated_at"`
 }, pullRequest *struct {
@@ -306,6 +333,19 @@ func enrichGitHubAdmission(result admissionResult, event, repository string, iss
 	result.authMethod = "github_hmac_sha256"
 	result.authVerified = true
 	result.actorClass = strings.ToLower(actorType)
+	if event == "push" {
+		result.sourceRef, result.sourceBefore, result.sourceAfter, result.sourceRevision = ref, before, after, after
+		if pushedAt > 0 {
+			parsed := time.Unix(pushedAt, 0).UTC()
+			result.sourceTimestamp = &parsed
+		}
+		if headCommit != nil && headCommit.Timestamp != "" {
+			if parsed, err := time.Parse(time.RFC3339, headCommit.Timestamp); err == nil {
+				parsed = parsed.UTC()
+				result.sourceHeadTime = &parsed
+			}
+		}
+	}
 	if issue != nil {
 		result.objectKind, result.objectID, result.sourceRevision = "issue", fmt.Sprint(issue.Number), issue.UpdatedAt
 	}
@@ -324,6 +364,18 @@ func enrichGitHubAdmission(result admissionResult, event, repository string, iss
 	return result
 }
 
+func validGitHubSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func admitGitHubTuple(route config.Route, event, deliveryID, action, repository string) (admissionResult, error) {
 	repositoryMatched := false
 	for _, tuple := range route.Admission.Tuples {
@@ -336,6 +388,9 @@ func admitGitHubTuple(route config.Route, event, deliveryID, action, repository 
 		}
 		if event == "ping" && !route.GitHub.PublishPing {
 			return admissionResult{ignore: true, ignoreReason: "ping"}, nil
+		}
+		if event == "push" {
+			return admissionResult{event: event, deliveryID: deliveryID}, nil
 		}
 		if !config.ContainsAllowed(tuple.Actions, action) {
 			return admissionResult{event: event, action: action, deliveryID: deliveryID, ignore: true, ignoreReason: "action_filtered"}, nil

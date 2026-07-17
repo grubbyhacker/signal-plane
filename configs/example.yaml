@@ -35,6 +35,41 @@ work_router:
   github_private_key_path: /run/secrets/github-fleiglabs-release-reader-app.pem
   ykm_local_secret_env: SIGNAL_PLANE_YKM_LOCAL_SECRET
 
+# Dedicated PR10 async push tripwire. It remains inert until deployment-owned
+# broker identity, fingerprint key, catalog, profile generation, and durable
+# state are reviewed together.
+push_scanner:
+  enabled: false
+  addr: ":8084"
+  subject: signals.github.webhook
+  durable: push-security-scanner
+  database_path: push-security-scanner.db
+  broker_url: http://127.0.0.1:8080/v1/security/push-tripwire
+  broker_token_env: PUSH_SECURITY_SCANNER_BROKER_TOKEN
+  fingerprint_key_env: PUSH_SECURITY_SCANNER_FINGERPRINT_KEY
+  holder_token_env: PUSH_SECURITY_SCANNER_HOLDER_TOKEN
+  event_subject: signals.security.push-tripwire
+  repositories: [grubbyhacker/gh-agent-broker]
+  refs: [refs/heads/agent/hermes-agent-infra/pr10-security-proof]
+  profile: general-writer-v1
+  profile_generation: 1
+  canary_attribution:
+    logical_session_id: synthetic-pr10-canary-session
+    session_lineage_id: "11111111111111111111111111111111"
+    worker_id: synthetic-pr10-canary-worker
+    worker_storage_lineage_id: "22222222222222222222222222222222"
+    worker_fence_epoch: 1
+  forensic_retention: 168h
+  reconcile_interval: 5s
+  fingerprint_prune_interval: 1h
+  bounds:
+    max_commits: 100
+    max_paths: 300
+    max_blob_bytes: 1048576
+    max_total_bytes: 16777216
+    max_candidates: 4096
+    max_decode_depth: 2
+
 routes:
   - id: manual-local
     path: /manual

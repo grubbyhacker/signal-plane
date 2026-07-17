@@ -11,6 +11,7 @@ GitHub or manual test sender
   -> NATS JetStream
   -> signal-observer (observation)
   -> github-task-dispatcher (retained, disabled proof implementation)
+  -> push-security-scanner (disabled PR10 tripwire)
 ```
 
 The repository now also contains the generalized durable work-ledger core. It
@@ -63,6 +64,14 @@ isolated in `github-task-dispatcher`.
   `youknowme_upload_v1` executor. It supports only deployment-owned
   `cloudflare_access` or `local_secret` YouKnowMe authentication and loads the
   GitHub App PEM from a mounted file.
+- `push-security-scanner`: disabled-by-default durable consumer for signed,
+  catalog-bounded GitHub pushes. It obtains bounded read-only material from the
+  broker, matches HMAC-SHA-256 fingerprints and a configured synthetic canary,
+  records sanitized findings through a transactional outbox, and requests
+  idempotent issuance halt and worker fencing for live high findings. Its
+  startup/periodic maintenance loop flushes alerts and retries pending broker
+  responses independently, marks missed SLO deadlines without new webhook
+  traffic, and prunes retained fingerprints on a separate configured cadence.
 
 ## Service endpoints
 
@@ -139,13 +148,21 @@ The smoke test starts local NATS JetStream with Docker Compose, starts the
 gateway and a one-shot observer, sends an authenticated manual event, and waits
 for the observer to log the received signal.
 
+The scanner's private `:8084` interface exposes health/readiness plus an
+authenticated digest-only fingerprint registry. The future credential holder
+registers a precomputed digest and bounded attribution; the API and SQLite store
+never accept token values, and the scanner derives forensic retention from its
+own configuration. The disabled process opens only SQLite and does not
+read secrets or connect to NATS or the broker. See
+[PR10 push tripwire](docs/pr10-push-tripwire.md).
+
 Build the service image with:
 
 ```sh
 docker build -t signal-plane:local .
 ```
 
-The image contains all four binaries; the default
+The image contains all five binaries; the default
 entrypoint runs the gateway, and deployment tooling can override the command to
 run the observer or dispatcher.
 
@@ -167,3 +184,4 @@ Pushes to `main` publish the deployment image to
 
 - [Signal plane design](docs/agent-signal-plane-design.md)
 - [Near-term phase plan](docs/near-term-phase-plan.md)
+- [PR10 push tripwire](docs/pr10-push-tripwire.md)

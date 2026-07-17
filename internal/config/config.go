@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,11 +21,51 @@ const (
 )
 
 type Config struct {
-	Gateway    GatewayConfig    `yaml:"gateway"`
-	NATS       NATSConfig       `yaml:"nats"`
-	Dispatcher DispatcherConfig `yaml:"dispatcher"`
-	WorkRouter WorkRouterConfig `yaml:"work_router"`
-	Routes     []Route          `yaml:"routes"`
+	Gateway     GatewayConfig     `yaml:"gateway"`
+	NATS        NATSConfig        `yaml:"nats"`
+	Dispatcher  DispatcherConfig  `yaml:"dispatcher"`
+	WorkRouter  WorkRouterConfig  `yaml:"work_router"`
+	PushScanner PushScannerConfig `yaml:"push_scanner"`
+	Routes      []Route           `yaml:"routes"`
+}
+
+type PushScannerConfig struct {
+	Enabled                  bool              `yaml:"enabled"`
+	Addr                     string            `yaml:"addr"`
+	Subject                  string            `yaml:"subject"`
+	Durable                  string            `yaml:"durable"`
+	DatabasePath             string            `yaml:"database_path"`
+	BrokerURL                string            `yaml:"broker_url"`
+	BrokerTokenEnv           string            `yaml:"broker_token_env"`
+	FingerprintKeyEnv        string            `yaml:"fingerprint_key_env"`
+	HolderTokenEnv           string            `yaml:"holder_token_env"`
+	EventSubject             string            `yaml:"event_subject"`
+	Repositories             []string          `yaml:"repositories"`
+	Refs                     []string          `yaml:"refs"`
+	Profile                  string            `yaml:"profile"`
+	ProfileGeneration        int64             `yaml:"profile_generation"`
+	CanaryAttribution        CanaryAttribution `yaml:"canary_attribution"`
+	ForensicRetention        string            `yaml:"forensic_retention"`
+	ReconcileInterval        string            `yaml:"reconcile_interval"`
+	FingerprintPruneInterval string            `yaml:"fingerprint_prune_interval"`
+	Bounds                   PushScannerBounds `yaml:"bounds"`
+}
+
+type CanaryAttribution struct {
+	LogicalSessionID     string `yaml:"logical_session_id"`
+	SessionLineageID     string `yaml:"session_lineage_id"`
+	WorkerID             string `yaml:"worker_id"`
+	WorkerStorageLineage string `yaml:"worker_storage_lineage_id"`
+	WorkerFenceEpoch     int64  `yaml:"worker_fence_epoch"`
+}
+
+type PushScannerBounds struct {
+	MaxCommits     int   `yaml:"max_commits"`
+	MaxPaths       int   `yaml:"max_paths"`
+	MaxBlobBytes   int64 `yaml:"max_blob_bytes"`
+	MaxTotalBytes  int64 `yaml:"max_total_bytes"`
+	MaxCandidates  int   `yaml:"max_candidates"`
+	MaxDecodeDepth int   `yaml:"max_decode_depth"`
 }
 
 type WorkRouterConfig struct {
@@ -76,8 +117,9 @@ type Route struct {
 }
 
 type GitHubConfig struct {
-	WebhookSecretEnv string `yaml:"webhook_secret_env"`
-	PublishPing      bool   `yaml:"publish_ping"`
+	WebhookSecretEnv string   `yaml:"webhook_secret_env"`
+	PublishPing      bool     `yaml:"publish_ping"`
+	PushRefs         []string `yaml:"push_refs"`
 }
 
 type AdmissionSet struct {
@@ -161,6 +203,48 @@ func applyEnv(cfg *Config) {
 	if cfg.WorkRouter.DatabasePath == "" {
 		cfg.WorkRouter.DatabasePath = "github-task-dispatcher.db"
 	}
+	if cfg.PushScanner.Addr == "" {
+		cfg.PushScanner.Addr = ":8084"
+	}
+	if cfg.PushScanner.Subject == "" {
+		cfg.PushScanner.Subject = "signals.github.webhook"
+	}
+	if cfg.PushScanner.Durable == "" {
+		cfg.PushScanner.Durable = "push-security-scanner"
+	}
+	if cfg.PushScanner.DatabasePath == "" {
+		cfg.PushScanner.DatabasePath = "push-security-scanner.db"
+	}
+	if cfg.PushScanner.EventSubject == "" {
+		cfg.PushScanner.EventSubject = "signals.security.push-tripwire"
+	}
+	if cfg.PushScanner.ForensicRetention == "" {
+		cfg.PushScanner.ForensicRetention = "168h"
+	}
+	if cfg.PushScanner.ReconcileInterval == "" {
+		cfg.PushScanner.ReconcileInterval = "5s"
+	}
+	if cfg.PushScanner.FingerprintPruneInterval == "" {
+		cfg.PushScanner.FingerprintPruneInterval = "1h"
+	}
+	if cfg.PushScanner.Bounds.MaxCommits == 0 {
+		cfg.PushScanner.Bounds.MaxCommits = 100
+	}
+	if cfg.PushScanner.Bounds.MaxPaths == 0 {
+		cfg.PushScanner.Bounds.MaxPaths = 300
+	}
+	if cfg.PushScanner.Bounds.MaxBlobBytes == 0 {
+		cfg.PushScanner.Bounds.MaxBlobBytes = 1 << 20
+	}
+	if cfg.PushScanner.Bounds.MaxTotalBytes == 0 {
+		cfg.PushScanner.Bounds.MaxTotalBytes = 16 << 20
+	}
+	if cfg.PushScanner.Bounds.MaxCandidates == 0 {
+		cfg.PushScanner.Bounds.MaxCandidates = 4096
+	}
+	if cfg.PushScanner.Bounds.MaxDecodeDepth == 0 {
+		cfg.PushScanner.Bounds.MaxDecodeDepth = 2
+	}
 
 	for i := range cfg.Routes {
 		if cfg.Routes[i].MaxBodyBytes == 0 {
@@ -219,6 +303,40 @@ func (cfg Config) Validate() error {
 			return errors.New("enabled work_router has unsupported ykm_auth_mode")
 		}
 	}
+	if cfg.PushScanner.Enabled {
+		ps := cfg.PushScanner
+		canary := ps.CanaryAttribution
+		if ps.Subject == "" || ps.Durable == "" || ps.DatabasePath == "" || ps.BrokerTokenEnv == "" || ps.FingerprintKeyEnv == "" || ps.HolderTokenEnv == "" || !strings.HasPrefix(ps.EventSubject, "signals.security.") || ps.EventSubject == ps.Subject || len(ps.Repositories) == 0 || len(ps.Refs) == 0 || ps.Profile == "" || ps.ProfileGeneration <= 0 || canary.LogicalSessionID == "" || canary.SessionLineageID == "" || canary.WorkerID == "" || canary.WorkerStorageLineage == "" || canary.WorkerFenceEpoch <= 0 {
+			return errors.New("enabled push_scanner requires durable storage, broker and holder credentials, fingerprint key, catalog, and profile generation")
+		}
+		parsed, err := url.Parse(ps.BrokerURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Host == "" || parsed.EscapedPath() != "/v1/security/push-tripwire" {
+			return errors.New("enabled push_scanner broker_url must be the fixed push-tripwire base endpoint")
+		}
+		for _, repository := range ps.Repositories {
+			if strings.TrimSpace(repository) != repository || strings.Count(repository, "/") != 1 {
+				return errors.New("push_scanner repositories must be exact owner/repository names")
+			}
+		}
+		for _, ref := range ps.Refs {
+			if !strings.HasPrefix(ref, "refs/heads/") || strings.TrimSpace(ref) != ref {
+				return errors.New("push_scanner refs must be exact branch refs")
+			}
+		}
+		if retention, err := time.ParseDuration(ps.ForensicRetention); err != nil || retention <= 0 {
+			return errors.New("push_scanner forensic_retention is invalid")
+		}
+		if interval, err := time.ParseDuration(ps.ReconcileInterval); err != nil || interval <= 0 || interval > 30*time.Second {
+			return errors.New("push_scanner reconcile_interval must be positive and at most 30s")
+		}
+		if interval, err := time.ParseDuration(ps.FingerprintPruneInterval); err != nil || interval <= 0 || interval > 24*time.Hour {
+			return errors.New("push_scanner fingerprint_prune_interval must be positive and at most 24h")
+		}
+		b := ps.Bounds
+		if b.MaxCommits <= 0 || b.MaxCommits > 100 || b.MaxPaths <= 0 || b.MaxPaths > 300 || b.MaxBlobBytes <= 0 || b.MaxBlobBytes > 1<<20 || b.MaxTotalBytes <= 0 || b.MaxTotalBytes > 16<<20 || b.MaxCandidates <= 0 || b.MaxCandidates > 4096 || b.MaxDecodeDepth < 1 || b.MaxDecodeDepth > 4 {
+			return errors.New("push_scanner bounds exceed the reviewed broker and scanner limits")
+		}
+	}
 
 	seen := map[string]string{}
 	for _, route := range cfg.Routes {
@@ -249,6 +367,16 @@ func (route Route) Validate() error {
 	if strings.TrimSpace(route.Subject()) == "" {
 		return fmt.Errorf("route %q publish_subject is required", route.ID)
 	}
+	seenPushRefs := map[string]struct{}{}
+	for _, ref := range route.GitHub.PushRefs {
+		if !strings.HasPrefix(ref, "refs/heads/") || strings.TrimSpace(ref) != ref {
+			return fmt.Errorf("route %q github push_refs must be exact branch refs", route.ID)
+		}
+		if _, duplicate := seenPushRefs[ref]; duplicate {
+			return fmt.Errorf("route %q github push_refs contains duplicate %q", route.ID, ref)
+		}
+		seenPushRefs[ref] = struct{}{}
+	}
 	if len(route.Admission.Tuples) > 0 {
 		if len(route.Admission.Repositories) > 0 || len(route.Admission.Events) > 0 || len(route.Admission.Actions) > 0 {
 			return fmt.Errorf("route %q admission cannot combine tuples with repositories/events/actions", route.ID)
@@ -258,7 +386,10 @@ func (route Route) Validate() error {
 			if strings.TrimSpace(tuple.Repository) == "" || strings.TrimSpace(tuple.Event) == "" {
 				return fmt.Errorf("route %q admission tuple %d requires repository and event", route.ID, i)
 			}
-			if len(tuple.Actions) == 0 {
+			if tuple.Event == "push" && len(tuple.Actions) != 0 {
+				return fmt.Errorf("route %q admission tuple %d push must be actionless", route.ID, i)
+			}
+			if tuple.Event != "push" && len(tuple.Actions) == 0 {
 				return fmt.Errorf("route %q admission tuple %d requires at least one action", route.ID, i)
 			}
 			key := tuple.Repository + "\x00" + tuple.Event
