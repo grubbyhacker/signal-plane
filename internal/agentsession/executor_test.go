@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,12 +68,15 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 	if err := registry.Register(&Executor{}); err != nil {
 		t.Fatal(err)
 	}
-	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Admission: workledger.AdmissionPolicy{Sources: []string{"github"}, Namespaces: []string{"example/widgets"}, ObjectKinds: []string{"pull_request"}, Events: []string{"pull_request"}, Actions: []string{"opened"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
+	if err := registry.RegisterTask(RepositoryChangeTask{}); err != nil {
+		t.Fatal(err)
+	}
+	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/pr10-proof/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{NeutralRepositoryID}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
 	snap, err := store.ActivateRoute(context.Background(), route, registry, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "github", Namespace: "example/widgets", ObjectKind: "pull_request", ObjectID: "17", EventKind: "pull_request", Action: "opened", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:payload", EvidenceRef: "nats://signals", ReceivedAt: now}
+	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: NeutralRepositoryID, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:payload", EvidenceRef: "nats://signals", ReceivedAt: now}
 	if _, err := store.Admit(context.Background(), snap.ID, event, now); err != nil {
 		t.Fatal(err)
 	}

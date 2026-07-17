@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 type WorkState string
 
@@ -62,30 +62,42 @@ type RetryPolicy struct {
 	Backoff     []time.Duration `json:"backoff"`
 }
 
+type TaskSelection struct {
+	Kind       string          `json:"kind"`
+	Parameters json.RawMessage `json:"parameters"`
+}
+
 type RouteDefinition struct {
 	ID              string            `json:"id"`
 	SchemaVersion   int               `json:"schema_version"`
 	SemanticVersion string            `json:"semantic_version"`
 	ExecutorID      string            `json:"executor_id"`
+	Task            *TaskSelection    `json:"task,omitempty"`
 	Admission       AdmissionPolicy   `json:"admission"`
 	Concurrency     ConcurrencyPolicy `json:"concurrency"`
 	Retry           RetryPolicy       `json:"retry"`
 }
 
 type RouteSnapshot struct {
-	ID              string
-	RouteID         string
-	SchemaVersion   int
-	SemanticVersion string
-	Digest          string
-	ExecutorID      string
-	ExecutorKind    ExecutorKind
-	ExecutorVersion string
-	Admission       AdmissionPolicy
-	Concurrency     ConcurrencyPolicy
-	Retry           RetryPolicy
-	ActivatedAt     time.Time
-	RetiredAt       *time.Time
+	ID                 string
+	RouteID            string
+	SchemaVersion      int
+	SemanticVersion    string
+	Digest             string
+	ExecutorID         string
+	ExecutorKind       ExecutorKind
+	ExecutorVersion    string
+	TaskKind           string
+	TaskVersion        string
+	CompletionContract string
+	VerifierID         string
+	TaskContractDigest string
+	TaskParameters     json.RawMessage
+	Admission          AdmissionPolicy
+	Concurrency        ConcurrencyPolicy
+	Retry              RetryPolicy
+	ActivatedAt        time.Time
+	RetiredAt          *time.Time
 }
 
 type Event struct {
@@ -249,6 +261,14 @@ func (definition RouteDefinition) Validate() error {
 	}
 	if !identifierPattern.MatchString(definition.ExecutorID) {
 		return errors.New("route executor_id must name a registered executor")
+	}
+	if definition.Task != nil {
+		if !identifierPattern.MatchString(definition.Task.Kind) {
+			return errors.New("route task kind must name registered behavior")
+		}
+		if len(definition.Task.Parameters) == 0 || len(definition.Task.Parameters) > 16*1024 || !json.Valid(definition.Task.Parameters) {
+			return errors.New("route task parameters must be bounded valid JSON")
+		}
 	}
 	if len(definition.Admission.Sources) == 0 || len(definition.Admission.ObjectKinds) == 0 || len(definition.Admission.Events) == 0 {
 		return errors.New("route admission requires sources, object kinds, and events")

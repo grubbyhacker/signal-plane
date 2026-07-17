@@ -15,7 +15,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	}
 	defer tx.Rollback()
 	statements := []string{
-		`CREATE TABLE IF NOT EXISTS route_snapshots (id TEXT PRIMARY KEY, route_id TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK(schema_version>0), semantic_version TEXT NOT NULL, digest TEXT NOT NULL, executor_id TEXT NOT NULL, executor_kind TEXT NOT NULL CHECK(executor_kind IN ('deterministic_tool','policy_evaluator','agent_session')), executor_version TEXT NOT NULL, definition_json TEXT NOT NULL, activated_at INTEGER NOT NULL, retired_at INTEGER CHECK(retired_at IS NULL OR retired_at>=activated_at))`,
+		`CREATE TABLE IF NOT EXISTS route_snapshots (id TEXT PRIMARY KEY, route_id TEXT NOT NULL, schema_version INTEGER NOT NULL CHECK(schema_version>0), semantic_version TEXT NOT NULL, digest TEXT NOT NULL, executor_id TEXT NOT NULL, executor_kind TEXT NOT NULL CHECK(executor_kind IN ('deterministic_tool','policy_evaluator','agent_session')), executor_version TEXT NOT NULL, task_kind TEXT NOT NULL DEFAULT '', task_version TEXT NOT NULL DEFAULT '', completion_contract TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL DEFAULT '', task_contract_digest TEXT NOT NULL DEFAULT '', definition_json TEXT NOT NULL, activated_at INTEGER NOT NULL, retired_at INTEGER CHECK(retired_at IS NULL OR retired_at>=activated_at))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS active_route_snapshot ON route_snapshots(route_id) WHERE retired_at IS NULL`,
 		`CREATE TABLE IF NOT EXISTS work_items (id TEXT PRIMARY KEY, route_snapshot_id TEXT NOT NULL REFERENCES route_snapshots(id), route_id TEXT NOT NULL, semantic_object_key TEXT NOT NULL, source TEXT NOT NULL, namespace TEXT NOT NULL, object_kind TEXT NOT NULL, object_id TEXT NOT NULL, source_revision TEXT NOT NULL, serialization_key TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('observed','admitted','active','waiting','completed','failed','cancelled','superseded','dead_letter')), state_version INTEGER NOT NULL DEFAULT 1 CHECK(state_version>0), superseded_by_id TEXT REFERENCES work_items(id), latest_executor_correlation TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, terminal_at INTEGER, next_attempt_at INTEGER, CHECK(state<>'superseded' OR superseded_by_id IS NOT NULL), CHECK(state NOT IN ('completed','failed','cancelled','superseded','dead_letter') OR terminal_at IS NOT NULL))`,
 		`CREATE INDEX IF NOT EXISTS work_items_due ON work_items(state,next_attempt_at,created_at)`,
@@ -28,7 +28,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS ingress_failures (source TEXT NOT NULL, namespace TEXT NOT NULL, source_delivery_id TEXT NOT NULL, event_digest TEXT NOT NULL, classification TEXT NOT NULL, attempts INTEGER NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(source,namespace,source_delivery_id))`,
 		`CREATE TABLE IF NOT EXISTS session_bindings (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), binding_key TEXT NOT NULL UNIQUE, authority_profile TEXT NOT NULL, worker_id TEXT NOT NULL DEFAULT '', checkpoint_ref TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK(state IN ('pending','active','checkpointed','terminated','failed')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS coordinator_events (binding_key TEXT NOT NULL REFERENCES session_bindings(binding_key), cursor INTEGER NOT NULL CHECK(cursor>0), worker_id TEXT NOT NULL, fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), event_kind TEXT NOT NULL, evidence_ref TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens>=0), cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cached_input_tokens>=0), output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens>=0), reasoning_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_output_tokens>=0), total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens>=0), recorded_at INTEGER NOT NULL, PRIMARY KEY(binding_key,cursor))`,
-		`PRAGMA user_version=7`,
+		`PRAGMA user_version=8`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -37,6 +37,17 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	}
 	if err := ensureMigrationColumn(ctx, tx, "executor_attempts", "operation_idempotency_key", `operation_idempotency_key TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"task_kind", `task_kind TEXT NOT NULL DEFAULT ''`},
+		{"task_version", `task_version TEXT NOT NULL DEFAULT ''`},
+		{"completion_contract", `completion_contract TEXT NOT NULL DEFAULT ''`},
+		{"verifier_id", `verifier_id TEXT NOT NULL DEFAULT ''`},
+		{"task_contract_digest", `task_contract_digest TEXT NOT NULL DEFAULT ''`},
+	} {
+		if err := ensureMigrationColumn(ctx, tx, "route_snapshots", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	for _, column := range []struct{ name, definition string }{
 		{"authority_policy_version", `authority_policy_version TEXT NOT NULL DEFAULT ''`},
