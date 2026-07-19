@@ -113,7 +113,7 @@ func (broker *HTTPBroker) CreateSession(ctx context.Context, request CreateSessi
 
 func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
 	var response brokerSessionResponse
-	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/submit", map[string]any{"session_binding": request.BindingKey, "prompt": request.Prompt, "idempotency_key": request.IdempotencyKey}, &response); err != nil {
+	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/submit", map[string]any{"session_binding": request.BindingKey, "idempotency_key": request.IdempotencyKey}, &response); err != nil {
 		return BrokerTurn{}, err
 	}
 	lease, err := response.validate()

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -138,8 +139,15 @@ func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 	if err != nil || n != 1 || u != usage(3, 2, 5, 5) {
 		t.Fatalf("usage n=%d u=%+v err=%v", n, u, err)
 	}
-	if broker.create.BindingKey != "session:"+item.ID || broker.turns[0].IdempotencyKey != attempt.IdempotencyKey {
+	if broker.create.BindingKey != "session:"+item.ID || len(broker.turns) != 1 || broker.turns[0].BindingKey != "session:"+item.ID || broker.turns[0].IdempotencyKey != attempt.IdempotencyKey {
 		t.Fatalf("broker requests=%+v %+v", broker.create, broker.turns)
+	}
+}
+
+func TestSubmitTurnRequestExcludesCallerTaskAndPrompt(t *testing.T) {
+	typeOfRequest := reflect.TypeOf(SubmitTurnRequest{})
+	if typeOfRequest.NumField() != 2 || typeOfRequest.Field(0).Name != "BindingKey" || typeOfRequest.Field(1).Name != "IdempotencyKey" {
+		t.Fatalf("submit request permits caller task override: %v", typeOfRequest)
 	}
 }
 

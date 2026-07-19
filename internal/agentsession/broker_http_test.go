@@ -78,6 +78,41 @@ func TestHTTPBrokerRequiresContiguousAgentdEvents(t *testing.T) {
 	}
 }
 
+func TestHTTPBrokerSubmitTurnSendsOnlyRegisteredCommandIdentifiers(t *testing.T) {
+	leaseFixture := mustFixture(t, "lease-v1.json")
+	var admission struct {
+		Admission struct {
+			Lease json.RawMessage `json:"lease"`
+		} `json:"admission"`
+	}
+	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/authority-workers/coordinator/v1/sessions/submit" {
+			http.NotFound(writer, request)
+			return
+		}
+		if got := string(mustReadBody(t, request)); got != `{"idempotency_key":"turn-1","session_binding":"logical-session"}` {
+			t.Fatalf("submit wire=%s", got)
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"version": brokerCoordinatorVersion,
+			"lease":   admission.Admission.Lease,
+			"result":  map[string]any{"sessionId": "session-1", "turnId": "turn-1", "phase": "active"},
+		})
+	}))
+	defer server.Close()
+	broker, err := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "logical-session", IdempotencyKey: "turn-1"})
+	if err != nil || turn.TurnID != "turn-1" {
+		t.Fatalf("turn=%+v err=%v", turn, err)
+	}
+}
+
 func TestHTTPBrokerRejectsUnknownWireFields(t *testing.T) {
 	base := mustFixture(t, "lease-v1.json")
 	fixture := append(append([]byte(nil), base[:len(base)-2]...), []byte(",\"caller_model\":\"forbidden\"}\n")...)

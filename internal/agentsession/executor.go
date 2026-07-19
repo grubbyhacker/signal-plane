@@ -38,7 +38,10 @@ type ReassignmentStatusRequest struct {
 	PredecessorEpoch int64
 }
 type CreateSessionRequest struct{ BindingKey string }
-type SubmitTurnRequest struct{ BindingKey, Prompt, IdempotencyKey string }
+
+// SubmitTurnRequest deliberately contains no task material. The broker derives
+// registered task fields from the snapshot persisted at durable admission.
+type SubmitTurnRequest struct{ BindingKey, IdempotencyKey string }
 type StreamEventsRequest struct {
 	BindingKey string
 	Cursor     int64
@@ -109,11 +112,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		}
 		binding.AgentdSessionID = created.SessionID
 	}
-	prompt, err := e.registeredPrompt(ctx, request)
-	if err != nil {
-		return retry("registered_task", "registered task snapshot unavailable"), nil
-	}
-	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, Prompt: prompt, IdempotencyKey: request.Attempt.IdempotencyKey})
+	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, IdempotencyKey: request.Attempt.IdempotencyKey})
 	if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
 		return retry("agentd_submit", "broker turn submit unavailable"), nil
 	}

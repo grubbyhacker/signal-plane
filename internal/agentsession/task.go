@@ -11,8 +11,6 @@ import (
 	"io"
 	"reflect"
 	"regexp"
-	"sort"
-	"strings"
 
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
@@ -97,33 +95,6 @@ func NeutralRepositoryTaskSelection(baseRevision, branchRef string) *workledger.
 		ValidationSelection: "required",
 	})
 	return &workledger.TaskSelection{Kind: RepositoryChangeTaskKind, Parameters: parameters}
-}
-
-func (e *Executor) registeredPrompt(ctx context.Context, request workledger.ExecutorRequest) (string, error) {
-	snapshot, err := e.Store.WorkTaskSnapshot(ctx, request.WorkItem.ID)
-	if err != nil {
-		return "", err
-	}
-	if snapshot.Kind != RepositoryChangeTaskKind || snapshot.CompletionContract != RepositoryCompletionContract || snapshot.VerifierID != RepositoryCompletionContract {
-		return "", errors.New("unsupported registered task snapshot")
-	}
-	var parameters RepositoryChangeParameters
-	if err := json.Unmarshal(snapshot.Parameters, &parameters); err != nil {
-		return "", err
-	}
-	lines := []string{
-		"Execute registered task " + snapshot.Kind + ".",
-		"Repository catalog identity: " + parameters.RepositoryID + ".",
-		"Immutable base revision: " + parameters.BaseRevision + ".",
-		"Broker-projected branch: " + parameters.BranchRef + ".",
-		"Required validation selection: " + parameters.ValidationSelection + ".",
-		"Completion contract: " + snapshot.CompletionContract + ".",
-		"Contract digest: " + snapshot.ContractDigest + ".",
-		"Task evidence digest: " + snapshot.TaskEvidenceDigest + ".",
-	}
-	// Sorting makes the prompt stable if additional declarative facts are added.
-	sort.Strings(lines[1:5])
-	return strings.Join(lines, "\n"), nil
 }
 
 func (e *Executor) RecordRepositoryVerifierResult(ctx context.Context, workItemID string, result workledger.VerifierResult) error {
