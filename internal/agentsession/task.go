@@ -3,8 +3,6 @@ package agentsession
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,13 +39,12 @@ type RepositoryChangeParameters struct {
 type RepositoryChangeTask struct{}
 
 func (RepositoryChangeTask) Descriptor() workledger.TaskDescriptor {
-	digest := sha256.Sum256([]byte(repositoryContractDocument))
 	return workledger.TaskDescriptor{
 		Kind:               RepositoryChangeTaskKind,
 		Version:            "1.0.0",
 		CompletionContract: RepositoryCompletionContract,
 		VerifierID:         RepositoryCompletionContract,
-		ContractDigest:     "sha256:" + hex.EncodeToString(digest[:]),
+		ContractDigest:     repositoryContractDigest,
 	}
 }
 

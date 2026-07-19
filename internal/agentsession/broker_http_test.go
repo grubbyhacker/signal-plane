@@ -2,10 +2,12 @@ package agentsession
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +20,12 @@ func TestHTTPBrokerConsumesSharedLeaseAndReassignmentFixtures(t *testing.T) {
 			return
 		}
 		switch request.URL.Path {
-		case "/v1/authority-workers/coordinator/v1/leases":
-			writer.Write(leaseFixture)
+		case "/v1/authority-workers/coordinator/v2/leases":
+			var got brokerAcquireV2Request
+			if err := decodeStrict(mustReadBody(t, request), &got); err != nil || got.Version != brokerCoordinatorV2Version || got.SessionBinding != "session:work-1" || got.AdmissionTaskDigest == "" {
+				t.Fatalf("v2 request=%+v err=%v", got, err)
+			}
+			writer.Write(v2LeaseFixture(t, leaseFixture))
 		case "/v1/authority-workers/coordinator/v1/reassignments/status":
 			writer.Write(statusFixture)
 		default:
@@ -31,7 +37,7 @@ func TestHTTPBrokerConsumesSharedLeaseAndReassignmentFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := broker.Acquire(t.Context(), AcquireRequest{BindingKey: "logical-session", AuthorityProfile: "writer", IdempotencyKey: "acquire-1"})
+	lease, err := broker.Acquire(t.Context(), testAcquireRequest(t))
 	if err != nil || lease.SessionLineageID != "11111111111111111111111111111111" || lease.PolicyDigest != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("lease=%+v err=%v", lease, err)
 	}
@@ -78,7 +84,7 @@ func TestHTTPBrokerRejectsUnknownWireFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.Write(fixture) }))
 	defer server.Close()
 	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	if _, err := broker.Acquire(t.Context(), AcquireRequest{BindingKey: "logical-session", AuthorityProfile: "writer", IdempotencyKey: "acquire-1"}); err == nil {
+	if _, err := broker.Acquire(t.Context(), testAcquireRequest(t)); err == nil {
 		t.Fatal("unknown broker field accepted")
 	}
 }
@@ -135,6 +141,41 @@ func TestHTTPBrokerUsesOnlySupportedSessionLifecycleOperations(t *testing.T) {
 func mustFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	value, err := os.ReadFile(filepath.Join("..", "..", "testdata", "coordinator-wire", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func testAcquireRequest(t *testing.T) AcquireRequest {
+	t.Helper()
+	task := RegisteredTask{Source: RegisteredTaskSource{WorkItemID: "work-1", RouteSnapshotID: "route-1"}, Snapshot: RegisteredTaskSnapshot{TaskKind: RepositoryChangeTaskKind, TaskVersion: "1.0.0", CompletionContract: RepositoryCompletionContract, VerifierID: RepositoryCompletionContract, ContractDigest: repositoryContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: []byte(`{"repositoryId":"neutral/pr10-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/pr10-proof/test","validationSelection":"required"}`)}}
+	digest, err := admissionTaskDigest(task.Source, task.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Digest = digest
+	return AcquireRequest{BindingKey: "session:work-1", AuthorityProfile: "writer", IdempotencyKey: "acquire-1", RegisteredTask: task}
+}
+
+func v2LeaseFixture(t *testing.T, v1 []byte) []byte {
+	t.Helper()
+	var response map[string]any
+	if err := json.Unmarshal(v1, &response); err != nil {
+		t.Fatal(err)
+	}
+	response["version"] = brokerCoordinatorV2Version
+	value, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func mustReadBody(t *testing.T, request *http.Request) []byte {
+	t.Helper()
+	defer request.Body.Close()
+	value, err := io.ReadAll(request.Body)
 	if err != nil {
 		t.Fatal(err)
 	}

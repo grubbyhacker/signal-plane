@@ -24,7 +24,10 @@ type Broker interface {
 	SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error)
 	StreamEvents(context.Context, StreamEventsRequest) (BrokerEvents, error)
 }
-type AcquireRequest struct{ BindingKey, AuthorityProfile, IdempotencyKey string }
+type AcquireRequest struct {
+	BindingKey, AuthorityProfile, IdempotencyKey string
+	RegisteredTask                               RegisteredTask
+}
 type ReassignRequest struct {
 	BindingKey, SessionLineageID, PredecessorWorker string
 	PredecessorEpoch                                int64
@@ -152,14 +155,19 @@ func (e *Executor) acquire(ctx context.Context, request workledger.ExecutorReque
 	if !errors.Is(err, sql.ErrNoRows) {
 		return workledger.SessionBinding{}, err
 	}
-	lease, err := e.Broker.Acquire(ctx, AcquireRequest{BindingKey: "session:" + request.WorkItem.ID, AuthorityProfile: authorityProfile, IdempotencyKey: request.Attempt.IdempotencyKey})
+	task, err := e.registeredTask(ctx, request)
+	if err != nil {
+		return workledger.SessionBinding{}, err
+	}
+	bindingKey := "session:" + task.Source.WorkItemID
+	lease, err := e.Broker.Acquire(ctx, AcquireRequest{BindingKey: bindingKey, AuthorityProfile: authorityProfile, IdempotencyKey: request.Attempt.IdempotencyKey, RegisteredTask: task})
 	if err != nil {
 		return workledger.SessionBinding{}, err
 	}
 	if lease.AuthorityProfile != authorityProfile {
 		return workledger.SessionBinding{}, errors.New("broker returned unauthorized profile")
 	}
-	return e.Store.BindSessionLease(ctx, request.WorkItem.ID, "session:"+request.WorkItem.ID, lease, e.now())
+	return e.Store.BindSessionLease(ctx, task.Source.WorkItemID, bindingKey, lease, e.now())
 }
 
 func (e *Executor) ReassignAfterLoss(ctx context.Context, workItemID string, predecessorEpoch int64) (workledger.SessionBinding, error) {

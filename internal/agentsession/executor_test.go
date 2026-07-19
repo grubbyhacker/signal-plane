@@ -85,7 +85,7 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: NeutralRepositoryID, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:payload", EvidenceRef: "nats://signals", ReceivedAt: now}
+	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: NeutralRepositoryID, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:" + strings.Repeat("b", 64), EvidenceRef: "nats://signals", ReceivedAt: now}
 	if _, err := store.Admit(context.Background(), snap.ID, event, now); err != nil {
 		t.Fatal(err)
 	}

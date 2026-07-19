@@ -17,7 +17,10 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
-const brokerCoordinatorVersion = "broker/coordinator/v1"
+const (
+	brokerCoordinatorVersion   = "broker/coordinator/v1"
+	brokerCoordinatorV2Version = "broker/coordinator/v2"
+)
 
 type HTTPBroker struct {
 	baseURL *url.URL
@@ -64,6 +67,9 @@ func (lease brokerLease) normalized() (workledger.SessionLease, error) {
 }
 
 func (broker *HTTPBroker) Acquire(ctx context.Context, request AcquireRequest) (workledger.SessionLease, error) {
+	if err := request.RegisteredTask.Validate(request.BindingKey); err != nil {
+		return workledger.SessionLease{}, fmt.Errorf("registered admission is invalid: %w", err)
+	}
 	var response struct {
 		Version   string `json:"version"`
 		Admission struct {
@@ -76,12 +82,12 @@ func (broker *HTTPBroker) Acquire(ctx context.Context, request AcquireRequest) (
 			} `json:"workspace"`
 		} `json:"admission"`
 	}
-	err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/leases", map[string]any{"profile": request.AuthorityProfile, "idempotency_key": request.IdempotencyKey, "session_binding": request.BindingKey}, &response)
+	err := broker.post(ctx, "/v1/authority-workers/coordinator/v2/leases", brokerAcquireV2Request{Version: brokerCoordinatorV2Version, Profile: request.AuthorityProfile, IdempotencyKey: request.IdempotencyKey, SessionBinding: request.BindingKey, RegisteredTaskSource: request.RegisteredTask.Source, RegisteredTask: request.RegisteredTask.Snapshot, AdmissionTaskDigest: request.RegisteredTask.Digest}, &response)
 	if err != nil {
 		return workledger.SessionLease{}, err
 	}
 	lease, err := response.Admission.Lease.normalized()
-	if err != nil || response.Version != brokerCoordinatorVersion || response.Admission.Workspace.UID < 20000 || response.Admission.Workspace.GID < 20000 || response.Admission.Workspace.WorkspacePath == "" || response.Admission.Workspace.SessionLineageID != lease.SessionLineageID {
+	if err != nil || response.Version != brokerCoordinatorV2Version || response.Admission.Workspace.UID < 20000 || response.Admission.Workspace.GID < 20000 || response.Admission.Workspace.WorkspacePath == "" || response.Admission.Workspace.SessionLineageID != lease.SessionLineageID {
 		return workledger.SessionLease{}, errors.New("broker lease response is inconsistent")
 	}
 	return lease, nil

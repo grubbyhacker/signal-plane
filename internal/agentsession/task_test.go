@@ -30,6 +30,9 @@ func TestNeutralRepositoryTaskIsRegisteredAndSnapshotted(t *testing.T) {
 		t.Fatal(err)
 	}
 	descriptor := (RepositoryChangeTask{}).Descriptor()
+	if descriptor.Kind != "repository_change_v1" || descriptor.Version != "1.0.0" || descriptor.CompletionContract != "repository_state_v1" || descriptor.VerifierID != "repository_state_v1" || descriptor.ContractDigest != "sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102" {
+		t.Fatalf("descriptor does not match locked registered-task contract: %+v", descriptor)
+	}
 	if snapshot.TaskKind != RepositoryChangeTaskKind ||
 		snapshot.TaskVersion != descriptor.Version ||
 		snapshot.CompletionContract != RepositoryCompletionContract ||
