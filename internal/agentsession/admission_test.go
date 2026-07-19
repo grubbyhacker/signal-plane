@@ -14,14 +14,14 @@ import (
 
 func TestAdmissionTaskDigestJCSVectorAndExactWire(t *testing.T) {
 	request := testAcquireRequest(t)
-	if request.RegisteredTask.Digest != "sha256:1e1fd450c61f2f3636a22b096c0fc20edf4ed44971d5ac4fd8c849cc75359284" {
+	if request.RegisteredTask.Digest != "sha256:17a66c0bb3a9614eaa183462850005a082abdc8a93dc4a8e2ea1bbbcaff99bbf" {
 		t.Fatalf("admission digest=%s", request.RegisteredTask.Digest)
 	}
 	wire, err := json.Marshal(brokerAcquireV2Request{Version: brokerCoordinatorV2Version, Profile: request.AuthorityProfile, IdempotencyKey: request.IdempotencyKey, SessionBinding: request.BindingKey, RegisteredTaskSource: request.RegisteredTask.Source, RegisteredTask: request.RegisteredTask.Snapshot, AdmissionTaskDigest: request.RegisteredTask.Digest})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"version":"broker/coordinator/v2","profile":"writer","idempotency_key":"acquire-1","session_binding":"session:work-1","registered_task_source":{"work_item_id":"work-1","route_snapshot_id":"route-1"},"registered_task":{"taskKind":"repository_change_v1","taskVersion":"1.0.0","completionContract":"repository_state_v1","verifierId":"repository_state_v1","contractDigest":"sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102","taskEvidenceDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameters":{"repositoryId":"neutral/pr10-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/pr10-proof/test","validationSelection":"required"}},"admission_task_digest":"sha256:1e1fd450c61f2f3636a22b096c0fc20edf4ed44971d5ac4fd8c849cc75359284"}`
+	want := `{"version":"broker/coordinator/v2","profile":"writer","idempotency_key":"acquire-1","session_binding":"session:work-1","registered_task_source":{"work_item_id":"work-1","route_snapshot_id":"route-1"},"registered_task":{"taskKind":"repository_change_v1","taskVersion":"1.0.0","completionContract":"repository_state_v1","verifierId":"repository_state_v1","contractDigest":"sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102","taskEvidenceDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameters":{"repositoryId":"neutral/repository-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/repository-proof/test","validationSelection":"required"}},"admission_task_digest":"sha256:17a66c0bb3a9614eaa183462850005a082abdc8a93dc4a8e2ea1bbbcaff99bbf"}`
 	if string(wire) != want {
 		t.Fatalf("wire=%s", wire)
 	}
@@ -44,7 +44,7 @@ func TestRegisteredAdmissionFailsClosedBeforeBrokerForMalformedSnapshot(t *testi
 
 func TestRegisteredAdmissionRejectsCallerSelectedAndBindingMismatch(t *testing.T) {
 	request := testAcquireRequest(t)
-	request.RegisteredTask.Snapshot.Parameters = []byte(`{"repositoryId":"neutral/pr10-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/pr10-proof/test","validationSelection":"required","prompt":"caller"}`)
+	request.RegisteredTask.Snapshot.Parameters = []byte(`{"repositoryId":"neutral/repository-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/repository-proof/test","validationSelection":"required","prompt":"caller"}`)
 	if err := request.RegisteredTask.Validate(request.BindingKey); err == nil {
 		t.Fatal("caller-selected task field was accepted")
 	}

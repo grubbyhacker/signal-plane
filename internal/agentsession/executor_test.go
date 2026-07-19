@@ -80,7 +80,7 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 	if err := registry.RegisterTask(RepositoryChangeTask{}); err != nil {
 		t.Fatal(err)
 	}
-	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/pr10-proof/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{NeutralRepositoryID}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
+	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/repository-proof/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{NeutralRepositoryID}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
 	snap, err := store.ActivateRoute(context.Background(), route, registry, now)
 	if err != nil {
 		t.Fatal(err)

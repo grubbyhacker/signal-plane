@@ -3,6 +3,8 @@ package agentsession
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,8 +20,8 @@ import (
 const (
 	RepositoryChangeTaskKind     = "repository_change_v1"
 	RepositoryCompletionContract = "repository_state_v1"
-	NeutralRepositoryID          = "neutral/pr10-proof"
-	repositoryContractDocument   = `{"budget":{"maxContinuations":1,"maxModelTurns":2,"maxRuntimeMs":1200000,"maxTotalTokens":250000,"perTurnTimeoutMs":600000,"wallClockDeadlineMs":1800000},"completionContract":"repository_state_v1","parameterSchema":"neutral_repository_change_v1","reasonCodes":["base_revision_mismatch","branch_mismatch","evidence_ambiguous","forbidden_action","head_not_advanced","head_not_reachable","ignored_state","untracked_state","validation_missing","validation_stale","worktree_dirty"],"taskKind":"repository_change_v1","verifierId":"repository_state_v1","version":"1.0.0"}`
+	NeutralRepositoryID          = "neutral/repository-proof"
+	repositoryContractDocument   = `{"budget":{"maxContinuations":1,"maxModelTurns":3,"maxRuntimeMs":1200000,"maxTotalTokens":250000,"perTurnTimeoutMs":600000,"wallClockDeadlineMs":1800000},"completionContract":"repository_state_v1","parameterSchema":"neutral_repository_change_v1","reasonCodes":["base_revision_mismatch","branch_mismatch","evidence_ambiguous","forbidden_action","head_not_advanced","head_not_reachable","ignored_state","untracked_state","validation_missing","validation_stale","worktree_dirty"],"taskKind":"repository_change_v1","verifierId":"repository_state_v1","version":"1.0.0"}`
 )
 
 var repositoryVerifierReasons = map[string]struct{}{
@@ -27,6 +29,13 @@ var repositoryVerifierReasons = map[string]struct{}{
 	"forbidden_action": {}, "head_not_advanced": {}, "head_not_reachable": {},
 	"ignored_state": {}, "untracked_state": {}, "validation_missing": {},
 	"validation_stale": {}, "worktree_dirty": {},
+}
+
+func init() {
+	sum := sha256.Sum256([]byte(repositoryContractDocument))
+	if "sha256:"+hex.EncodeToString(sum[:]) != repositoryContractDigest {
+		panic("repository contract document digest drift")
+	}
 }
 
 type RepositoryChangeParameters struct {
@@ -72,7 +81,7 @@ func (RepositoryChangeTask) CanonicalizeParameters(raw json.RawMessage) (json.Ra
 	}
 	if parameters.RepositoryID != NeutralRepositoryID ||
 		!regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(parameters.BaseRevision) ||
-		!regexp.MustCompile(`^agent/pr10-proof/[a-z0-9][a-z0-9-]{0,62}$`).MatchString(parameters.BranchRef) ||
+		!regexp.MustCompile(`^agent/repository-proof/[a-z0-9][a-z0-9-]{0,62}$`).MatchString(parameters.BranchRef) ||
 		parameters.ValidationSelection != "required" {
 		return nil, errors.New("repository task parameters are outside the reviewed neutral contract")
 	}

@@ -2,6 +2,8 @@ package agentsession
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -65,7 +67,7 @@ func TestNeutralRepositoryTaskRejectsUnregisteredAndCallerSelectedBehavior(t *te
 	if err := registry.RegisterTask(RepositoryChangeTask{}); err != nil {
 		t.Fatal(err)
 	}
-	route.Task.Parameters = json.RawMessage(`{"repositoryId":"neutral/pr10-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/pr10-proof/test","validationSelection":"required","verifier":"shell -c arbitrary"}`)
+	route.Task.Parameters = json.RawMessage(`{"repositoryId":"neutral/repository-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/repository-proof/test","validationSelection":"required","verifier":"shell -c arbitrary"}`)
 	if _, err := store.ActivateRoute(context.Background(), route, registry, time.Now()); err == nil {
 		t.Fatal("caller-selected verifier field was accepted")
 	}
@@ -76,13 +78,31 @@ func TestNeutralRepositoryTaskRejectsUnregisteredAndCallerSelectedBehavior(t *te
 	}
 }
 
+func TestRepositoryContractDocumentMatchesLockedDigest(t *testing.T) {
+	sum := sha256.Sum256([]byte(repositoryContractDocument))
+	if got := "sha256:" + hex.EncodeToString(sum[:]); got != repositoryContractDigest {
+		t.Fatalf("repository contract document digest=%s, want %s", got, repositoryContractDigest)
+	}
+}
+
+func TestNeutralRepositoryTaskRejectsPredecessorIdentifiers(t *testing.T) {
+	for _, raw := range []string{
+		`{"repositoryId":"neutral/pr10-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/repository-proof/test","validationSelection":"required"}`,
+		`{"repositoryId":"neutral/repository-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/pr10-proof/test","validationSelection":"required"}`,
+	} {
+		if _, err := (RepositoryChangeTask{}).CanonicalizeParameters(json.RawMessage(raw)); err == nil {
+			t.Fatalf("predecessor task parameters accepted: %s", raw)
+		}
+	}
+}
+
 func neutralTaskRoute() workledger.RouteDefinition {
 	return workledger.RouteDefinition{
 		ID:              "agent-session",
 		SchemaVersion:   1,
 		SemanticVersion: "1.0.0",
 		ExecutorID:      ExecutorID,
-		Task:            NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/pr10-proof/test"),
+		Task:            NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/repository-proof/test"),
 		Admission: workledger.AdmissionPolicy{
 			Sources:     []string{"manual"},
 			Namespaces:  []string{NeutralRepositoryID},
