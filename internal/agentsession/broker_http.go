@@ -94,7 +94,7 @@ func (broker *HTTPBroker) Acquire(ctx context.Context, request AcquireRequest) (
 }
 
 func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
-	if request.Version != "agentd/registered-lifecycle/v1" || request.IdempotencyKey == "" || request.TaskKind == "" || request.AdmissionTaskDigest == "" || request.TaskEvidenceDigest == "" || len(request.Parameters) == 0 || !json.Valid(request.Parameters) {
+	if request.BindingKey == "" || request.Version != "agentd/registered-lifecycle/v1" || request.IdempotencyKey == "" || request.TaskKind == "" || request.AdmissionTaskDigest == "" || request.TaskEvidenceDigest == "" || len(request.Parameters) == 0 || !json.Valid(request.Parameters) {
 		return BrokerTurn{}, errors.New("registered lifecycle request is invalid")
 	}
 	var parameters map[string]json.RawMessage
@@ -102,13 +102,14 @@ func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequ
 		return BrokerTurn{}, errors.New("registered lifecycle parameters are invalid")
 	}
 	wire := struct {
+		SessionBinding      string                     `json:"sessionBinding"`
 		Version             string                     `json:"version"`
 		IdempotencyKey      string                     `json:"idempotencyKey"`
 		TaskKind            string                     `json:"taskKind"`
 		AdmissionTaskDigest string                     `json:"admissionTaskDigest"`
 		TaskEvidenceDigest  string                     `json:"taskEvidenceDigest"`
 		Parameters          map[string]json.RawMessage `json:"parameters"`
-	}{request.Version, request.IdempotencyKey, request.TaskKind, request.AdmissionTaskDigest, request.TaskEvidenceDigest, parameters}
+	}{request.BindingKey, request.Version, request.IdempotencyKey, request.TaskKind, request.AdmissionTaskDigest, request.TaskEvidenceDigest, parameters}
 	var response struct {
 		Version       string      `json:"version"`
 		Lease         brokerLease `json:"lease"`
@@ -138,7 +139,7 @@ func (broker *HTTPBroker) StreamEvents(ctx context.Context, request StreamEvents
 		Events     []registeredEventWire `json:"events"`
 		NextCursor int64                 `json:"nextCursor"`
 	}
-	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/registered-events", map[string]int64{"after": request.Cursor}, &response); err != nil {
+	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/registered-events", map[string]any{"sessionBinding": request.BindingKey, "after": request.Cursor}, &response); err != nil {
 		return BrokerEvents{}, err
 	}
 	lease, err := response.Lease.normalized()

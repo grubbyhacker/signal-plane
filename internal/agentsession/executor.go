@@ -44,8 +44,8 @@ type ReassignmentStatusRequest struct {
 // broker forwards this exact shape to agentd; no prompt or continuation input
 // is selectable by the coordinator.
 type SubmitTurnRequest struct {
-	Version, IdempotencyKey, TaskKind, AdmissionTaskDigest, TaskEvidenceDigest string
-	Parameters                                                                 []byte
+	BindingKey, Version, IdempotencyKey, TaskKind, AdmissionTaskDigest, TaskEvidenceDigest string
+	Parameters                                                                             []byte
 }
 
 // Retained for ancillary broker lifecycle helpers; the coordinator does not
@@ -147,7 +147,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		if taskErr != nil {
 			return retry("agentd_submit", "registered task is unavailable"), nil
 		}
-		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: binding.RegisteredSubmitKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
+		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, Version: "agentd/registered-lifecycle/v1", IdempotencyKey: binding.RegisteredSubmitKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
 		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+binding.RegisteredSubmitKey || turn.Cursor <= 0 || !sameLease(binding, turn.Lease) {
 			return retry("agentd_submit", "broker turn submit unavailable"), nil
 		}

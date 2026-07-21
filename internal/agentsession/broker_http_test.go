@@ -30,10 +30,15 @@ func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		var got json.RawMessage
+		var got map[string]json.RawMessage
 		_ = json.NewDecoder(r.Body).Decode(&got)
+		if string(got["sessionBinding"]) != `"session:work-42"` {
+			t.Fatalf("session binding=%s", got["sessionBinding"])
+		}
+		delete(got, "sessionBinding")
 		var gotValue, wantValue any
-		_ = json.Unmarshal(got, &gotValue)
+		gotBytes, _ := json.Marshal(got)
+		_ = json.Unmarshal(gotBytes, &gotValue)
 		_ = json.Unmarshal(fixture.Request, &wantValue)
 		if !reflect.DeepEqual(gotValue, wantValue) {
 			t.Fatalf("request=%s want=%s", got, fixture.Request)
@@ -53,7 +58,7 @@ func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
 	}
 	_ = json.Unmarshal(fixture.Request, &request)
 	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
-	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: request.Version, IdempotencyKey: request.IdempotencyKey, TaskKind: request.TaskKind, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.TaskEvidenceDigest, Parameters: request.Parameters})
+	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "session:work-42", Version: request.Version, IdempotencyKey: request.IdempotencyKey, TaskKind: request.TaskKind, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.TaskEvidenceDigest, Parameters: request.Parameters})
 	if err != nil || turn.SessionID != "session-42" || turn.TurnID != "turn:turn-42" || turn.ModelEffectID != "model:turn-42" || turn.Cursor != 1 {
 		t.Fatalf("turn=%+v err=%v", turn, err)
 	}
@@ -61,13 +66,18 @@ func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
 
 func TestRegisteredTurnRejectsWrongVersionAndExtraFields(t *testing.T) {
 	for _, body := range []string{`{"version":"agentd/registered-turn/v1","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0}`, `{"version":"agentd/registered-turn/v2","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0,"extra":true}`} {
+		called := false
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"lease":` + string(testLeaseJSON(t)) + `,` + body[1:]))
 		}))
 		broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
-		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
+		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "session:work", Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
 			t.Fatal("invalid response accepted")
+		}
+		if !called {
+			t.Fatal("invalid response was not exercised through HTTP")
 		}
 		server.Close()
 	}
@@ -89,6 +99,13 @@ func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.
 		if r.URL.Path != "/v1/authority-workers/coordinator/v1/registered-events" {
 			http.NotFound(w, r)
 			return
+		}
+		var request struct {
+			SessionBinding string `json:"sessionBinding"`
+			After          int64  `json:"after"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.SessionBinding != "binding" || request.After != 0 {
+			t.Fatalf("registered events request=%+v err=%v", request, err)
 		}
 		_ = json.NewEncoder(w).Encode(fixture.Events)
 	}))
