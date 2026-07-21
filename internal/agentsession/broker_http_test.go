@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
 func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
@@ -93,15 +95,22 @@ func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.
 	defer server.Close()
 	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
 	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
-	if err != nil || len(batch.Events) != 2 || batch.Events[1].Attempt != 1 || batch.Events[1].Verifier == nil || batch.Events[1].Verifier.Outcome != "waiting" {
+	if err != nil || len(batch.Events) != 6 || batch.Events[0].Phase != "queued" || batch.Events[1].Phase != "authorized" || batch.Events[2].Phase != "running" || batch.Events[3].Phase != "completed" || batch.Events[4].Verifier == nil || batch.Events[4].Verifier.Outcome != "waiting" || batch.Events[5].Verifier == nil || batch.Events[5].Verifier.Outcome != "satisfied" {
 		t.Fatalf("batch=%+v err=%v", batch, err)
+	}
+	binding := workledger.SessionBinding{AgentdSessionID: "session-42", SubmittedTurnID: "turn:turn-42", ModelEffectID: "model:turn-42", WorkerID: "worker-42", WorkerStorageLineageID: "lineage-42", WorkerFenceEpoch: 7}
+	task := RegisteredTask{Digest: "sha256:" + strings.Repeat("a", 64), Snapshot: RegisteredTaskSnapshot{TaskEvidenceDigest: "sha256:" + strings.Repeat("b", 64)}}
+	for _, event := range batch.Events {
+		if !validEvent(event, binding, task) {
+			t.Fatalf("shared registered lifecycle fixture event was rejected: %+v", event)
+		}
 	}
 
 	var invalid map[string]any
 	encoded, _ := json.Marshal(fixture.Events)
 	_ = json.Unmarshal(encoded, &invalid)
 	events := invalid["events"].([]any)
-	verifier := events[1].(map[string]any)["verifier"].(map[string]any)
+	verifier := events[4].(map[string]any)["verifier"].(map[string]any)
 	verifier["workItemId"] = "legacy-wire-member"
 	invalidServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(invalid)

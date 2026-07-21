@@ -136,21 +136,29 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	if err != nil {
 		return retry("coordinator_acquire", "authority session unavailable"), nil
 	}
+	binding, err = e.Store.BindRegisteredSubmitKey(ctx, request.WorkItem.ID, bindingLease(binding), registeredSubmitKey(binding), e.now())
+	if err != nil {
+		return retry("coordinator_fence", "registered submit key unavailable"), nil
+	}
 	turnID := binding.SubmittedTurnID
 	if binding.SubmittedIdempotencyKey == "" {
 		task, taskErr := e.registeredTask(ctx, request)
 		if taskErr != nil {
 			return retry("agentd_submit", "registered task is unavailable"), nil
 		}
-		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: request.Attempt.IdempotencyKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
-		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+request.Attempt.IdempotencyKey || turn.Cursor <= 0 || !sameLease(binding, turn.Lease) {
+		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: binding.RegisteredSubmitKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
+		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+binding.RegisteredSubmitKey || turn.Cursor <= 0 || !sameLease(binding, turn.Lease) {
 			return retry("agentd_submit", "broker turn submit unavailable"), nil
 		}
-		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, request.Attempt.IdempotencyKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.Cursor, e.now()); err != nil {
+		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, binding.RegisteredSubmitKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.Cursor, e.now()); err != nil {
 			return retry("coordinator_fence", "submitted turn conflicts"), nil
 		}
 		turnID = turn.TurnID
 		binding.AgentdSessionID, binding.ModelEffectID, binding.EventCursor = turn.SessionID, turn.ModelEffectID, turn.Cursor
+	}
+	task, err := e.registeredTask(ctx, request)
+	if err != nil {
+		return retry("agentd_protocol", "registered task is unavailable"), nil
 	}
 	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, Cursor: binding.EventCursor})
 	if err != nil || !sameLease(binding, batch.Lease) {
@@ -160,7 +168,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	next, deadline := now.Add(pollInterval), now.Add(waitDeadline)
 	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turnID, NextAttemptAt: &next, DeadlineAt: &deadline}
 	for _, event := range batch.Events {
-		if !validEvent(event, binding, request) {
+		if !validEvent(event, binding, task) {
 			return retry("agentd_protocol", "agent event invalid"), nil
 		}
 		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_" + event.Phase, EvidenceRef: "agentd:registered-events:" + event.ModelEffectID + ":" + fmt.Sprint(event.Cursor)}, e.now()); err != nil {
@@ -179,11 +187,27 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
-func validEvent(e Event, binding workledger.SessionBinding, request workledger.ExecutorRequest) bool {
-	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest == "" || e.TaskEvidenceDigest == "" {
+func validEvent(e Event, binding workledger.SessionBinding, task RegisteredTask) bool {
+	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest != task.Digest || e.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest {
 		return false
 	}
-	return (e.Phase == "queued" && e.Verifier == nil) || (e.Verifier != nil && e.Phase == e.Verifier.Phase && validVerifierResult(e.Verifier))
+	if e.Verifier == nil {
+		switch e.Phase {
+		case "queued", "authorized", "running", "completed":
+			return true
+		default:
+			return false
+		}
+	}
+	return (e.Phase == "pending" || e.Phase == "green" || e.Phase == "red" || e.Phase == "refused" || e.Phase == "escalated") && e.Phase == e.Verifier.Phase && validVerifierResult(e.Verifier)
+}
+
+func registeredSubmitKey(binding workledger.SessionBinding) string {
+	return "agentd:registered-turn:v1:" + binding.WorkItemID
+}
+
+func bindingLease(binding workledger.SessionBinding) workledger.SessionLease {
+	return workledger.SessionLease{AuthorityProfile: binding.AuthorityProfile, ProfileVersion: binding.ProfileVersion, PolicyDigest: binding.PolicyDigest, SessionLineageID: binding.SessionLineageID, WorkerID: binding.WorkerID, WorkerStorageLineageID: binding.WorkerStorageLineageID, WorkerFenceEpoch: binding.WorkerFenceEpoch}
 }
 
 func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.ExecutorRequest, binding workledger.SessionBinding, event Event) error {

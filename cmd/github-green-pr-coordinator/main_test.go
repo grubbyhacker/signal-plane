@@ -105,7 +105,7 @@ func TestFixtureAdmissionRunsSubmitThenScheduledPollWithoutAnotherTurn(t *testin
 		t.Fatalf("poll claim attempt=%+v first=%+v ok=%v err=%v", poll, first, ok, err)
 	}
 	task := broker.acquire.RegisteredTask
-	broker.events = []agentsession.Event{{Cursor: 2, Attempt: 0, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + first.IdempotencyKey, Phase: "queued", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest}}
+	broker.events = []agentsession.Event{{Cursor: 2, Attempt: 0, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + broker.turns[0].IdempotencyKey, Phase: "queued", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest}}
 	pollResult, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: poll})
 	if err != nil || pollResult.Outcome != workledger.OutcomeWaiting {
 		t.Fatalf("poll execute=%+v err=%v", pollResult, err)
@@ -113,15 +113,15 @@ func TestFixtureAdmissionRunsSubmitThenScheduledPollWithoutAnotherTurn(t *testin
 	if err := store.Complete(ctx, poll.ID, pollResult, pollAt); err != nil {
 		t.Fatal(err)
 	}
-	if len(broker.turns) != 1 || broker.turns[0].IdempotencyKey != first.IdempotencyKey {
-		t.Fatalf("submit turns=%+v, want only first Signal attempt", broker.turns)
+	if len(broker.turns) != 1 || broker.turns[0].IdempotencyKey != "agentd:registered-turn:v1:"+item.ID {
+		t.Fatalf("submit turns=%+v, want the durable work-item key", broker.turns)
 	}
 	item, secondPoll, ok, err := store.Claim(ctx, pollAt.Add(5*time.Second))
 	if err != nil || !ok || secondPoll.ID == poll.ID {
 		t.Fatalf("second poll=%+v ok=%v err=%v", secondPoll, ok, err)
 	}
 	clock = pollAt.Add(5 * time.Second)
-	broker.events = []agentsession.Event{{Cursor: 3, Attempt: 1, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + first.IdempotencyKey, Phase: "red", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Verifier: &agentsession.VerifierEvent{Phase: "red", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Outcome: "continuation", Reasons: []agentsession.VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}}}
+	broker.events = []agentsession.Event{{Cursor: 3, Attempt: 1, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + broker.turns[0].IdempotencyKey, Phase: "red", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Verifier: &agentsession.VerifierEvent{Phase: "red", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Outcome: "continuation", Reasons: []agentsession.VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}}}
 	secondResult, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: secondPoll})
 	if err != nil || secondResult.Outcome != workledger.OutcomeWaiting {
 		t.Fatalf("second execute=%+v err=%v", secondResult, err)
@@ -137,7 +137,7 @@ func TestFixtureAdmissionRunsSubmitThenScheduledPollWithoutAnotherTurn(t *testin
 		t.Fatalf("terminal poll=%+v ok=%v err=%v", terminalPoll, ok, err)
 	}
 	clock = pollAt.Add(10 * time.Second)
-	broker.events = []agentsession.Event{{Cursor: 4, Attempt: 2, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + first.IdempotencyKey, Phase: "green", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Verifier: &agentsession.VerifierEvent{Phase: "green", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Outcome: "satisfied", EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}}}
+	broker.events = []agentsession.Event{{Cursor: 4, Attempt: 2, SessionID: "fixture-session", TurnID: "fixture-turn", ModelEffectID: "model:" + broker.turns[0].IdempotencyKey, Phase: "green", WorkerID: broker.lease.WorkerID, StorageLineageID: broker.lease.WorkerStorageLineageID, FenceEpoch: broker.lease.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Verifier: &agentsession.VerifierEvent{Phase: "green", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Outcome: "satisfied", EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}}}
 	terminalResult, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: terminalPoll})
 	if err != nil || terminalResult.Outcome != workledger.OutcomeWaiting {
 		t.Fatalf("terminal execute=%+v err=%v", terminalResult, err)
@@ -149,7 +149,7 @@ func TestFixtureAdmissionRunsSubmitThenScheduledPollWithoutAnotherTurn(t *testin
 		t.Fatalf("continuation submitted/restarted a turn: turns=%+v streams=%+v", broker.turns, broker.streams)
 	}
 	binding, err := store.SessionBinding(ctx, item.ID)
-	if err != nil || binding.SubmittedIdempotencyKey != first.IdempotencyKey || binding.ModelEffectID != "model:"+first.IdempotencyKey {
+	if err != nil || binding.SubmittedIdempotencyKey != broker.turns[0].IdempotencyKey || binding.ModelEffectID != "model:"+broker.turns[0].IdempotencyKey {
 		t.Fatalf("binding=%+v err=%v", binding, err)
 	}
 	if _, _, ok, err := store.Claim(ctx, pollAt.Add(time.Minute)); err != nil || ok {

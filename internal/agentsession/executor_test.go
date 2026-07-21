@@ -2,6 +2,7 @@ package agentsession
 
 import (
 	"context"
+	"errors"
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"path/filepath"
 	"strings"
@@ -63,6 +64,135 @@ func TestRegisteredVerifierMappingsAndLocalOpaqueRevision(t *testing.T) {
 	if validVerifierResult(local) {
 		t.Fatal("non-satisfied verifier result without reasons was accepted")
 	}
+}
+
+func TestRegisteredLifecycleAcceptsExactTransportAndVerifierPhases(t *testing.T) {
+	store, item, attempt, _ := coordinatorFixture(t)
+	defer store.Close()
+	executor := &Executor{Store: store}
+	task, err := executor.registeredTask(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := workledger.SessionBinding{AgentdSessionID: "session", SubmittedTurnID: "turn", ModelEffectID: "model:key", WorkerID: "worker", WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: 1}
+	base := func(cursor int64, phase string) Event {
+		return Event{Cursor: cursor, SessionID: binding.AgentdSessionID, TurnID: binding.SubmittedTurnID, ModelEffectID: binding.ModelEffectID, Phase: phase, WorkerID: binding.WorkerID, StorageLineageID: binding.WorkerStorageLineageID, FenceEpoch: binding.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest}
+	}
+	for cursor, phase := range []string{"queued", "authorized", "running", "completed"} {
+		if !validEvent(base(int64(cursor+1), phase), binding, task) {
+			t.Fatalf("transport phase %q was rejected", phase)
+		}
+	}
+	pending := base(5, "pending")
+	pending.Verifier = &VerifierEvent{Phase: "pending", Outcome: "waiting", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "waiting"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if !validEvent(pending, binding, task) {
+		t.Fatal("pending verifier phase was rejected")
+	}
+	green := base(6, "green")
+	green.Verifier = &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if !validEvent(green, binding, task) {
+		t.Fatal("green verifier phase was rejected")
+	}
+	queuedWithVerifier := base(1, "queued")
+	queuedWithVerifier.Verifier = green.Verifier
+	if validEvent(queuedWithVerifier, binding, task) {
+		t.Fatal("verifier coupled to queued transport phase was accepted")
+	}
+	if validEvent(base(5, "pending"), binding, task) {
+		t.Fatal("verifier-free pending phase was accepted")
+	}
+	malformed := green
+	malformed.Verifier = &VerifierEvent{Phase: "pending", Outcome: "satisfied", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if validEvent(malformed, binding, task) {
+		t.Fatal("malformed phase/verifier coupling was accepted")
+	}
+}
+
+func TestRegisteredSubmitRecoversLostResponseWithDurableWorkItemKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, first, now := coordinatorFixtureAt(t, path)
+	broker := &lostResponseBroker{lease: fixtureTestLease()}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	firstResult, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+	if err != nil || firstResult.Outcome != workledger.OutcomeRetryableFailure {
+		t.Fatalf("first execute=%+v err=%v", firstResult, err)
+	}
+	if err := store.Complete(t.Context(), first.ID, firstResult, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, retryAttempt, ok, err := store.Claim(t.Context(), now.Add(time.Second))
+	if err != nil || !ok {
+		t.Fatalf("retry claim ok=%v err=%v", ok, err)
+	}
+	executor.Store = store
+	retryResult, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: retryAttempt})
+	if err != nil || retryResult.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("retry execute=%+v err=%v", retryResult, err)
+	}
+	if len(broker.submitKeys) != 2 || broker.submitKeys[0] != broker.submitKeys[1] || broker.logicalSubmissions != 1 {
+		t.Fatalf("submit keys=%v logical submissions=%d", broker.submitKeys, broker.logicalSubmissions)
+	}
+	if err := store.Complete(t.Context(), retryAttempt.ID, retryResult, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	item, pollAttempt, ok, err := store.Claim(t.Context(), now.Add(6*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("poll claim ok=%v err=%v", ok, err)
+	}
+	if result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: pollAttempt}); err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("poll execute=%+v err=%v", result, err)
+	}
+	if len(broker.submitKeys) != 2 {
+		t.Fatalf("later poll submitted again: %v", broker.submitKeys)
+	}
+	binding, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || binding.RegisteredSubmitKey == "" || binding.RegisteredSubmitKey != binding.SubmittedIdempotencyKey {
+		t.Fatalf("binding=%+v err=%v", binding, err)
+	}
+}
+
+type lostResponseBroker struct {
+	lease              workledger.SessionLease
+	submitKeys         []string
+	logicalSubmissions int
+	turn               BrokerTurn
+}
+
+func (b *lostResponseBroker) Acquire(_ context.Context, _ AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *lostResponseBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
+	b.submitKeys = append(b.submitKeys, request.IdempotencyKey)
+	if b.turn.TurnID == "" {
+		b.logicalSubmissions++
+		b.turn = BrokerTurn{SessionID: "lost-session", TurnID: "lost-turn", ModelEffectID: "model:" + request.IdempotencyKey, Cursor: 1, Lease: b.lease}
+		return BrokerTurn{}, errors.New("response lost after broker acceptance")
+	}
+	if request.IdempotencyKey != b.submitKeys[0] {
+		return BrokerTurn{}, errors.New("broker rejected changed replay key")
+	}
+	return b.turn, nil
+}
+func (b *lostResponseBroker) StreamEvents(_ context.Context, _ StreamEventsRequest) (BrokerEvents, error) {
+	return BrokerEvents{Lease: b.lease}, nil
+}
+func (b *lostResponseBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *lostResponseBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
+}
+
+func fixtureTestLease() workledger.SessionLease {
+	return workledger.SessionLease{WorkerID: "fixture-worker", AuthorityProfile: authorityProfile, ProfileVersion: "fixture-profile-v1", PolicyDigest: strings.Repeat("a", 64), SessionLineageID: strings.Repeat("1", 32), WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: 1}
 }
 
 func TestRecordVerifierEventRejectsDigestsOutsideRegisteredTaskSnapshot(t *testing.T) {

@@ -18,12 +18,12 @@ const durablePollInterval = 5 * time.Second
 const durableWaitDeadline = 30 * time.Minute
 
 type SessionBinding struct {
-	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest string
-	SessionLineageID, WorkerID, WorkerStorageLineageID                     string
-	AgentdSessionID, CheckpointRef, State                                  string
-	SubmittedIdempotencyKey, ModelEffectID, SubmittedTurnID                string
-	EventCursor, WorkerFenceEpoch                                          int64
-	CreatedAt, UpdatedAt                                                   time.Time
+	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest       string
+	SessionLineageID, WorkerID, WorkerStorageLineageID                           string
+	AgentdSessionID, CheckpointRef, State                                        string
+	RegisteredSubmitKey, SubmittedIdempotencyKey, ModelEffectID, SubmittedTurnID string
+	EventCursor, WorkerFenceEpoch                                                int64
+	CreatedAt, UpdatedAt                                                         time.Time
 }
 
 type SessionLease struct {
@@ -126,15 +126,35 @@ func sameSessionLease(binding SessionBinding, lease SessionLease) bool {
 func (store *Store) SessionBinding(ctx context.Context, workItemID string) (SessionBinding, error) {
 	var binding SessionBinding
 	var created, updated int64
-	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,submitted_idempotency_key,model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
+	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,registered_submit_key,submitted_idempotency_key,model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
 		&binding.WorkItemID, &binding.BindingKey, &binding.AuthorityProfile, &binding.ProfileVersion, &binding.PolicyDigest,
 		&binding.SessionLineageID, &binding.WorkerID, &binding.WorkerStorageLineageID, &binding.WorkerFenceEpoch,
-		&binding.AgentdSessionID, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
+		&binding.AgentdSessionID, &binding.RegisteredSubmitKey, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
 	)
 	if err != nil {
 		return SessionBinding{}, err
 	}
 	binding.CreatedAt, binding.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
+	return binding, nil
+}
+
+// BindRegisteredSubmitKey durably reserves the one broker idempotency key for
+// this fenced work-item binding before the registered-turn network effect.
+func (store *Store) BindRegisteredSubmitKey(ctx context.Context, workItemID string, lease SessionLease, key string, now time.Time) (SessionBinding, error) {
+	if key == "" || !validLease(lease) {
+		return SessionBinding{}, errors.New("registered submit key requires a complete fenced binding")
+	}
+	_, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET registered_submit_key=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND registered_submit_key=''`, key, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	if err != nil {
+		return SessionBinding{}, err
+	}
+	binding, err := store.SessionBinding(ctx, workItemID)
+	if err != nil {
+		return SessionBinding{}, err
+	}
+	if !sameSessionLease(binding, lease) || binding.RegisteredSubmitKey != key {
+		return SessionBinding{}, errors.New("registered submit key conflicts with durable binding")
+	}
 	return binding, nil
 }
 
