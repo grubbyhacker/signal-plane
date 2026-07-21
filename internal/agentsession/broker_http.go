@@ -151,7 +151,10 @@ func (broker *HTTPBroker) StreamEvents(ctx context.Context, request StreamEvents
 		if wire.Cursor != previous+1 || wire.SessionID == "" || wire.TurnID == "" || wire.ModelEffectID == "" || wire.Attempt < 0 || wire.Phase == "" || wire.WorkerID == "" || wire.StorageLineageID == "" || wire.FenceEpoch < 0 || wire.AdmissionTaskDigest == "" || wire.TaskEvidenceDigest == "" {
 			return BrokerEvents{}, errors.New("broker event stream is non-contiguous or malformed")
 		}
-		event := Event{Cursor: wire.Cursor, Attempt: wire.Attempt, SessionID: wire.SessionID, TurnID: wire.TurnID, ModelEffectID: wire.ModelEffectID, Phase: wire.Phase, WorkerID: wire.WorkerID, StorageLineageID: wire.StorageLineageID, FenceEpoch: wire.FenceEpoch, AdmissionTaskDigest: wire.AdmissionTaskDigest, TaskEvidenceDigest: wire.TaskEvidenceDigest, Verifier: wire.Verifier}
+		event := Event{Cursor: wire.Cursor, Attempt: wire.Attempt, SessionID: wire.SessionID, TurnID: wire.TurnID, ModelEffectID: wire.ModelEffectID, Phase: wire.Phase, WorkerID: wire.WorkerID, StorageLineageID: wire.StorageLineageID, FenceEpoch: wire.FenceEpoch, AdmissionTaskDigest: wire.AdmissionTaskDigest, TaskEvidenceDigest: wire.TaskEvidenceDigest, Verifier: wire.Verifier, Failure: wire.Failure}
+		if !validEventShape(event) {
+			return BrokerEvents{}, errors.New("broker event stream has invalid phase, failure, or verifier coupling")
+		}
 		events = append(events, event)
 		previous = wire.Cursor
 	}
@@ -174,6 +177,7 @@ type registeredEventWire struct {
 	AdmissionTaskDigest string         `json:"admissionTaskDigest"`
 	TaskEvidenceDigest  string         `json:"taskEvidenceDigest"`
 	Verifier            *VerifierEvent `json:"verifier,omitempty"`
+	Failure             string         `json:"failure,omitempty"`
 }
 
 func (broker *HTTPBroker) Reassign(ctx context.Context, request ReassignRequest) (BrokerReassignment, error) {

@@ -40,45 +40,6 @@
         "sessionId": "session-42",
         "turnId": "turn:turn-42",
         "modelEffectId": "model:turn-42",
-        "attempt": 0,
-        "phase": "authorized",
-        "workerId": "worker-42",
-        "storageLineageId": "lineage-42",
-        "fenceEpoch": 7,
-        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      },
-      {
-        "cursor": 3,
-        "sessionId": "session-42",
-        "turnId": "turn:turn-42",
-        "modelEffectId": "model:turn-42",
-        "attempt": 0,
-        "phase": "running",
-        "workerId": "worker-42",
-        "storageLineageId": "lineage-42",
-        "fenceEpoch": 7,
-        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      },
-      {
-        "cursor": 4,
-        "sessionId": "session-42",
-        "turnId": "turn:turn-42",
-        "modelEffectId": "model:turn-42",
-        "attempt": 0,
-        "phase": "completed",
-        "workerId": "worker-42",
-        "storageLineageId": "lineage-42",
-        "fenceEpoch": 7,
-        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      },
-      {
-        "cursor": 5,
-        "sessionId": "session-42",
-        "turnId": "turn:turn-42",
-        "modelEffectId": "model:turn-42",
         "attempt": 1,
         "phase": "pending",
         "workerId": "worker-42",
@@ -103,33 +64,8 @@
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
           ]
         }
-      },
-      {
-        "cursor": 6,
-        "sessionId": "session-42",
-        "turnId": "turn:turn-42",
-        "modelEffectId": "model:turn-42",
-        "attempt": 1,
-        "phase": "green",
-        "workerId": "worker-42",
-        "storageLineageId": "lineage-42",
-        "fenceEpoch": 7,
-        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "verifier": {
-          "phase": "green",
-          "outcome": "satisfied",
-          "contractDigest": "sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb",
-          "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          "headRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          "reasons": [],
-          "evidenceRefs": [
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-          ]
-        }
       }
     ],
-    "nextCursor": 6
+    "nextCursor": 2
   }
 }

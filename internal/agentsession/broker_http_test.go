@@ -95,7 +95,7 @@ func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.
 	defer server.Close()
 	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
 	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
-	if err != nil || len(batch.Events) != 6 || batch.Events[0].Phase != "queued" || batch.Events[1].Phase != "authorized" || batch.Events[2].Phase != "running" || batch.Events[3].Phase != "completed" || batch.Events[4].Verifier == nil || batch.Events[4].Verifier.Outcome != "waiting" || batch.Events[5].Verifier == nil || batch.Events[5].Verifier.Outcome != "satisfied" {
+	if err != nil || len(batch.Events) != 2 || batch.Events[0].Phase != "queued" || batch.Events[1].Verifier == nil || batch.Events[1].Verifier.Outcome != "waiting" {
 		t.Fatalf("batch=%+v err=%v", batch, err)
 	}
 	binding := workledger.SessionBinding{AgentdSessionID: "session-42", SubmittedTurnID: "turn:turn-42", ModelEffectID: "model:turn-42", WorkerID: "worker-42", WorkerStorageLineageID: "lineage-42", WorkerFenceEpoch: 7}
@@ -110,7 +110,7 @@ func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.
 	encoded, _ := json.Marshal(fixture.Events)
 	_ = json.Unmarshal(encoded, &invalid)
 	events := invalid["events"].([]any)
-	verifier := events[4].(map[string]any)["verifier"].(map[string]any)
+	verifier := events[1].(map[string]any)["verifier"].(map[string]any)
 	verifier["workItemId"] = "legacy-wire-member"
 	invalidServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(invalid)
@@ -119,6 +119,54 @@ func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.
 	invalidBroker, _ := NewHTTPBroker(invalidServer.URL, "token", invalidServer.Client())
 	if _, err := invalidBroker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0}); err == nil {
 		t.Fatal("legacy verifier member was accepted")
+	}
+}
+
+func TestRegisteredEventsRetainUncertainRuntimeFailureAndRejectMalformedCoupling(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	evidence := "sha256:" + strings.Repeat("b", 64)
+	uncertain := registeredEventWire{
+		Cursor: 1, Attempt: 1, SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42", Phase: "escalated", WorkerID: "worker-42", StorageLineageID: "lineage-42", FenceEpoch: 7, AdmissionTaskDigest: digest, TaskEvidenceDigest: evidence, Failure: "runtime_outcome_uncertain",
+		Verifier: &VerifierEvent{Phase: "escalated", Outcome: "escalated", ContractDigest: digest, TaskEvidenceDigest: evidence, HeadRevision: "local:unavailable:verifier:turn-42:uncertain-runtime", Reasons: []VerifierReason{{Code: "refused", EvidenceRef: "local:refused:" + evidence}}, EvidenceRefs: []string{"local:refused:" + evidence}},
+	}
+	type eventsResponse struct {
+		Version    string                `json:"version"`
+		Lease      json.RawMessage       `json:"lease"`
+		Events     []registeredEventWire `json:"events"`
+		NextCursor int64                 `json:"nextCursor"`
+	}
+	response := func(event registeredEventWire) eventsResponse {
+		return eventsResponse{Version: "agentd/registered-events/v2", Lease: testLeaseJSON(t), Events: []registeredEventWire{event}, NextCursor: 1}
+	}
+	serve := func(event registeredEventWire) *HTTPBroker {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(response(event))
+		}))
+		t.Cleanup(server.Close)
+		broker, err := NewHTTPBroker(server.URL, "token", server.Client())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return broker
+	}
+	batch, err := serve(uncertain).StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
+	if err != nil || len(batch.Events) != 1 || batch.Events[0].Failure != "runtime_outcome_uncertain" || batch.Events[0].Verifier == nil || batch.Events[0].Verifier.Phase != "escalated" {
+		t.Fatalf("uncertain event=%+v err=%v", batch.Events, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*registeredEventWire)
+	}{
+		{name: "uncertain failure on wrong phase", mutate: func(event *registeredEventWire) { event.Phase = "failed" }},
+		{name: "unknown failure", mutate: func(event *registeredEventWire) { event.Failure = "unknown_failure" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := uncertain
+			tc.mutate(&event)
+			if _, err := serve(event).StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0}); err == nil {
+				t.Fatal("malformed failure event was accepted")
+			}
+		})
 	}
 }
 

@@ -84,6 +84,7 @@ type Event struct {
 	SessionID, TurnID, ModelEffectID, Phase, WorkerID, StorageLineageID string
 	AdmissionTaskDigest, TaskEvidenceDigest                             string
 	Verifier                                                            *VerifierEvent
+	Failure                                                             string
 	// Ignored legacy envelope fields retained for source compatibility.
 	Kind, EvidenceRef, AttemptID string
 	Usage                        workledger.Usage
@@ -190,6 +191,24 @@ func retry(classification, message string) workledger.ExecutorResult {
 func validEvent(e Event, binding workledger.SessionBinding, task RegisteredTask) bool {
 	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest != task.Digest || e.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest {
 		return false
+	}
+	return validEventShape(e)
+}
+
+func validEventShape(e Event) bool {
+	if e.Failure != "" {
+		switch e.Failure {
+		case "credential_mint_failed":
+			return e.Phase == "authorized" && e.Verifier == nil
+		case "runtime_failed":
+			return e.Phase == "failed" && e.Verifier == nil
+		case "credential_expired":
+			return e.Phase == "escalated" && e.Verifier == nil
+		case "runtime_outcome_uncertain":
+			return e.Phase == "escalated" && e.Verifier != nil && e.Verifier.Phase == "escalated" && validVerifierResult(e.Verifier)
+		default:
+			return false
+		}
 	}
 	if e.Verifier == nil {
 		switch e.Phase {
