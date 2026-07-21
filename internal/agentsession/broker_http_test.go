@@ -66,13 +66,18 @@ func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
 
 func TestRegisteredTurnRejectsWrongVersionAndExtraFields(t *testing.T) {
 	for _, body := range []string{`{"version":"agentd/registered-turn/v1","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0}`, `{"version":"agentd/registered-turn/v2","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0,"extra":true}`} {
+		called := false
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"lease":` + string(testLeaseJSON(t)) + `,` + body[1:]))
 		}))
 		broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
-		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
+		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "session:work", Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
 			t.Fatal("invalid response accepted")
+		}
+		if !called {
+			t.Fatal("invalid response was not exercised through HTTP")
 		}
 		server.Close()
 	}
