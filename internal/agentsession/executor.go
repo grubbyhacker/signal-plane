@@ -22,7 +22,6 @@ type Broker interface {
 	Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error)
 	Reassign(context.Context, ReassignRequest) (BrokerReassignment, error)
 	ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error)
-	CreateSession(context.Context, CreateSessionRequest) (BrokerSession, error)
 	SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error)
 	StreamEvents(context.Context, StreamEventsRequest) (BrokerEvents, error)
 }
@@ -39,22 +38,30 @@ type ReassignmentStatusRequest struct {
 	BindingKey       string
 	PredecessorEpoch int64
 }
-type CreateSessionRequest struct{ BindingKey string }
 
-// SubmitTurnRequest deliberately contains no task material. The broker derives
-// registered task fields from the snapshot persisted at durable admission.
-type SubmitTurnRequest struct{ BindingKey, IdempotencyKey string }
-type StreamEventsRequest struct {
-	BindingKey string
-	Cursor     int64
+// SubmitTurnRequest is the source-closed registered-lifecycle command. The
+// broker forwards this exact shape to agentd; no prompt or continuation input
+// is selectable by the coordinator.
+type SubmitTurnRequest struct {
+	Version, IdempotencyKey, TaskKind, AdmissionTaskDigest, TaskEvidenceDigest string
+	Parameters                                                                 []byte
 }
+
+// Retained for ancillary broker lifecycle helpers; the coordinator does not
+// create a session before the registered lifecycle submission.
+type CreateSessionRequest struct{ BindingKey string }
 type BrokerSession struct {
 	SessionID string
 	Lease     workledger.SessionLease
 }
+type StreamEventsRequest struct {
+	BindingKey string
+	Cursor     int64
+}
 type BrokerTurn struct {
-	TurnID string
-	Lease  workledger.SessionLease
+	SessionID, TurnID, ModelEffectID string
+	Cursor                           int64
+	Lease                            workledger.SessionLease
 }
 type BrokerEvents struct {
 	Lease  workledger.SessionLease
@@ -72,23 +79,30 @@ type BrokerReassignmentStatus struct {
 	State, ErrorCode     string
 }
 type Event struct {
-	Cursor                       int64
-	Kind, EvidenceRef, SessionID string
-	TurnID, AttemptID            string
+	Cursor, Attempt, FenceEpoch                                         int64
+	SessionID, TurnID, ModelEffectID, Phase, WorkerID, StorageLineageID string
+	AdmissionTaskDigest, TaskEvidenceDigest                             string
+	Verifier                                                            *VerifierEvent
+	// Ignored legacy envelope fields retained for source compatibility.
+	Kind, EvidenceRef, AttemptID string
 	Usage                        workledger.Usage
-	Verifier                     *VerifierEvent
 }
 
 // VerifierEvent is the authenticated agentd verdict.  It deliberately keeps
 // the identity fields separate from EvidenceRef: verdict semantics must never
 // be reconstructed from a hash of an opaque event payload.
 type VerifierEvent struct {
-	WorkItemID, AttemptID, AdmissionTaskDigest                    string
-	VerifierID, CompletionContract, ContractDigest                string
-	TaskEvidenceDigest, HeadRevision, EvaluationRevision, Outcome string
-	WorkerID, SessionID                                           string
-	FenceEpoch                                                    int64
-	ReasonCodes, EvidenceRefs                                     []string
+	Phase              string   `json:"phase"`
+	Outcome            string   `json:"outcome"`
+	HeadRevision       string   `json:"headRevision"`
+	EvaluationRevision string   `json:"evaluationRevision"`
+	ReasonCodes        []string `json:"reasonCodes"`
+	EvidenceRefs       []string `json:"evidenceRefs"`
+	// Ignored legacy envelope fields retained for source compatibility.
+	WorkItemID, AttemptID, AdmissionTaskDigest                         string
+	VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
+	WorkerID, SessionID                                                string
+	FenceEpoch                                                         int64
 }
 
 type Executor struct {
@@ -118,26 +132,21 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	if err != nil {
 		return retry("coordinator_acquire", "authority session unavailable"), nil
 	}
-	if binding.AgentdSessionID == "" {
-		created, err := e.Broker.CreateSession(ctx, CreateSessionRequest{BindingKey: binding.BindingKey})
-		if err != nil || created.SessionID == "" || !sameLease(binding, created.Lease) {
-			return retry("agentd_create", "broker session create unavailable"), nil
-		}
-		if err := e.Store.SetAgentdSession(ctx, request.WorkItem.ID, created.Lease, created.SessionID, e.now()); err != nil {
-			return retry("coordinator_fence", "session binding changed"), nil
-		}
-		binding.AgentdSessionID = created.SessionID
-	}
 	turnID := binding.SubmittedTurnID
 	if binding.SubmittedIdempotencyKey == "" {
-		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, IdempotencyKey: request.Attempt.IdempotencyKey})
-		if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
+		task, taskErr := e.registeredTask(ctx, request)
+		if taskErr != nil {
+			return retry("agentd_submit", "registered task is unavailable"), nil
+		}
+		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: request.Attempt.IdempotencyKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
+		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+request.Attempt.IdempotencyKey || turn.Cursor < 0 || !sameLease(binding, turn.Lease) {
 			return retry("agentd_submit", "broker turn submit unavailable"), nil
 		}
-		if err := e.Store.RecordSubmittedTurn(ctx, request.WorkItem.ID, turn.Lease, request.Attempt.IdempotencyKey, turn.TurnID, e.now()); err != nil {
+		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, request.Attempt.IdempotencyKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.Cursor, e.now()); err != nil {
 			return retry("coordinator_fence", "submitted turn conflicts"), nil
 		}
 		turnID = turn.TurnID
+		binding.AgentdSessionID, binding.ModelEffectID, binding.EventCursor = turn.SessionID, turn.ModelEffectID, turn.Cursor
 	}
 	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, Cursor: binding.EventCursor})
 	if err != nil || !sameLease(binding, batch.Lease) {
@@ -147,14 +156,11 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	next, deadline := now.Add(pollInterval), now.Add(waitDeadline)
 	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turnID, NextAttemptAt: &next, DeadlineAt: &deadline}
 	for _, event := range batch.Events {
-		if !validEvent(event) {
+		if !validEvent(event, binding, request) {
 			return retry("agentd_protocol", "agent event invalid"), nil
 		}
-		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: event.Kind, EvidenceRef: event.EvidenceRef, Usage: event.Usage}, e.now()); err != nil {
+		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_" + event.Phase, EvidenceRef: "agentd:registered-events:" + event.ModelEffectID + ":" + fmt.Sprint(event.Cursor)}, e.now()); err != nil {
 			return retry("coordinator_fence", "agent event rejected"), nil
-		}
-		if event.Kind == "attempt_completed" {
-			result.ResultDigest = event.EvidenceRef
 		}
 		if event.Verifier != nil {
 			if err := e.recordVerifierEvent(ctx, request, binding, event); err != nil {
@@ -169,33 +175,26 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
-func validEvent(e Event) bool {
-	if e.Cursor <= 0 || !knownAgentdEvent(e.Kind) || e.EvidenceRef == "" || !e.Usage.Valid() {
+func validEvent(e Event, binding workledger.SessionBinding, request workledger.ExecutorRequest) bool {
+	if e.Cursor <= 0 || e.Attempt != 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest == "" || e.TaskEvidenceDigest == "" {
 		return false
 	}
-	if e.Verifier == nil {
-		return true
-	}
-	v := e.Verifier
-	return e.SessionID != "" && (e.Kind == "verifier_evaluated" || e.Kind == "verifier_continuation" || e.Kind == "verifier_failed" || e.Kind == "verifier_escalated") &&
-		v.WorkItemID != "" && v.AttemptID != "" && v.AdmissionTaskDigest != "" && v.VerifierID != "" && v.CompletionContract != "" &&
-		v.ContractDigest != "" && v.TaskEvidenceDigest != "" && v.HeadRevision != "" && v.EvaluationRevision != "" &&
-		v.Outcome != "" && v.WorkerID != "" && v.SessionID != "" && v.FenceEpoch > 0 && len(v.EvidenceRefs) > 0
+	return e.Phase == "queued" || (e.Verifier != nil && verifierPhaseMatches(e.Verifier.Phase, e.Verifier.Outcome))
 }
 
 func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.ExecutorRequest, binding workledger.SessionBinding, event Event) error {
 	v := event.Verifier
-	if event.SessionID != binding.AgentdSessionID || event.AttemptID != request.Attempt.ID || event.TurnID == "" || v.WorkItemID != request.WorkItem.ID || v.AttemptID != request.Attempt.ID || v.WorkerID != binding.WorkerID || v.SessionID != binding.AgentdSessionID || v.FenceEpoch != binding.WorkerFenceEpoch {
-		return errors.New("agent verifier event identity does not bind current execution")
-	}
 	task, err := e.registeredTask(ctx, request)
-	if err != nil || v.AdmissionTaskDigest != task.Digest {
+	if err != nil || event.AdmissionTaskDigest != task.Digest {
 		return errors.New("agent verifier event admission identity is stale")
 	}
-	if err := e.RecordGitHubGreenPRResult(ctx, request.WorkItem.ID, workledger.VerifierResult{AttemptID: v.AttemptID, VerifierID: v.VerifierID, CompletionContract: v.CompletionContract, ContractDigest: v.ContractDigest, TaskEvidenceDigest: v.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.EvaluationRevision, Outcome: v.Outcome, ReasonCodes: v.ReasonCodes, EvidenceRefs: v.EvidenceRefs}); err != nil {
+	if err := e.RecordGitHubGreenPRResult(ctx, request.WorkItem.ID, workledger.VerifierResult{AttemptID: request.Attempt.ID, VerifierID: task.Snapshot.VerifierID, CompletionContract: task.Snapshot.CompletionContract, ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: event.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.EvaluationRevision, Outcome: v.Outcome, ReasonCodes: v.ReasonCodes, EvidenceRefs: v.EvidenceRefs}); err != nil {
 		return err
 	}
 	return nil
+}
+func verifierPhaseMatches(phase, outcome string) bool {
+	return (phase == "pending" && outcome == "waiting") || (phase == "green" && outcome == "satisfied") || (phase == "red" && outcome == "escalated") || (phase == "refused" && outcome == "escalated") || (phase == "escalated" && outcome == "escalated")
 }
 func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
 	return l.WorkerID == b.WorkerID && l.WorkerFenceEpoch == b.WorkerFenceEpoch && l.ProfileVersion == b.ProfileVersion && l.PolicyDigest == b.PolicyDigest && l.SessionLineageID == b.SessionLineageID && l.WorkerStorageLineageID == b.WorkerStorageLineageID && l.AuthorityProfile == b.AuthorityProfile

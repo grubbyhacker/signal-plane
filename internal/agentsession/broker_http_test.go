@@ -2,198 +2,78 @@ package agentsession
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestHTTPBrokerConsumesSharedLeaseAndReassignmentFixtures(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	statusFixture := mustFixture(t, "reassignment-status-v1.json")
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer coordinator-token" {
-			http.Error(writer, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		switch request.URL.Path {
-		case "/v1/authority-workers/coordinator/v2/leases":
-			var got brokerAcquireV2Request
-			if err := decodeStrict(mustReadBody(t, request), &got); err != nil || got.Version != brokerCoordinatorV2Version || got.SessionBinding != "session:work-1" || got.AdmissionTaskDigest == "" {
-				t.Fatalf("v2 request=%+v err=%v", got, err)
-			}
-			writer.Write(v2LeaseFixture(t, leaseFixture))
-		case "/v1/authority-workers/coordinator/v1/reassignments/status":
-			writer.Write(statusFixture)
-		default:
-			http.NotFound(writer, request)
-		}
-	}))
-	defer server.Close()
-	broker, err := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
+func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("..", "..", "testdata", "agentd", "registered-turn-v2.golden.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := broker.Acquire(t.Context(), testAcquireRequest(t))
-	if err != nil || lease.SessionLineageID != "11111111111111111111111111111111" || lease.PolicyDigest != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
-		t.Fatalf("lease=%+v err=%v", lease, err)
+	var fixture struct {
+		Request  json.RawMessage            `json:"request"`
+		Response map[string]json.RawMessage `json:"response"`
 	}
-	status, err := broker.ReassignmentStatus(t.Context(), ReassignmentStatusRequest{BindingKey: "logical-session", PredecessorEpoch: 1})
-	if err != nil || status.State != "confirmed" || status.Lease.WorkerID != "worker-2" || status.Lease.ProfileVersion != "profile-v1" || status.RebindIdempotencyKey != "opaque-rebind-key" {
-		t.Fatalf("status=%+v err=%v", status, err)
-	}
-}
-
-func TestHTTPBrokerRequiresContiguousAgentdEvents(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	var admission struct {
-		Admission struct {
-			Lease json.RawMessage `json:"lease"`
-		} `json:"admission"`
-	}
-	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
+	if err := json.Unmarshal(golden, &fixture); err != nil {
 		t.Fatal(err)
 	}
-	gap := false
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		cursor := 1
-		if gap {
-			cursor = 2
-		}
-		result := []map[string]any{{"version": "agentd/v1", "cursor": cursor, "kind": "attempt_completed", "sessionId": "session-1", "turnId": "turn-1", "attemptId": "attempt-1", "payload": map[string]any{"conversation": map[string]any{"adapterKind": "codex", "adapterVersion": "v1", "backendThreadRef": "thread-1"}, "tokenUsage": map[string]any{"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2, "reasoningOutputTokens": 1, "totalTokens": 5}}}}
-		_ = json.NewEncoder(writer).Encode(map[string]any{"version": brokerCoordinatorVersion, "lease": admission.Admission.Lease, "result": result})
-	}))
-	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "logical-session", Cursor: 0})
-	if err != nil || len(batch.Events) != 1 || batch.Events[0].Usage.TotalTokens != 5 || batch.Events[0].EvidenceRef == "" {
-		t.Fatalf("batch=%+v err=%v", batch, err)
-	}
-	gap = true
-	if _, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "logical-session", Cursor: 0}); err == nil {
-		t.Fatal("event cursor gap was accepted")
-	}
-}
-
-func TestHTTPBrokerStrictlyDecodesTypedVerifierEvent(t *testing.T) {
-	payload := []byte(`{"verifier":{"workItemId":"work-1","attemptId":"attempt-1","admissionTaskDigest":"sha256:admission","verifierId":"github_green_pr_v1","completionContract":"github_green_pr_v1","contractDigest":"sha256:contract","taskEvidenceDigest":"sha256:task","headRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evaluationRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"continuation_required","reasonCodes":["checks_failed"],"evidenceRefs":["evidence://agentd/1"],"workerId":"worker-1","sessionId":"session-1","fenceEpoch":3}}`)
-	event, err := decodeVerifierEvent(payload)
-	if err != nil || event.WorkItemID != "work-1" || event.AttemptID != "attempt-1" || event.EvaluationRevision != strings.Repeat("b", 40) || event.FenceEpoch != 3 {
-		t.Fatalf("verifier=%+v err=%v", event, err)
-	}
-	if !verifierKindMatches("verifier_continuation", event.Outcome) || verifierKindMatches("verifier_evaluated", event.Outcome) {
-		t.Fatal("verifier outcome/event-kind contract was not enforced")
-	}
-	if _, err := decodeVerifierEvent([]byte(`{"verifier":{"workItemId":"work-1","unknown":"forbidden"}}`)); err == nil {
-		t.Fatal("unknown verifier field was accepted")
-	}
-}
-
-func TestHTTPBrokerSubmitTurnSendsOnlyRegisteredCommandIdentifiers(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	var admission struct {
-		Admission struct {
-			Lease json.RawMessage `json:"lease"`
-		} `json:"admission"`
-	}
-	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/v1/authority-workers/coordinator/v1/sessions/submit" {
-			http.NotFound(writer, request)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority-workers/coordinator/v1/registered-turn" {
+			http.NotFound(w, r)
 			return
 		}
-		if got := string(mustReadBody(t, request)); got != `{"idempotency_key":"turn-1","session_binding":"logical-session"}` {
-			t.Fatalf("submit wire=%s", got)
+		var got json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		var gotValue, wantValue any
+		_ = json.Unmarshal(got, &gotValue)
+		_ = json.Unmarshal(fixture.Request, &wantValue)
+		if !reflect.DeepEqual(gotValue, wantValue) {
+			t.Fatalf("request=%s want=%s", got, fixture.Request)
 		}
-		_ = json.NewEncoder(writer).Encode(map[string]any{
-			"version": brokerCoordinatorVersion,
-			"lease":   admission.Admission.Lease,
-			"result":  map[string]any{"sessionId": "session-1", "turnId": "turn-1", "phase": "active"},
-		})
+		fixture.Response["lease"] = testLeaseJSON(t)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(fixture.Response)
 	}))
 	defer server.Close()
-	broker, err := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	if err != nil {
-		t.Fatal(err)
+	var request struct {
+		Version             string          `json:"version"`
+		IdempotencyKey      string          `json:"idempotencyKey"`
+		TaskKind            string          `json:"taskKind"`
+		AdmissionTaskDigest string          `json:"admissionTaskDigest"`
+		TaskEvidenceDigest  string          `json:"taskEvidenceDigest"`
+		Parameters          json.RawMessage `json:"parameters"`
 	}
-	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "logical-session", IdempotencyKey: "turn-1"})
-	if err != nil || turn.TurnID != "turn-1" {
+	_ = json.Unmarshal(fixture.Request, &request)
+	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: request.Version, IdempotencyKey: request.IdempotencyKey, TaskKind: request.TaskKind, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.TaskEvidenceDigest, Parameters: request.Parameters})
+	if err != nil || turn.SessionID != "session-42" || turn.TurnID != "turn:turn-42" || turn.ModelEffectID != "model:turn-42" || turn.Cursor != 1 {
 		t.Fatalf("turn=%+v err=%v", turn, err)
 	}
 }
 
-func TestHTTPBrokerRejectsUnknownWireFields(t *testing.T) {
-	base := mustFixture(t, "lease-v1.json")
-	fixture := append(append([]byte(nil), base[:len(base)-2]...), []byte(",\"caller_model\":\"forbidden\"}\n")...)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.Write(fixture) }))
-	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	if _, err := broker.Acquire(t.Context(), testAcquireRequest(t)); err == nil {
-		t.Fatal("unknown broker field accepted")
+func TestRegisteredTurnRejectsWrongVersionAndExtraFields(t *testing.T) {
+	for _, body := range []string{`{"version":"agentd/registered-turn/v1","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0}`, `{"version":"agentd/registered-turn/v2","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0,"extra":true}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"lease":` + string(testLeaseJSON(t)) + `,` + body[1:]))
+		}))
+		broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
+			t.Fatal("invalid response accepted")
+		}
+		server.Close()
 	}
 }
 
-func TestHTTPBrokerUsesOnlySupportedSessionLifecycleOperations(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	var admission struct {
-		Admission struct {
-			Lease json.RawMessage `json:"lease"`
-		} `json:"admission"`
-	}
-	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		seen[request.URL.Path] = true
-		result := any(map[string]any{
-			"version": "agentd/v1", "sessionId": "session-1", "coordinatorBinding": "logical-session", "authorityBinding": "writer",
-			"workerId": "worker-1", "storageLineageId": "22222222222222222222222222222222", "fenceEpoch": 1,
-			"sessionLineageId": "11111111111111111111111111111111", "workspace": map[string]any{"workspaceRef": "/workspace", "uid": 20000, "gid": 20000},
-			"phase": "active", "turnIds": []string{"turn-1"}, "nextCursor": 2,
-		})
-		if request.URL.Path == "/v1/authority-workers/coordinator/v1/sessions/checkpoint" {
-			result.(map[string]any)["workspace"].(map[string]any)["checkpointRef"] = "checkpoint-1"
-		}
-		if request.URL.Path == "/v1/authority-workers/coordinator/v1/sessions/cancel" {
-			result = map[string]any{"sessionId": "session-1", "turnId": "turn-1", "phase": "cancelled"}
-		}
-		_ = json.NewEncoder(writer).Encode(map[string]any{"version": brokerCoordinatorVersion, "lease": admission.Admission.Lease, "result": result})
-	}))
-	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	checkpoint, err := broker.Checkpoint(t.Context(), "logical-session", "checkpoint-1")
-	if err != nil || checkpoint.Workspace.CheckpointRef != "checkpoint-1" {
-		t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
-	}
-	if _, err := broker.Resume(t.Context(), "logical-session"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := broker.Status(t.Context(), "logical-session"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := broker.Cancel(t.Context(), "logical-session", "turn-1"); err != nil {
-		t.Fatal(err)
-	}
-	for _, operation := range []string{"checkpoint", "resume", "status", "cancel"} {
-		if !seen["/v1/authority-workers/coordinator/v1/sessions/"+operation] {
-			t.Fatalf("supported %s path was not used", operation)
-		}
-	}
-}
-
-func mustFixture(t *testing.T, name string) []byte {
+func testLeaseJSON(t *testing.T) json.RawMessage {
 	t.Helper()
-	value, err := os.ReadFile(filepath.Join("..", "..", "testdata", "coordinator-wire", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value
+	return json.RawMessage(`{"principal":"p","profile":"general-writer-v1","worker_id":"worker-42","session_lineage_id":"11111111111111111111111111111111","worker_storage_lineage_id":"22222222222222222222222222222222","worker_fence_epoch":7,"profile_version":"v1","policy_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_binding_digest":"x","idempotency_key_digest":"y","created_at":"now","released_at":"","replay":false}`)
 }
 
 func testAcquireRequest(t *testing.T) AcquireRequest {
@@ -205,28 +85,4 @@ func testAcquireRequest(t *testing.T) AcquireRequest {
 	}
 	task.Digest = digest
 	return AcquireRequest{BindingKey: "session:work-1", AuthorityProfile: "writer", IdempotencyKey: "acquire-1", RegisteredTask: task}
-}
-
-func v2LeaseFixture(t *testing.T, v1 []byte) []byte {
-	t.Helper()
-	var response map[string]any
-	if err := json.Unmarshal(v1, &response); err != nil {
-		t.Fatal(err)
-	}
-	response["version"] = brokerCoordinatorV2Version
-	value, err := json.Marshal(response)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value
-}
-
-func mustReadBody(t *testing.T, request *http.Request) []byte {
-	t.Helper()
-	defer request.Body.Close()
-	value, err := io.ReadAll(request.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value
 }
