@@ -16,95 +16,80 @@ import (
 )
 
 const (
-	RepositoryChangeTaskKind     = "repository_change_v1"
-	RepositoryCompletionContract = "repository_state_v1"
-	NeutralRepositoryID          = "neutral/repository-proof"
-	repositoryContractDocument   = `{"budget":{"maxContinuations":1,"maxModelTurns":3,"maxRuntimeMs":1200000,"maxTotalTokens":250000,"perTurnTimeoutMs":600000,"wallClockDeadlineMs":1800000},"completionContract":"repository_state_v1","parameterSchema":"neutral_repository_change_v1","reasonCodes":["base_revision_mismatch","branch_mismatch","evidence_ambiguous","forbidden_action","head_not_advanced","head_not_reachable","ignored_state","untracked_state","validation_missing","validation_stale","worktree_dirty"],"taskKind":"repository_change_v1","verifierId":"repository_state_v1","version":"1.0.0"}`
+	GitHubGreenPRTaskKind   = "github_green_pr_v1"
+	GitHubGreenPRContract   = "github_green_pr_v1"
+	GitHubGreenPRRepository = "grubbyhacker/repository-worker-lifecycle-test"
+	gitHubGreenPRDocument   = `{"budget":{"maxContinuations":1,"maxModelTurns":2,"maxRuntimeMs":1200000,"maxTotalTokens":250000,"perTurnTimeoutMs":600000,"wallClockDeadlineMs":1800000},"completionContract":"github_green_pr_v1","parameterSchema":"github_green_pr_v1","taskKind":"github_green_pr_v1","verifierId":"github_green_pr_v1","version":"1.0.0"}`
 )
 
-var repositoryVerifierReasons = map[string]struct{}{
-	"base_revision_mismatch": {}, "branch_mismatch": {}, "evidence_ambiguous": {},
-	"forbidden_action": {}, "head_not_advanced": {}, "head_not_reachable": {},
-	"ignored_state": {}, "untracked_state": {}, "validation_missing": {},
-	"validation_stale": {}, "worktree_dirty": {},
-}
-
 func init() {
-	sum := sha256.Sum256([]byte(repositoryContractDocument))
-	if "sha256:"+hex.EncodeToString(sum[:]) != repositoryContractDigest {
-		panic("repository contract document digest drift")
+	sum := sha256.Sum256([]byte(gitHubGreenPRDocument))
+	if "sha256:"+hex.EncodeToString(sum[:]) != gitHubGreenPRDigest {
+		panic("github green PR contract document digest drift")
 	}
 }
 
-type RepositoryChangeParameters struct {
-	RepositoryID        string `json:"repositoryId"`
-	BaseRevision        string `json:"baseRevision"`
-	BranchRef           string `json:"branchRef"`
-	ValidationSelection string `json:"validationSelection"`
+type GitHubGreenPRParameters struct {
+	Repository string `json:"repository"`
+	BaseBranch string `json:"baseBranch"`
+	BranchRef  string `json:"branchRef"`
 }
 
-type RepositoryChangeTask struct{}
+type GitHubGreenPRTask struct{}
 
-func (RepositoryChangeTask) Descriptor() workledger.TaskDescriptor {
+func (GitHubGreenPRTask) Descriptor() workledger.TaskDescriptor {
 	return workledger.TaskDescriptor{
-		Kind:               RepositoryChangeTaskKind,
+		Kind:               GitHubGreenPRTaskKind,
 		Version:            "1.0.0",
-		CompletionContract: RepositoryCompletionContract,
-		VerifierID:         RepositoryCompletionContract,
-		ContractDigest:     repositoryContractDigest,
+		CompletionContract: GitHubGreenPRContract,
+		VerifierID:         GitHubGreenPRContract,
+		ContractDigest:     gitHubGreenPRDigest,
 	}
 }
 
-func (RepositoryChangeTask) ValidateAdmission(admission workledger.AdmissionPolicy) error {
+func (GitHubGreenPRTask) ValidateAdmission(admission workledger.AdmissionPolicy) error {
 	if !reflect.DeepEqual(admission.Sources, []string{"manual"}) ||
-		!reflect.DeepEqual(admission.Namespaces, []string{NeutralRepositoryID}) ||
+		!reflect.DeepEqual(admission.Namespaces, []string{GitHubGreenPRRepository}) ||
 		!reflect.DeepEqual(admission.ObjectKinds, []string{"repository_task"}) ||
 		!reflect.DeepEqual(admission.Events, []string{"repository_change"}) ||
 		!reflect.DeepEqual(admission.Actions, []string{"requested"}) {
-		return errors.New("repository_change_v1 is restricted to the neutral manual staging route")
+		return errors.New("github_green_pr_v1 is restricted to the registered manual route")
 	}
 	return nil
 }
 
-func (RepositoryChangeTask) CanonicalizeParameters(raw json.RawMessage) (json.RawMessage, error) {
+func (GitHubGreenPRTask) CanonicalizeParameters(raw json.RawMessage) (json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	var parameters RepositoryChangeParameters
+	var parameters GitHubGreenPRParameters
 	if err := decoder.Decode(&parameters); err != nil {
-		return nil, fmt.Errorf("decode repository task parameters: %w", err)
+		return nil, fmt.Errorf("decode github green PR task parameters: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, errors.New("repository task parameters contain trailing content")
+		return nil, errors.New("github green PR task parameters contain trailing content")
 	}
-	if parameters.RepositoryID != NeutralRepositoryID ||
-		!regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(parameters.BaseRevision) ||
-		!regexp.MustCompile(`^agent/repository-proof/[a-z0-9][a-z0-9-]{0,62}$`).MatchString(parameters.BranchRef) ||
-		parameters.ValidationSelection != "required" {
-		return nil, errors.New("repository task parameters are outside the reviewed neutral contract")
+	if parameters.Repository != GitHubGreenPRRepository ||
+		parameters.BaseBranch != "main" ||
+		!regexp.MustCompile(`^agent/fleiglabs-repo-agent/[a-z0-9][a-z0-9-]{0,62}$`).MatchString(parameters.BranchRef) {
+		return nil, errors.New("github green PR task parameters are outside the registered contract")
 	}
 	canonical, err := json.Marshal(parameters)
 	return json.RawMessage(canonical), err
 }
 
-func NeutralRepositoryTaskSelection(baseRevision, branchRef string) *workledger.TaskSelection {
-	parameters, _ := json.Marshal(RepositoryChangeParameters{
-		RepositoryID:        NeutralRepositoryID,
-		BaseRevision:        baseRevision,
-		BranchRef:           branchRef,
-		ValidationSelection: "required",
+func GitHubGreenPRTaskSelection(branchRef string) *workledger.TaskSelection {
+	parameters, _ := json.Marshal(GitHubGreenPRParameters{
+		Repository: GitHubGreenPRRepository,
+		BaseBranch: "main",
+		BranchRef:  branchRef,
 	})
-	return &workledger.TaskSelection{Kind: RepositoryChangeTaskKind, Parameters: parameters}
+	return &workledger.TaskSelection{Kind: GitHubGreenPRTaskKind, Parameters: parameters}
 }
 
-func (e *Executor) RecordRepositoryVerifierResult(ctx context.Context, workItemID string, result workledger.VerifierResult) error {
-	if e.Store == nil || result.VerifierID != RepositoryCompletionContract || result.CompletionContract != RepositoryCompletionContract {
-		return errors.New("registered repository verifier is required")
-	}
-	for _, reason := range result.ReasonCodes {
-		if _, ok := repositoryVerifierReasons[reason]; !ok {
-			return fmt.Errorf("unregistered verifier reason %q", reason)
-		}
+func (e *Executor) RecordGitHubGreenPRResult(ctx context.Context, workItemID string, result workledger.VerifierResult) error {
+	if e.Store == nil || result.VerifierID != GitHubGreenPRContract || result.CompletionContract != GitHubGreenPRContract {
+		return errors.New("registered github green PR observation is required")
 	}
 	return e.Store.RecordVerifierResult(ctx, workItemID, result, 1, e.now())
 }

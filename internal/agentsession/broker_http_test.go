@@ -184,7 +184,7 @@ func mustFixture(t *testing.T, name string) []byte {
 
 func testAcquireRequest(t *testing.T) AcquireRequest {
 	t.Helper()
-	task := RegisteredTask{Source: RegisteredTaskSource{WorkItemID: "work-1", RouteSnapshotID: "route-1"}, Snapshot: RegisteredTaskSnapshot{TaskKind: RepositoryChangeTaskKind, TaskVersion: "1.0.0", CompletionContract: RepositoryCompletionContract, VerifierID: RepositoryCompletionContract, ContractDigest: repositoryContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: []byte(`{"repositoryId":"neutral/repository-proof","baseRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branchRef":"agent/repository-proof/test","validationSelection":"required"}`)}}
+	task := RegisteredTask{Source: RegisteredTaskSource{WorkItemID: "work-1", RouteSnapshotID: "route-1"}, Snapshot: RegisteredTaskSnapshot{TaskKind: GitHubGreenPRTaskKind, TaskVersion: "1.0.0", CompletionContract: GitHubGreenPRContract, VerifierID: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: []byte(`{"repository":"grubbyhacker/repository-worker-lifecycle-test","baseBranch":"main","branchRef":"agent/fleiglabs-repo-agent/test"}`)}}
 	digest, err := admissionTaskDigest(task.Source, task.Snapshot)
 	if err != nil {
 		t.Fatal(err)

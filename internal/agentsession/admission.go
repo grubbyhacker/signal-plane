@@ -15,7 +15,7 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
-const repositoryContractDigest = "sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102"
+const gitHubGreenPRDigest = "sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb"
 
 var sha256Digest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
@@ -79,10 +79,10 @@ func (task RegisteredTask) Validate(binding string) error {
 	if !boundedID(task.Source.WorkItemID) || !boundedID(task.Source.RouteSnapshotID) || !utf8.ValidString(task.Source.WorkItemID) || !utf8.ValidString(task.Source.RouteSnapshotID) || binding != "session:"+task.Source.WorkItemID {
 		return errors.New("registered task source or session binding is invalid")
 	}
-	if task.Snapshot.TaskKind != RepositoryChangeTaskKind || task.Snapshot.TaskVersion != "1.0.0" || task.Snapshot.CompletionContract != RepositoryCompletionContract || task.Snapshot.VerifierID != RepositoryCompletionContract || task.Snapshot.ContractDigest != repositoryContractDigest || !sha256Digest.MatchString(task.Snapshot.TaskEvidenceDigest) {
+	if task.Snapshot.TaskKind != GitHubGreenPRTaskKind || task.Snapshot.TaskVersion != "1.0.0" || task.Snapshot.CompletionContract != GitHubGreenPRContract || task.Snapshot.VerifierID != GitHubGreenPRContract || task.Snapshot.ContractDigest != gitHubGreenPRDigest || !sha256Digest.MatchString(task.Snapshot.TaskEvidenceDigest) {
 		return errors.New("registered task descriptor is outside the locked contract")
 	}
-	canonical, err := (RepositoryChangeTask{}).CanonicalizeParameters(task.Snapshot.Parameters)
+	canonical, err := (GitHubGreenPRTask{}).CanonicalizeParameters(task.Snapshot.Parameters)
 	if err != nil || string(canonical) != string(task.Snapshot.Parameters) {
 		return errors.New("registered task parameters are not canonical")
 	}
@@ -110,7 +110,7 @@ func admissionTaskDigest(source RegisteredTaskSource, task RegisteredTaskSnapsho
 }
 
 func jcsObjectFromJSON(raw []byte) (string, error) {
-	var parameters RepositoryChangeParameters
+	var parameters GitHubGreenPRParameters
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&parameters); err != nil {
@@ -120,10 +120,10 @@ func jcsObjectFromJSON(raw []byte) (string, error) {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return "", errors.New("parameters contain trailing content")
 	}
-	if parameters.RepositoryID == "" || parameters.BaseRevision == "" || parameters.BranchRef == "" || parameters.ValidationSelection == "" {
+	if parameters.Repository == "" || parameters.BaseBranch == "" || parameters.BranchRef == "" {
 		return "", errors.New("incomplete parameters")
 	}
-	return `{"baseRevision":` + jcsString(parameters.BaseRevision) + `,"branchRef":` + jcsString(parameters.BranchRef) + `,"repositoryId":` + jcsString(parameters.RepositoryID) + `,"validationSelection":` + jcsString(parameters.ValidationSelection) + `}`, nil
+	return `{"baseBranch":` + jcsString(parameters.BaseBranch) + `,"branchRef":` + jcsString(parameters.BranchRef) + `,"repository":` + jcsString(parameters.Repository) + `}`, nil
 }
 
 func jcsString(value string) string {

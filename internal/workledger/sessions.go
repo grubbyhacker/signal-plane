@@ -391,7 +391,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	if maxContinuations < 0 || maxContinuations > 8 {
 		return errors.New("verifier continuation bound is invalid")
 	}
-	if result.Outcome != "satisfied" && result.Outcome != "missing_or_stale" && result.Outcome != "continuation" && result.Outcome != "escalated" {
+	if result.Outcome != "waiting" && result.Outcome != "continuation_required" && result.Outcome != "satisfied" && result.Outcome != "escalated" {
 		return errors.New("unknown verifier outcome")
 	}
 	if result.AttemptID == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(result.HeadRevision) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || result.TaskEvidenceDigest == "" || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 || len(result.ReasonCodes) > 32 {
@@ -457,7 +457,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 				return errors.New("satisfied verifier result requires durable runtime completion evidence")
 			}
 		}
-		if result.Outcome == "continuation" || result.Outcome == "missing_or_stale" {
+		if result.Outcome == "continuation_required" {
 			if continuations >= maxContinuations {
 				result.Outcome = "escalated"
 			} else {
@@ -474,7 +474,9 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		switch result.Outcome {
 		case "satisfied":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateCompleted, continuations, millis(now), millis(now), workItemID, StateWaiting)
-		case "continuation", "missing_or_stale":
+		case "waiting":
+			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,updated_at=? WHERE id=? AND state=?`, millis(now), workItemID, StateWaiting)
+		case "continuation_required":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		case "escalated":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateFailed, continuations, millis(now), millis(now), workItemID, StateWaiting)

@@ -112,7 +112,7 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := future.Exec(`PRAGMA user_version=11`); err != nil {
+	if _, err := future.Exec(`PRAGMA user_version=12`); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.Close(); err != nil {
@@ -159,6 +159,28 @@ func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != SchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestMigrationFromV10ReplacesVerifierOutcomeSchema(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v10.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE verifier_results (work_item_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('satisfied','missing_or_stale','continuation','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL); PRAGMA user_version=10`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var definition string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='verifier_results'`).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(definition, "'waiting','continuation_required','satisfied','escalated'") {
+		t.Fatalf("verifier outcome schema=%s", definition)
 	}
 }
 

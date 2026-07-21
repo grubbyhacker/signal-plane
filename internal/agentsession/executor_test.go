@@ -78,15 +78,15 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 	if err := registry.Register(&Executor{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.RegisterTask(RepositoryChangeTask{}); err != nil {
+	if err := registry.RegisterTask(GitHubGreenPRTask{}); err != nil {
 		t.Fatal(err)
 	}
-	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/repository-proof/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{NeutralRepositoryID}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
+	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: GitHubGreenPRTaskSelection("agent/fleiglabs-repo-agent/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{GitHubGreenPRRepository}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
 	snap, err := store.ActivateRoute(context.Background(), route, registry, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: NeutralRepositoryID, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:" + strings.Repeat("b", 64), EvidenceRef: "nats://signals", ReceivedAt: now}
+	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: GitHubGreenPRRepository, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:" + strings.Repeat("b", 64), EvidenceRef: "nats://signals", ReceivedAt: now}
 	if _, err := store.Admit(context.Background(), snap.ID, event, now); err != nil {
 		t.Fatal(err)
 	}
@@ -372,8 +372,8 @@ func TestVerifierReceiptSurvivesRestartWithoutConsumingContinuationTwice(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/restart"}}
-	if err := (&Executor{Store: store, Now: func() time.Time { return now }}).RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
+	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation_required", ReasonCodes: []string{"missing"}, EvidenceRefs: []string{"evidence://verification/restart"}}
+	if err := (&Executor{Store: store, Now: func() time.Time { return now }}).RecordGitHubGreenPRResult(ctx, item.ID, result); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -385,12 +385,12 @@ func TestVerifierReceiptSurvivesRestartWithoutConsumingContinuationTwice(t *test
 	}
 	defer store.Close()
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, result); err != nil {
 		t.Fatalf("exact verifier replay after restart failed: %v", err)
 	}
 	conflict := result
 	conflict.HeadRevision = strings.Repeat("c", 40)
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, conflict); err == nil {
 		t.Fatal("conflicting verifier replay after restart was accepted")
 	}
 	if _, _, ok, err := store.Claim(ctx, now); err != nil || !ok {
@@ -416,16 +416,16 @@ func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation_required", ReasonCodes: []string{"missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, continuation); err != nil {
 		t.Fatalf("exact verifier replay was not idempotent: %v", err)
 	}
 	conflict := continuation
 	conflict.EvidenceRefs = []string{"evidence://verification/conflict"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, conflict); err == nil {
 		t.Fatal("conflicting verifier replay was accepted")
 	}
 	_, secondAttempt, ok, err := store.Claim(ctx, now)
@@ -437,20 +437,59 @@ func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
 	}
 	stale := continuation
 	stale.TaskEvidenceDigest = "sha256:stale"
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, stale); err == nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, stale); err == nil {
 		t.Fatal("stale verifier evidence accepted")
 	}
 	satisfied := continuation
 	satisfied.AttemptID = secondAttempt.ID
 	satisfied.Outcome, satisfied.ReasonCodes, satisfied.EvidenceRefs = "satisfied", nil, []string{"evidence://verification/2"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, satisfied); err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, satisfied); err != nil {
 		t.Fatalf("terminal verifier replay was not idempotent: %v", err)
 	}
 	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
 		t.Fatalf("satisfied work remained claimable: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestGitHubGreenPRWaitingDoesNotSpendContinuation(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &Executor{Store: store, Now: func() time.Time { return now }}
+	waiting := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "waiting", ReasonCodes: []string{"pending"}, EvidenceRefs: []string{"evidence://github/pending"}}
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, waiting); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
+		t.Fatalf("waiting observation did not remain pollable: %v", err)
+	}
+	_, pollAttempt, ok, err := store.Claim(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("poll wake was not claimable: ok=%v err=%v", ok, err)
+	}
+	if err := store.Complete(ctx, pollAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	continuation := waiting
+	continuation.AttemptID = pollAttempt.ID
+	continuation.Outcome = "continuation_required"
+	continuation.ReasonCodes = []string{"failed"}
+	continuation.EvidenceRefs = []string{"evidence://github/failed"}
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, continuation); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := store.Claim(ctx, now); err != nil || !ok {
+		t.Fatalf("waiting observation consumed the one continuation: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -488,7 +527,7 @@ func TestNamedVerifierCannotSatisfyWithoutDurableRuntimeCompletion(t *testing.T)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
 	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err == nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, result); err == nil {
 		t.Fatal("verifier satisfied work without a durable attempt_completed event")
 	}
 }
@@ -511,8 +550,8 @@ func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) 
 		t.Fatal(err)
 	}
 	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation_required", ReasonCodes: []string{"missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
 	}
 	_, secondAttempt, ok, err := store.Claim(ctx, now)
@@ -524,7 +563,7 @@ func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) 
 	}
 	continuation.AttemptID = secondAttempt.ID
 	continuation.EvidenceRefs = []string{"evidence://verification/2"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
+	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, continuation); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
