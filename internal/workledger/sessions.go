@@ -10,15 +10,20 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 )
 
+const durablePollInterval = 5 * time.Second
+const durableWaitDeadline = 30 * time.Minute
+
 type SessionBinding struct {
-	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest string
-	SessionLineageID, WorkerID, WorkerStorageLineageID                     string
-	AgentdSessionID, CheckpointRef, State                                  string
-	EventCursor, WorkerFenceEpoch                                          int64
-	CreatedAt, UpdatedAt                                                   time.Time
+	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest                            string
+	SessionLineageID, WorkerID, WorkerStorageLineageID                                                string
+	AgentdSessionID, CheckpointRef, State                                                             string
+	RegisteredSubmitKey, SubmittedIdempotencyKey, ModelEffectID, ActiveModelEffectID, SubmittedTurnID string
+	EventCursor, WorkerFenceEpoch, ActiveEffectAttempt                                                int64
+	CreatedAt, UpdatedAt                                                                              time.Time
 }
 
 type SessionLease struct {
@@ -33,6 +38,15 @@ type CoordinatorEvent struct {
 	WorkerID, Kind, EvidenceRef string
 	WorkerFenceEpoch            int64
 	Usage                       Usage
+}
+
+// RegisteredCoordinatorEvent is an authenticated registered-lifecycle event.
+// Its effect identity is kept separately from the immutable submitted root.
+type RegisteredCoordinatorEvent struct {
+	CoordinatorEvent
+	ModelEffectID string
+	Attempt       int64
+	Phase         string
 }
 
 type ReassignmentPhase string
@@ -55,9 +69,15 @@ type Reassignment struct {
 }
 
 type VerifierResult struct {
-	AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-	HeadRevision, Outcome                                                         string
-	ReasonCodes, EvidenceRefs                                                     []string
+	AttemptID, ContractDigest, TaskEvidenceDigest string
+	// EvaluationRevision is the durable representation projection of the
+	// package headRevision, not a provider fact.
+	HeadRevision, EvaluationRevision, Outcome string
+	ReasonCodes, EvidenceRefs                 []string
+}
+
+func boundedVerifierRevision(value string) bool {
+	return value != "" && len(value) <= 512 && !strings.ContainsAny(value, "\r\n")
 }
 
 func (u Usage) Valid() bool {
@@ -115,16 +135,66 @@ func sameSessionLease(binding SessionBinding, lease SessionLease) bool {
 func (store *Store) SessionBinding(ctx context.Context, workItemID string) (SessionBinding, error) {
 	var binding SessionBinding
 	var created, updated int64
-	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
+	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,registered_submit_key,submitted_idempotency_key,model_effect_id,active_model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),active_effect_attempt,state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
 		&binding.WorkItemID, &binding.BindingKey, &binding.AuthorityProfile, &binding.ProfileVersion, &binding.PolicyDigest,
 		&binding.SessionLineageID, &binding.WorkerID, &binding.WorkerStorageLineageID, &binding.WorkerFenceEpoch,
-		&binding.AgentdSessionID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
+		&binding.AgentdSessionID, &binding.RegisteredSubmitKey, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.ActiveModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.ActiveEffectAttempt, &binding.State, &created, &updated,
 	)
 	if err != nil {
 		return SessionBinding{}, err
 	}
 	binding.CreatedAt, binding.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	return binding, nil
+}
+
+// BindRegisteredSubmitKey durably reserves the one broker idempotency key for
+// this fenced work-item binding before the registered-turn network effect.
+func (store *Store) BindRegisteredSubmitKey(ctx context.Context, workItemID string, lease SessionLease, key string, now time.Time) (SessionBinding, error) {
+	if key == "" || !validLease(lease) {
+		return SessionBinding{}, errors.New("registered submit key requires a complete fenced binding")
+	}
+	_, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET registered_submit_key=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND registered_submit_key=''`, key, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	if err != nil {
+		return SessionBinding{}, err
+	}
+	binding, err := store.SessionBinding(ctx, workItemID)
+	if err != nil {
+		return SessionBinding{}, err
+	}
+	if !sameSessionLease(binding, lease) || binding.RegisteredSubmitKey != key {
+		return SessionBinding{}, errors.New("registered submit key conflicts with durable binding")
+	}
+	return binding, nil
+}
+
+// RecordSubmittedTurn persists the relationship between the Signal attempt
+// submission key and agentd's distinct canonical effect model:<key>.
+func (store *Store) RecordSubmittedTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, turnID string, now time.Time) error {
+	return store.RecordRegisteredTurn(ctx, workItemID, lease, idempotencyKey, "legacy-session", turnID, "model:"+idempotencyKey, 0, now)
+}
+
+// RecordRegisteredTurn durably records the exact agentd v2 acceptance mapping
+// before the coordinator schedules any poll. A restart therefore polls after
+// the persisted cursor and never submits or continues the model turn again.
+func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, sessionID, turnID, modelEffectID string, cursor int64, now time.Time) error {
+	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || cursor <= 0 || !validLease(lease) {
+		return errors.New("submitted turn identity is incomplete")
+	}
+	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,active_model_effect_id=?,active_effect_attempt=0,submitted_turn_id=?,event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, modelEffectID, turnID, cursor, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed == 1 {
+		return nil
+	}
+	binding, err := store.SessionBinding(ctx, workItemID)
+	if err != nil {
+		return err
+	}
+	if !sameSessionLease(binding, lease) || binding.AgentdSessionID != sessionID || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.ActiveModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID || binding.EventCursor != cursor {
+		return errors.New("submitted turn conflicts with durable model effect")
+	}
+	return nil
 }
 
 func (store *Store) RoutingReady(ctx context.Context, workItemID string) error {
@@ -194,6 +264,70 @@ func (store *Store) RecordCoordinatorEvent(ctx context.Context, workItemID strin
 		changed, _ = result.RowsAffected()
 		if changed != 1 {
 			return errors.New("coordinator cursor CAS lost")
+		}
+		inserted = true
+		return nil
+	})
+	return inserted, err
+}
+
+// RecordRegisteredCoordinatorEvent appends an exact ordered event and, only
+// for the authorized next continuation, advances the durable active effect.
+// The root model effect in session_bindings is intentionally never updated.
+func (store *Store) RecordRegisteredCoordinatorEvent(ctx context.Context, workItemID string, event RegisteredCoordinatorEvent, now time.Time) (bool, error) {
+	if event.Cursor <= 0 || event.WorkerID == "" || event.WorkerFenceEpoch <= 0 || event.Kind == "" || event.ModelEffectID == "" || event.Attempt < 0 || event.Phase == "" || !event.Usage.Valid() {
+		return false, errors.New("invalid registered coordinator event")
+	}
+	inserted := false
+	err := store.immediate(ctx, func(conn *sql.Conn) error {
+		var key, worker, profileVersion, policyDigest, storageLineage, rootEffect, activeEffect string
+		var epoch, cursor, activeAttempt int64
+		if err := conn.QueryRowContext(ctx, `SELECT binding_key,worker_id,profile_version,policy_digest,worker_storage_lineage_id,worker_fence_epoch,CAST(event_cursor AS INTEGER),model_effect_id,active_model_effect_id,active_effect_attempt FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&key, &worker, &profileVersion, &policyDigest, &storageLineage, &epoch, &cursor, &rootEffect, &activeEffect, &activeAttempt); err != nil {
+			return err
+		}
+		if worker != event.WorkerID || epoch != event.WorkerFenceEpoch {
+			return errors.New("stale predecessor event rejected")
+		}
+		if event.Cursor <= cursor {
+			return store.matchCoordinatorEvent(ctx, conn, key, event.CoordinatorEvent)
+		}
+		if event.Cursor != cursor+1 {
+			return fmt.Errorf("coordinator event cursor gap: got %d after %d", event.Cursor, cursor)
+		}
+		if activeEffect == "" {
+			return errors.New("registered event active model effect is missing")
+		}
+		advance := event.ModelEffectID != activeEffect
+		if advance {
+			if activeEffect != rootEffect {
+				return errors.New("registered continuation effect already advanced")
+			}
+			var outcome string
+			if err := conn.QueryRowContext(ctx, `SELECT outcome FROM verifier_results WHERE work_item_id=?`, workItemID).Scan(&outcome); err != nil || outcome != "continuation_required" {
+				return errors.New("continuation effect lacks a durable root continuation verdict")
+			}
+			if event.Phase != "authorized" || event.Attempt != activeAttempt+1 {
+				return errors.New("continuation effect progression is invalid")
+			}
+		} else if event.Attempt < activeAttempt || event.Attempt > activeAttempt+1 {
+			return errors.New("registered event attempt progression is invalid")
+		}
+		result, err := conn.ExecContext(ctx, `INSERT INTO coordinator_events(binding_key,cursor,worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, key, event.Cursor, event.WorkerID, event.WorkerFenceEpoch, event.Kind, event.EvidenceRef, event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.OutputTokens, event.Usage.ReasoningOutputTokens, event.Usage.TotalTokens, millis(now))
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("coordinator event insert lost")
+		}
+		if advance {
+			activeEffect = event.ModelEffectID
+		}
+		result, err = conn.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=?,active_model_effect_id=?,active_effect_attempt=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND worker_storage_lineage_id=? AND event_cursor=?`, event.Cursor, activeEffect, event.Attempt, millis(now), workItemID, event.WorkerID, event.WorkerFenceEpoch, profileVersion, policyDigest, storageLineage, cursor)
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("registered coordinator cursor CAS lost")
 		}
 		inserted = true
 		return nil
@@ -387,14 +521,11 @@ func (store *Store) CoordinatorUsage(ctx context.Context, workItemID string) (us
 	return
 }
 
-func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string, result VerifierResult, maxContinuations int, now time.Time) error {
-	if maxContinuations < 0 || maxContinuations > 8 {
-		return errors.New("verifier continuation bound is invalid")
-	}
-	if result.Outcome != "satisfied" && result.Outcome != "missing_or_stale" && result.Outcome != "continuation" && result.Outcome != "escalated" {
+func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string, result VerifierResult, now time.Time) error {
+	if result.Outcome != "waiting" && result.Outcome != "continuation_required" && result.Outcome != "satisfied" && result.Outcome != "escalated" {
 		return errors.New("unknown verifier outcome")
 	}
-	if result.AttemptID == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(result.HeadRevision) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || result.TaskEvidenceDigest == "" || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 || len(result.ReasonCodes) > 32 {
+	if result.AttemptID == "" || !boundedVerifierRevision(result.HeadRevision) || result.EvaluationRevision != result.HeadRevision || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.TaskEvidenceDigest) || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 {
 		return errors.New("verifier result identity is incomplete")
 	}
 	if result.Outcome == "satisfied" && len(result.ReasonCodes) != 0 {
@@ -411,10 +542,10 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	reasonJSON, _ := json.Marshal(reasons)
 	evidenceJSON, _ := json.Marshal(evidence)
 	identityJSON, _ := json.Marshal(struct {
-		AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-		HeadRevision, Outcome                                                         string
-		ReasonCodes, EvidenceRefs                                                     []string
-	}{result.AttemptID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, reasons, evidence})
+		AttemptID, ContractDigest, TaskEvidenceDigest string
+		HeadRevision, EvaluationRevision, Outcome     string
+		ReasonCodes, EvidenceRefs                     []string
+	}{result.AttemptID, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, reasons, evidence})
 	resultDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(identityJSON))
 	return store.immediate(ctx, func(conn *sql.Conn) error {
 		var verifierID, contract, digest, taskEvidence, state string
@@ -423,7 +554,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if err != nil {
 			return err
 		}
-		if verifierID != result.VerifierID || contract != result.CompletionContract || digest != result.ContractDigest || taskEvidence != result.TaskEvidenceDigest {
+		if digest != result.ContractDigest || taskEvidence != result.TaskEvidenceDigest {
 			return errors.New("stale verifier result rejected")
 		}
 		var priorAttemptID string
@@ -435,8 +566,8 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 			return err
 		}
 		var attemptState, receiptDigest string
-		if err := conn.QueryRowContext(ctx, `SELECT state FROM executor_attempts WHERE id=? AND work_item_id=?`, result.AttemptID, workItemID).Scan(&attemptState); err != nil || (attemptState != string(AttemptSucceeded) && attemptState != string(AttemptRetryScheduled)) {
-			return errors.New("verifier result requires its completed waiting attempt")
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM executor_attempts WHERE id=? AND work_item_id=?`, result.AttemptID, workItemID).Scan(&attemptState); err != nil {
+			return errors.New("verifier result requires its bound attempt")
 		}
 		err = conn.QueryRowContext(ctx, `SELECT result_digest FROM verifier_result_receipts WHERE work_item_id=? AND attempt_id=?`, workItemID, result.AttemptID).Scan(&receiptDigest)
 		if err == nil {
@@ -448,37 +579,49 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if state != string(StateWaiting) {
-			return errors.New("verifier result requires waiting work")
-		}
-		if result.Outcome == "satisfied" {
-			var completed int
-			if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM coordinator_events e JOIN session_bindings b ON b.binding_key=e.binding_key WHERE b.work_item_id=? AND e.event_kind='attempt_completed'`, workItemID).Scan(&completed); err != nil || completed == 0 {
-				return errors.New("satisfied verifier result requires durable runtime completion evidence")
-			}
-		}
-		if result.Outcome == "continuation" || result.Outcome == "missing_or_stale" {
-			if continuations >= maxContinuations {
-				result.Outcome = "escalated"
-			} else {
-				continuations++
-			}
+		activeAttempt := state == string(StateActive) && attemptState == string(AttemptRunning)
+		waitingAttempt := state == string(StateWaiting) && (attemptState == string(AttemptSucceeded) || attemptState == string(AttemptRetryScheduled))
+		if !activeAttempt && !waitingAttempt {
+			return errors.New("verifier result requires its active or completed waiting attempt")
 		}
 		if _, err = conn.ExecContext(ctx, `INSERT INTO verifier_result_receipts(work_item_id,attempt_id,result_digest,recorded_at) VALUES(?,?,?,?)`, workItemID, result.AttemptID, resultDigest, millis(now)); err != nil {
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
+		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,evaluation_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,evaluation_revision=excluded.evaluation_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, verifierID, contract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
 		if err != nil {
 			return err
 		}
 		switch result.Outcome {
 		case "satisfied":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateCompleted, continuations, millis(now), millis(now), workItemID, StateWaiting)
-		case "continuation", "missing_or_stale":
-			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now), millis(now), workItemID, StateWaiting)
+		case "waiting":
+			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,next_attempt_at=?,wait_deadline_at=COALESCE(wait_deadline_at,?),updated_at=? WHERE id=? AND state=?`, millis(now.Add(durablePollInterval)), millis(now.Add(durableWaitDeadline)), millis(now), workItemID, StateWaiting)
+		case "continuation_required":
+			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now.Add(durablePollInterval)), millis(now), workItemID, StateWaiting)
 		case "escalated":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateFailed, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		}
+		if err != nil || !activeAttempt {
+			return err
+		}
+		// A live agentd verdict arrives while the executor attempt still owns the
+		// serialization lease.  Commit the attempt and work transition together;
+		// Complete recognizes the durable verifier receipt as an idempotent handoff.
+		finalAttemptState, workState, next := AttemptRetryScheduled, StateWaiting, any(millis(now.Add(durablePollInterval)))
+		terminal := any(nil)
+		if result.Outcome == "satisfied" {
+			finalAttemptState, workState, terminal = AttemptSucceeded, StateCompleted, millis(now)
+		}
+		if result.Outcome == "escalated" {
+			finalAttemptState, workState, terminal = AttemptFailed, StateFailed, millis(now)
+		}
+		if _, err = conn.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE id=? AND state=?`, finalAttemptState, millis(now), result.AttemptID, AttemptRunning); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=?,wait_deadline_at=CASE WHEN ? THEN COALESCE(wait_deadline_at,?) ELSE wait_deadline_at END,updated_at=? WHERE id=? AND state=?`, workState, continuations, terminal, next, result.Outcome == "waiting", millis(now.Add(durableWaitDeadline)), millis(now), workItemID, StateActive); err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM serialization_leases WHERE attempt_id=?`, result.AttemptID)
 		return err
 	})
 }

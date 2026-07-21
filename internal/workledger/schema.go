@@ -9,6 +9,10 @@ import (
 // Migrate adds the generalized ledger alongside the legacy proof tables. It is
 // additive so an existing dispatcher database retains all recovery evidence.
 func Migrate(ctx context.Context, db *sql.DB) error {
+	var priorVersion int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&priorVersion); err != nil {
+		return fmt.Errorf("read work ledger schema version: %w", err)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin work ledger migration: %w", err)
@@ -26,12 +30,12 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS release_operations (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), repository TEXT NOT NULL, repository_id INTEGER NOT NULL, installation_id INTEGER NOT NULL, release_id INTEGER NOT NULL, tag TEXT NOT NULL, published_at TEXT NOT NULL, target_commitish TEXT NOT NULL, commit_sha TEXT NOT NULL, asset_id INTEGER NOT NULL, asset_name TEXT NOT NULL, asset_size INTEGER NOT NULL, asset_content_type TEXT NOT NULL, provider_digest TEXT NOT NULL, computed_digest TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS content_results (computed_digest TEXT PRIMARY KEY, external_correlation TEXT NOT NULL, result_digest TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ingress_failures (source TEXT NOT NULL, namespace TEXT NOT NULL, source_delivery_id TEXT NOT NULL, event_digest TEXT NOT NULL, classification TEXT NOT NULL, attempts INTEGER NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(source,namespace,source_delivery_id))`,
-		`CREATE TABLE IF NOT EXISTS session_bindings (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), binding_key TEXT NOT NULL UNIQUE, authority_profile TEXT NOT NULL, profile_version TEXT NOT NULL DEFAULT '', policy_digest TEXT NOT NULL DEFAULT '', session_lineage_id TEXT NOT NULL DEFAULT '', worker_id TEXT NOT NULL DEFAULT '', worker_storage_lineage_id TEXT NOT NULL DEFAULT '', worker_fence_epoch INTEGER NOT NULL DEFAULT 1, agentd_session_id TEXT NOT NULL DEFAULT '', checkpoint_ref TEXT NOT NULL DEFAULT '', event_cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL CHECK(state IN ('pending','active','reassigning','checkpointed','terminated','failed')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS session_bindings (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), binding_key TEXT NOT NULL UNIQUE, authority_profile TEXT NOT NULL, profile_version TEXT NOT NULL DEFAULT '', policy_digest TEXT NOT NULL DEFAULT '', session_lineage_id TEXT NOT NULL DEFAULT '', worker_id TEXT NOT NULL DEFAULT '', worker_storage_lineage_id TEXT NOT NULL DEFAULT '', worker_fence_epoch INTEGER NOT NULL DEFAULT 1, agentd_session_id TEXT NOT NULL DEFAULT '', registered_submit_key TEXT NOT NULL DEFAULT '', active_model_effect_id TEXT NOT NULL DEFAULT '', active_effect_attempt INTEGER NOT NULL DEFAULT 0, checkpoint_ref TEXT NOT NULL DEFAULT '', event_cursor INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL CHECK(state IN ('pending','active','reassigning','checkpointed','terminated','failed')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS coordinator_events (binding_key TEXT NOT NULL REFERENCES session_bindings(binding_key), cursor INTEGER NOT NULL CHECK(cursor>0), worker_id TEXT NOT NULL, fence_epoch INTEGER NOT NULL CHECK(fence_epoch>0), event_kind TEXT NOT NULL, evidence_ref TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens>=0), cached_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cached_input_tokens>=0), output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens>=0), reasoning_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(reasoning_output_tokens>=0), total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens>=0), recorded_at INTEGER NOT NULL, PRIMARY KEY(binding_key,cursor))`,
 		`CREATE TABLE IF NOT EXISTS coordinator_reassignments (work_item_id TEXT NOT NULL REFERENCES work_items(id), predecessor_fence_epoch INTEGER NOT NULL CHECK(predecessor_fence_epoch>0), idempotency_key TEXT NOT NULL, rebind_idempotency_key TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL CHECK(phase IN ('requested','broker_committed','agentd_adopted','coordinator_committed','escalated')), session_lineage_id TEXT NOT NULL, authority_profile TEXT NOT NULL, profile_version TEXT NOT NULL, policy_digest TEXT NOT NULL, storage_lineage_id TEXT NOT NULL, predecessor_worker_id TEXT NOT NULL, successor_worker_id TEXT NOT NULL DEFAULT '', successor_fence_epoch INTEGER NOT NULL DEFAULT 0, broker_state TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,predecessor_fence_epoch), UNIQUE(idempotency_key))`,
-		`CREATE TABLE IF NOT EXISTS verifier_results (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('satisfied','missing_or_stale','continuation','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS verifier_results (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, evaluation_revision TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL CHECK(outcome IN ('waiting','continuation_required','satisfied','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS verifier_result_receipts (work_item_id TEXT NOT NULL REFERENCES work_items(id), attempt_id TEXT NOT NULL REFERENCES executor_attempts(id), result_digest TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,attempt_id))`,
-		`PRAGMA user_version=10`,
+		`PRAGMA user_version=15`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -52,9 +56,15 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
+	if priorVersion < 11 {
+		if err := migrateVerifierResultsV11(ctx, tx); err != nil {
+			return err
+		}
+	}
 	for _, column := range []struct{ name, definition string }{
 		{"task_evidence_digest", `task_evidence_digest TEXT NOT NULL DEFAULT ''`},
 		{"continuation_count", `continuation_count INTEGER NOT NULL DEFAULT 0`},
+		{"wait_deadline_at", `wait_deadline_at INTEGER`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "work_items", column.name, column.definition); err != nil {
 			return err
@@ -67,6 +77,12 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		{"worker_storage_lineage_id", `worker_storage_lineage_id TEXT NOT NULL DEFAULT ''`},
 		{"worker_fence_epoch", `worker_fence_epoch INTEGER NOT NULL DEFAULT 1`},
 		{"agentd_session_id", `agentd_session_id TEXT NOT NULL DEFAULT ''`},
+		{"registered_submit_key", `registered_submit_key TEXT NOT NULL DEFAULT ''`},
+		{"submitted_idempotency_key", `submitted_idempotency_key TEXT NOT NULL DEFAULT ''`},
+		{"model_effect_id", `model_effect_id TEXT NOT NULL DEFAULT ''`},
+		{"active_model_effect_id", `active_model_effect_id TEXT NOT NULL DEFAULT ''`},
+		{"active_effect_attempt", `active_effect_attempt INTEGER NOT NULL DEFAULT 0`},
+		{"submitted_turn_id", `submitted_turn_id TEXT NOT NULL DEFAULT ''`},
 		{"event_cursor", `event_cursor INTEGER NOT NULL DEFAULT 0`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "session_bindings", column.name, column.definition); err != nil {
@@ -85,6 +101,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	for _, column := range []struct{ name, definition string }{
 		{"attempt_id", `attempt_id TEXT NOT NULL DEFAULT ''`},
 		{"result_digest", `result_digest TEXT NOT NULL DEFAULT ''`},
+		{"evaluation_revision", `evaluation_revision TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "verifier_results", column.name, column.definition); err != nil {
 			return err
@@ -95,8 +112,29 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=0 WHERE CAST(event_cursor AS TEXT)=''`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET registered_submit_key=submitted_idempotency_key WHERE registered_submit_key='' AND submitted_idempotency_key<>''`); err != nil {
+		return fmt.Errorf("backfill registered submit keys: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET active_model_effect_id=model_effect_id WHERE active_model_effect_id='' AND model_effect_id<>''`); err != nil {
+		return fmt.Errorf("backfill active model effects: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit work ledger migration: %w", err)
+	}
+	return nil
+}
+
+func migrateVerifierResultsV11(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`CREATE TABLE verifier_results_v11 (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('waiting','continuation_required','satisfied','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`INSERT INTO verifier_results_v11(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) SELECT work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,CASE outcome WHEN 'continuation' THEN 'continuation_required' WHEN 'missing_or_stale' THEN 'continuation_required' ELSE outcome END,reason_codes_json,evidence_refs_json,recorded_at FROM verifier_results`,
+		`DROP TABLE verifier_results`,
+		`ALTER TABLE verifier_results_v11 RENAME TO verifier_results`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("migrate verifier results v11: %w", err)
+		}
 	}
 	return nil
 }

@@ -36,7 +36,7 @@ description = "Run the deterministic in-process dispatcher restore/replay/reconc
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/recovery -run '^TestDispatcherRecoveryProof$' -count=1"
 
 [tasks.build]
-run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher ./cmd/resume-release-router ./cmd/push-security-scanner"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher ./cmd/resume-release-router ./cmd/push-security-scanner ./cmd/github-green-pr-coordinator ./cmd/github-green-pr-fixture-admit"
 
 [tasks.image-build]
 run = "docker build -t signal-plane:local ."

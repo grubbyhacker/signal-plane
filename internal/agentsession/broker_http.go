@@ -17,7 +17,10 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
-const brokerCoordinatorVersion = "broker/coordinator/v1"
+const (
+	brokerCoordinatorVersion   = "broker/coordinator/v1"
+	brokerCoordinatorV2Version = "broker/coordinator/v2"
+)
 
 type HTTPBroker struct {
 	baseURL *url.URL
@@ -64,6 +67,9 @@ func (lease brokerLease) normalized() (workledger.SessionLease, error) {
 }
 
 func (broker *HTTPBroker) Acquire(ctx context.Context, request AcquireRequest) (workledger.SessionLease, error) {
+	if err := request.RegisteredTask.Validate(request.BindingKey); err != nil {
+		return workledger.SessionLease{}, fmt.Errorf("registered admission is invalid: %w", err)
+	}
 	var response struct {
 		Version   string `json:"version"`
 		Admission struct {
@@ -76,102 +82,102 @@ func (broker *HTTPBroker) Acquire(ctx context.Context, request AcquireRequest) (
 			} `json:"workspace"`
 		} `json:"admission"`
 	}
-	err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/leases", map[string]any{"profile": request.AuthorityProfile, "idempotency_key": request.IdempotencyKey, "session_binding": request.BindingKey}, &response)
+	err := broker.post(ctx, "/v1/authority-workers/coordinator/v2/leases", brokerAcquireV2Request{Version: brokerCoordinatorV2Version, Profile: request.AuthorityProfile, IdempotencyKey: request.IdempotencyKey, SessionBinding: request.BindingKey, RegisteredTaskSource: request.RegisteredTask.Source, RegisteredTask: request.RegisteredTask.Snapshot, AdmissionTaskDigest: request.RegisteredTask.Digest}, &response)
 	if err != nil {
 		return workledger.SessionLease{}, err
 	}
 	lease, err := response.Admission.Lease.normalized()
-	if err != nil || response.Version != brokerCoordinatorVersion || response.Admission.Workspace.UID < 20000 || response.Admission.Workspace.GID < 20000 || response.Admission.Workspace.WorkspacePath == "" || response.Admission.Workspace.SessionLineageID != lease.SessionLineageID {
+	if err != nil || response.Version != brokerCoordinatorV2Version || response.Admission.Workspace.UID < 20000 || response.Admission.Workspace.GID < 20000 || response.Admission.Workspace.WorkspacePath == "" || response.Admission.Workspace.SessionLineageID != lease.SessionLineageID {
 		return workledger.SessionLease{}, errors.New("broker lease response is inconsistent")
 	}
 	return lease, nil
 }
 
-func (broker *HTTPBroker) CreateSession(ctx context.Context, request CreateSessionRequest) (BrokerSession, error) {
-	var response brokerSessionResponse
-	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/create", map[string]any{"session_binding": request.BindingKey}, &response); err != nil {
-		return BrokerSession{}, err
-	}
-	lease, err := response.validate()
-	if err != nil {
-		return BrokerSession{}, err
-	}
-	var status struct {
-		SessionID string `json:"sessionId"`
-	}
-	if err := decodeStrict(response.Result, &status); err != nil || status.SessionID == "" {
-		return BrokerSession{}, errors.New("broker session create result is invalid")
-	}
-	return BrokerSession{SessionID: status.SessionID, Lease: lease}, nil
-}
-
 func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
-	var response brokerSessionResponse
-	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/submit", map[string]any{"session_binding": request.BindingKey, "prompt": request.Prompt, "idempotency_key": request.IdempotencyKey}, &response); err != nil {
+	if request.Version != "agentd/registered-lifecycle/v1" || request.IdempotencyKey == "" || request.TaskKind == "" || request.AdmissionTaskDigest == "" || request.TaskEvidenceDigest == "" || len(request.Parameters) == 0 || !json.Valid(request.Parameters) {
+		return BrokerTurn{}, errors.New("registered lifecycle request is invalid")
+	}
+	var parameters map[string]json.RawMessage
+	if err := decodeStrict(request.Parameters, &parameters); err != nil {
+		return BrokerTurn{}, errors.New("registered lifecycle parameters are invalid")
+	}
+	wire := struct {
+		Version             string                     `json:"version"`
+		IdempotencyKey      string                     `json:"idempotencyKey"`
+		TaskKind            string                     `json:"taskKind"`
+		AdmissionTaskDigest string                     `json:"admissionTaskDigest"`
+		TaskEvidenceDigest  string                     `json:"taskEvidenceDigest"`
+		Parameters          map[string]json.RawMessage `json:"parameters"`
+	}{request.Version, request.IdempotencyKey, request.TaskKind, request.AdmissionTaskDigest, request.TaskEvidenceDigest, parameters}
+	var response struct {
+		Version       string      `json:"version"`
+		Lease         brokerLease `json:"lease"`
+		SessionID     string      `json:"sessionId"`
+		TurnID        string      `json:"turnId"`
+		ModelEffectID string      `json:"modelEffectId"`
+		Phase         string      `json:"phase"`
+		Cursor        int64       `json:"cursor"`
+	}
+	if err := broker.postStatus(ctx, "/v1/authority-workers/coordinator/v1/registered-turn", wire, &response, http.StatusAccepted); err != nil {
 		return BrokerTurn{}, err
 	}
-	lease, err := response.validate()
-	if err != nil {
-		return BrokerTurn{}, err
-	}
-	var turn struct {
-		SessionID string `json:"sessionId"`
-		TurnID    string `json:"turnId"`
-		Phase     string `json:"phase"`
-	}
-	if err := decodeStrict(response.Result, &turn); err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.Phase == "" {
+	lease, err := response.Lease.normalized()
+	if err != nil || response.Version != "agentd/registered-turn/v2" || response.SessionID == "" || response.TurnID == "" || response.ModelEffectID != "model:"+request.IdempotencyKey || response.Phase != "queued" || response.Cursor <= 0 {
 		return BrokerTurn{}, errors.New("broker turn result is invalid")
 	}
-	return BrokerTurn{TurnID: turn.TurnID, Lease: lease}, nil
+	return BrokerTurn{SessionID: response.SessionID, TurnID: response.TurnID, ModelEffectID: response.ModelEffectID, Cursor: response.Cursor, Lease: lease}, nil
 }
 
 func (broker *HTTPBroker) StreamEvents(ctx context.Context, request StreamEventsRequest) (BrokerEvents, error) {
-	var response brokerSessionResponse
-	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/sessions/events", map[string]any{"session_binding": request.BindingKey, "after": request.Cursor}, &response); err != nil {
+	if request.Cursor < 0 {
+		return BrokerEvents{}, errors.New("registered event cursor is invalid")
+	}
+	var response struct {
+		Version    string                `json:"version"`
+		Lease      brokerLease           `json:"lease"`
+		Events     []registeredEventWire `json:"events"`
+		NextCursor int64                 `json:"nextCursor"`
+	}
+	if err := broker.post(ctx, "/v1/authority-workers/coordinator/v1/registered-events", map[string]int64{"after": request.Cursor}, &response); err != nil {
 		return BrokerEvents{}, err
 	}
-	lease, err := response.validate()
-	if err != nil {
-		return BrokerEvents{}, err
+	lease, err := response.Lease.normalized()
+	if err != nil || response.Version != "agentd/registered-events/v2" || response.NextCursor < request.Cursor {
+		return BrokerEvents{}, errors.New("broker registered events response is invalid")
 	}
-	var wireEvents []struct {
-		Version   string          `json:"version"`
-		Cursor    int64           `json:"cursor"`
-		Kind      string          `json:"kind"`
-		SessionID string          `json:"sessionId"`
-		TurnID    string          `json:"turnId,omitempty"`
-		AttemptID string          `json:"attemptId,omitempty"`
-		Payload   json.RawMessage `json:"payload"`
-	}
-	if err := decodeStrict(response.Result, &wireEvents); err != nil {
-		return BrokerEvents{}, errors.New("broker event result is invalid")
-	}
-	events := make([]Event, 0, len(wireEvents))
+	events := make([]Event, 0, len(response.Events))
 	previous := request.Cursor
-	for _, wire := range wireEvents {
-		if wire.Version != "agentd/v1" || wire.SessionID == "" || wire.Cursor != previous+1 || !knownAgentdEvent(wire.Kind) || len(wire.Payload) == 0 || !json.Valid(wire.Payload) {
+	for _, wire := range response.Events {
+		if wire.Cursor != previous+1 || wire.SessionID == "" || wire.TurnID == "" || wire.ModelEffectID == "" || wire.Attempt < 0 || wire.Phase == "" || wire.WorkerID == "" || wire.StorageLineageID == "" || wire.FenceEpoch < 0 || wire.AdmissionTaskDigest == "" || wire.TaskEvidenceDigest == "" {
 			return BrokerEvents{}, errors.New("broker event stream is non-contiguous or malformed")
 		}
-		usage := workledger.Usage{}
-		if wire.Kind == "attempt_completed" {
-			var payload struct {
-				Conversation json.RawMessage  `json:"conversation"`
-				Facts        []string         `json:"facts,omitempty"`
-				TokenUsage   workledger.Usage `json:"tokenUsage"`
-			}
-			if err := decodeStrict(wire.Payload, &payload); err != nil || len(payload.Conversation) == 0 || !payload.TokenUsage.Valid() {
-				return BrokerEvents{}, errors.New("attempt completion payload is invalid")
-			}
-			usage = payload.TokenUsage
+		event := Event{Cursor: wire.Cursor, Attempt: wire.Attempt, SessionID: wire.SessionID, TurnID: wire.TurnID, ModelEffectID: wire.ModelEffectID, Phase: wire.Phase, WorkerID: wire.WorkerID, StorageLineageID: wire.StorageLineageID, FenceEpoch: wire.FenceEpoch, AdmissionTaskDigest: wire.AdmissionTaskDigest, TaskEvidenceDigest: wire.TaskEvidenceDigest, Verifier: wire.Verifier, Failure: wire.Failure}
+		if !validEventShape(event) {
+			return BrokerEvents{}, errors.New("broker event stream has invalid phase, failure, or verifier coupling")
 		}
-		evidenceRef, err := canonicalEvidenceRef(wire)
-		if err != nil {
-			return BrokerEvents{}, err
-		}
-		events = append(events, Event{Cursor: wire.Cursor, Kind: wire.Kind, EvidenceRef: evidenceRef, Usage: usage})
+		events = append(events, event)
 		previous = wire.Cursor
 	}
+	if response.NextCursor != previous {
+		return BrokerEvents{}, errors.New("broker event next cursor is inconsistent")
+	}
 	return BrokerEvents{Lease: lease, Events: events}, nil
+}
+
+type registeredEventWire struct {
+	Cursor              int64          `json:"cursor"`
+	Attempt             int64          `json:"attempt"`
+	FenceEpoch          int64          `json:"fenceEpoch"`
+	SessionID           string         `json:"sessionId"`
+	TurnID              string         `json:"turnId"`
+	ModelEffectID       string         `json:"modelEffectId"`
+	Phase               string         `json:"phase"`
+	WorkerID            string         `json:"workerId"`
+	StorageLineageID    string         `json:"storageLineageId"`
+	AdmissionTaskDigest string         `json:"admissionTaskDigest"`
+	TaskEvidenceDigest  string         `json:"taskEvidenceDigest"`
+	Verifier            *VerifierEvent `json:"verifier,omitempty"`
+	Failure             string         `json:"failure,omitempty"`
 }
 
 func (broker *HTTPBroker) Reassign(ctx context.Context, request ReassignRequest) (BrokerReassignment, error) {
@@ -371,6 +377,10 @@ func (response brokerSessionResponse) validate() (workledger.SessionLease, error
 }
 
 func (broker *HTTPBroker) post(ctx context.Context, path string, input, output any) error {
+	return broker.postStatus(ctx, path, input, output, 0)
+}
+
+func (broker *HTTPBroker) postStatus(ctx context.Context, path string, input, output any, expectedStatus int) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return err
@@ -391,7 +401,7 @@ func (broker *HTTPBroker) post(ctx context.Context, path string, input, output a
 	if err != nil || len(limited) > 1024*1024 {
 		return errors.New("broker coordinator response exceeds limit")
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
+	if (expectedStatus != 0 && response.StatusCode != expectedStatus) || (expectedStatus == 0 && (response.StatusCode < 200 || response.StatusCode >= 300)) {
 		return fmt.Errorf("broker coordinator rejected request with status %d", response.StatusCode)
 	}
 	if err := decodeStrict(limited, output); err != nil {

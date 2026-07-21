@@ -70,6 +70,15 @@ push_scanner:
     max_candidates: 4096
     max_decode_depth: 2
 
+# The durable github_green_pr_v1 coordinator is fixture-only. Production
+# remains disabled: it has no route, principal, or broker identity here.
+coordinator:
+  enabled: false
+  database_path: github-green-pr-coordinator.db
+  broker_url: http://127.0.0.1:8091
+  broker_token_env: GITHUB_GREEN_PR_COORDINATOR_TOKEN
+  poll_interval: 1s
+
 routes:
   - id: manual-local
     path: /manual

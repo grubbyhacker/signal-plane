@@ -6,137 +6,182 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
-func TestHTTPBrokerConsumesSharedLeaseAndReassignmentFixtures(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	statusFixture := mustFixture(t, "reassignment-status-v1.json")
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer coordinator-token" {
-			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("..", "..", "testdata", "agentd", "registered-turn-v2.golden.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Request  json.RawMessage            `json:"request"`
+		Response map[string]json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(golden, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority-workers/coordinator/v1/registered-turn" {
+			http.NotFound(w, r)
 			return
 		}
-		switch request.URL.Path {
-		case "/v1/authority-workers/coordinator/v1/leases":
-			writer.Write(leaseFixture)
-		case "/v1/authority-workers/coordinator/v1/reassignments/status":
-			writer.Write(statusFixture)
-		default:
-			http.NotFound(writer, request)
+		var got json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		var gotValue, wantValue any
+		_ = json.Unmarshal(got, &gotValue)
+		_ = json.Unmarshal(fixture.Request, &wantValue)
+		if !reflect.DeepEqual(gotValue, wantValue) {
+			t.Fatalf("request=%s want=%s", got, fixture.Request)
 		}
+		fixture.Response["lease"] = testLeaseJSON(t)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(fixture.Response)
 	}))
 	defer server.Close()
-	broker, err := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	if err != nil {
-		t.Fatal(err)
+	var request struct {
+		Version             string          `json:"version"`
+		IdempotencyKey      string          `json:"idempotencyKey"`
+		TaskKind            string          `json:"taskKind"`
+		AdmissionTaskDigest string          `json:"admissionTaskDigest"`
+		TaskEvidenceDigest  string          `json:"taskEvidenceDigest"`
+		Parameters          json.RawMessage `json:"parameters"`
 	}
-	lease, err := broker.Acquire(t.Context(), AcquireRequest{BindingKey: "logical-session", AuthorityProfile: "writer", IdempotencyKey: "acquire-1"})
-	if err != nil || lease.SessionLineageID != "11111111111111111111111111111111" || lease.PolicyDigest != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
-		t.Fatalf("lease=%+v err=%v", lease, err)
-	}
-	status, err := broker.ReassignmentStatus(t.Context(), ReassignmentStatusRequest{BindingKey: "logical-session", PredecessorEpoch: 1})
-	if err != nil || status.State != "confirmed" || status.Lease.WorkerID != "worker-2" || status.Lease.ProfileVersion != "profile-v1" || status.RebindIdempotencyKey != "opaque-rebind-key" {
-		t.Fatalf("status=%+v err=%v", status, err)
+	_ = json.Unmarshal(fixture.Request, &request)
+	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: request.Version, IdempotencyKey: request.IdempotencyKey, TaskKind: request.TaskKind, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.TaskEvidenceDigest, Parameters: request.Parameters})
+	if err != nil || turn.SessionID != "session-42" || turn.TurnID != "turn:turn-42" || turn.ModelEffectID != "model:turn-42" || turn.Cursor != 1 {
+		t.Fatalf("turn=%+v err=%v", turn, err)
 	}
 }
 
-func TestHTTPBrokerRequiresContiguousAgentdEvents(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	var admission struct {
-		Admission struct {
-			Lease json.RawMessage `json:"lease"`
-		} `json:"admission"`
+func TestRegisteredTurnRejectsWrongVersionAndExtraFields(t *testing.T) {
+	for _, body := range []string{`{"version":"agentd/registered-turn/v1","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0}`, `{"version":"agentd/registered-turn/v2","sessionId":"s","turnId":"t","modelEffectId":"model:k","phase":"queued","cursor":0,"extra":true}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"lease":` + string(testLeaseJSON(t)) + `,` + body[1:]))
+		}))
+		broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+		if _, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "k", TaskKind: "task", AdmissionTaskDigest: "sha256:a", TaskEvidenceDigest: "sha256:b", Parameters: []byte(`{}`)}); err == nil {
+			t.Fatal("invalid response accepted")
+		}
+		server.Close()
 	}
-	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
+}
+
+func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("..", "..", "testdata", "agentd", "registered-turn-v2.golden.json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	gap := false
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		cursor := 1
-		if gap {
-			cursor = 2
+	var fixture struct {
+		Events map[string]json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(golden, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	fixture.Events["lease"] = testLeaseJSON(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority-workers/coordinator/v1/registered-events" {
+			http.NotFound(w, r)
+			return
 		}
-		result := []map[string]any{{"version": "agentd/v1", "cursor": cursor, "kind": "attempt_completed", "sessionId": "session-1", "turnId": "turn-1", "attemptId": "attempt-1", "payload": map[string]any{"conversation": map[string]any{"adapterKind": "codex", "adapterVersion": "v1", "backendThreadRef": "thread-1"}, "tokenUsage": map[string]any{"inputTokens": 3, "cachedInputTokens": 1, "outputTokens": 2, "reasoningOutputTokens": 1, "totalTokens": 5}}}}
-		_ = json.NewEncoder(writer).Encode(map[string]any{"version": brokerCoordinatorVersion, "lease": admission.Admission.Lease, "result": result})
+		_ = json.NewEncoder(w).Encode(fixture.Events)
 	}))
 	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "logical-session", Cursor: 0})
-	if err != nil || len(batch.Events) != 1 || batch.Events[0].Usage.TotalTokens != 5 || batch.Events[0].EvidenceRef == "" {
+	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
+	if err != nil || len(batch.Events) != 2 || batch.Events[0].Phase != "queued" || batch.Events[1].Verifier == nil || batch.Events[1].Verifier.Outcome != "waiting" {
 		t.Fatalf("batch=%+v err=%v", batch, err)
 	}
-	gap = true
-	if _, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "logical-session", Cursor: 0}); err == nil {
-		t.Fatal("event cursor gap was accepted")
-	}
-}
-
-func TestHTTPBrokerRejectsUnknownWireFields(t *testing.T) {
-	base := mustFixture(t, "lease-v1.json")
-	fixture := append(append([]byte(nil), base[:len(base)-2]...), []byte(",\"caller_model\":\"forbidden\"}\n")...)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.Write(fixture) }))
-	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	if _, err := broker.Acquire(t.Context(), AcquireRequest{BindingKey: "logical-session", AuthorityProfile: "writer", IdempotencyKey: "acquire-1"}); err == nil {
-		t.Fatal("unknown broker field accepted")
-	}
-}
-
-func TestHTTPBrokerUsesOnlySupportedSessionLifecycleOperations(t *testing.T) {
-	leaseFixture := mustFixture(t, "lease-v1.json")
-	var admission struct {
-		Admission struct {
-			Lease json.RawMessage `json:"lease"`
-		} `json:"admission"`
-	}
-	if err := json.Unmarshal(leaseFixture, &admission); err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		seen[request.URL.Path] = true
-		result := any(map[string]any{
-			"version": "agentd/v1", "sessionId": "session-1", "coordinatorBinding": "logical-session", "authorityBinding": "writer",
-			"workerId": "worker-1", "storageLineageId": "22222222222222222222222222222222", "fenceEpoch": 1,
-			"sessionLineageId": "11111111111111111111111111111111", "workspace": map[string]any{"workspaceRef": "/workspace", "uid": 20000, "gid": 20000},
-			"phase": "active", "turnIds": []string{"turn-1"}, "nextCursor": 2,
-		})
-		if request.URL.Path == "/v1/authority-workers/coordinator/v1/sessions/checkpoint" {
-			result.(map[string]any)["workspace"].(map[string]any)["checkpointRef"] = "checkpoint-1"
+	binding := workledger.SessionBinding{AgentdSessionID: "session-42", SubmittedTurnID: "turn:turn-42", ModelEffectID: "model:turn-42", WorkerID: "worker-42", WorkerStorageLineageID: "lineage-42", WorkerFenceEpoch: 7}
+	task := RegisteredTask{Digest: "sha256:" + strings.Repeat("a", 64), Snapshot: RegisteredTaskSnapshot{TaskEvidenceDigest: "sha256:" + strings.Repeat("b", 64)}}
+	for _, event := range batch.Events {
+		if !validEvent(event, binding, task) {
+			t.Fatalf("shared registered lifecycle fixture event was rejected: %+v", event)
 		}
-		if request.URL.Path == "/v1/authority-workers/coordinator/v1/sessions/cancel" {
-			result = map[string]any{"sessionId": "session-1", "turnId": "turn-1", "phase": "cancelled"}
-		}
-		_ = json.NewEncoder(writer).Encode(map[string]any{"version": brokerCoordinatorVersion, "lease": admission.Admission.Lease, "result": result})
+	}
+
+	var invalid map[string]any
+	encoded, _ := json.Marshal(fixture.Events)
+	_ = json.Unmarshal(encoded, &invalid)
+	events := invalid["events"].([]any)
+	verifier := events[1].(map[string]any)["verifier"].(map[string]any)
+	verifier["workItemId"] = "legacy-wire-member"
+	invalidServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(invalid)
 	}))
-	defer server.Close()
-	broker, _ := NewHTTPBroker(server.URL, "coordinator-token", server.Client())
-	checkpoint, err := broker.Checkpoint(t.Context(), "logical-session", "checkpoint-1")
-	if err != nil || checkpoint.Workspace.CheckpointRef != "checkpoint-1" {
-		t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
-	}
-	if _, err := broker.Resume(t.Context(), "logical-session"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := broker.Status(t.Context(), "logical-session"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := broker.Cancel(t.Context(), "logical-session", "turn-1"); err != nil {
-		t.Fatal(err)
-	}
-	for _, operation := range []string{"checkpoint", "resume", "status", "cancel"} {
-		if !seen["/v1/authority-workers/coordinator/v1/sessions/"+operation] {
-			t.Fatalf("supported %s path was not used", operation)
-		}
+	defer invalidServer.Close()
+	invalidBroker, _ := NewHTTPBroker(invalidServer.URL, "token", invalidServer.Client())
+	if _, err := invalidBroker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0}); err == nil {
+		t.Fatal("legacy verifier member was accepted")
 	}
 }
 
-func mustFixture(t *testing.T, name string) []byte {
+func TestRegisteredEventsRetainUncertainRuntimeFailureAndRejectMalformedCoupling(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	evidence := "sha256:" + strings.Repeat("b", 64)
+	uncertain := registeredEventWire{
+		Cursor: 1, Attempt: 1, SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42", Phase: "escalated", WorkerID: "worker-42", StorageLineageID: "lineage-42", FenceEpoch: 7, AdmissionTaskDigest: digest, TaskEvidenceDigest: evidence, Failure: "runtime_outcome_uncertain",
+		Verifier: &VerifierEvent{Phase: "escalated", Outcome: "escalated", ContractDigest: digest, TaskEvidenceDigest: evidence, HeadRevision: "local:unavailable:verifier:turn-42:uncertain-runtime", Reasons: []VerifierReason{{Code: "refused", EvidenceRef: "local:refused:" + evidence}}, EvidenceRefs: []string{"local:refused:" + evidence}},
+	}
+	type eventsResponse struct {
+		Version    string                `json:"version"`
+		Lease      json.RawMessage       `json:"lease"`
+		Events     []registeredEventWire `json:"events"`
+		NextCursor int64                 `json:"nextCursor"`
+	}
+	response := func(event registeredEventWire) eventsResponse {
+		return eventsResponse{Version: "agentd/registered-events/v2", Lease: testLeaseJSON(t), Events: []registeredEventWire{event}, NextCursor: 1}
+	}
+	serve := func(event registeredEventWire) *HTTPBroker {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(response(event))
+		}))
+		t.Cleanup(server.Close)
+		broker, err := NewHTTPBroker(server.URL, "token", server.Client())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return broker
+	}
+	batch, err := serve(uncertain).StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
+	if err != nil || len(batch.Events) != 1 || batch.Events[0].Failure != "runtime_outcome_uncertain" || batch.Events[0].Verifier == nil || batch.Events[0].Verifier.Phase != "escalated" {
+		t.Fatalf("uncertain event=%+v err=%v", batch.Events, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*registeredEventWire)
+	}{
+		{name: "uncertain failure on wrong phase", mutate: func(event *registeredEventWire) { event.Phase = "failed" }},
+		{name: "unknown failure", mutate: func(event *registeredEventWire) { event.Failure = "unknown_failure" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := uncertain
+			tc.mutate(&event)
+			if _, err := serve(event).StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0}); err == nil {
+				t.Fatal("malformed failure event was accepted")
+			}
+		})
+	}
+}
+
+func testLeaseJSON(t *testing.T) json.RawMessage {
 	t.Helper()
-	value, err := os.ReadFile(filepath.Join("..", "..", "testdata", "coordinator-wire", name))
+	return json.RawMessage(`{"principal":"p","profile":"general-writer-v1","worker_id":"worker-42","session_lineage_id":"11111111111111111111111111111111","worker_storage_lineage_id":"22222222222222222222222222222222","worker_fence_epoch":7,"profile_version":"v1","policy_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_binding_digest":"x","idempotency_key_digest":"y","created_at":"now","released_at":"","replay":false}`)
+}
+
+func testAcquireRequest(t *testing.T) AcquireRequest {
+	t.Helper()
+	task := RegisteredTask{Source: RegisteredTaskSource{WorkItemID: "work-1", RouteSnapshotID: "route-1"}, Snapshot: RegisteredTaskSnapshot{TaskKind: GitHubGreenPRTaskKind, TaskVersion: "1.0.0", CompletionContract: GitHubGreenPRContract, VerifierID: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: []byte(`{"repository":"grubbyhacker/repository-worker-lifecycle-test","baseBranch":"main","branchRef":"agent/fleiglabs-repo-agent/test"}`)}}
+	digest, err := admissionTaskDigest(task.Source, task.Snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return value
+	task.Digest = digest
+	return AcquireRequest{BindingKey: "session:work-1", AuthorityProfile: "writer", IdempotencyKey: "acquire-1", RegisteredTask: task}
 }

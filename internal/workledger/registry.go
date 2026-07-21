@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ExecutorDescriptor struct {
@@ -48,6 +49,8 @@ type ExecutorResult struct {
 	ExternalCorrelation string
 	SanitizedError      string
 	ResultDigest        string
+	NextAttemptAt       *time.Time
+	DeadlineAt          *time.Time
 }
 
 type Executor interface {
@@ -65,6 +68,8 @@ type TaskDescriptor struct {
 
 type WorkTaskSnapshot struct {
 	TaskDescriptor
+	WorkItemID         string
+	RouteSnapshotID    string
 	Parameters         json.RawMessage
 	TaskEvidenceDigest string
 }
@@ -72,7 +77,7 @@ type WorkTaskSnapshot struct {
 func (store *Store) WorkTaskSnapshot(ctx context.Context, workItemID string) (WorkTaskSnapshot, error) {
 	var snapshot WorkTaskSnapshot
 	var definitionJSON string
-	err := store.db.QueryRowContext(ctx, `SELECT s.task_kind,s.task_version,s.completion_contract,s.verifier_id,s.task_contract_digest,s.definition_json,w.task_evidence_digest FROM work_items w JOIN route_snapshots s ON s.id=w.route_snapshot_id WHERE w.id=?`, workItemID).Scan(&snapshot.Kind, &snapshot.Version, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.ContractDigest, &definitionJSON, &snapshot.TaskEvidenceDigest)
+	err := store.db.QueryRowContext(ctx, `SELECT w.id,w.route_snapshot_id,s.task_kind,s.task_version,s.completion_contract,s.verifier_id,s.task_contract_digest,s.definition_json,w.task_evidence_digest FROM work_items w JOIN route_snapshots s ON s.id=w.route_snapshot_id WHERE w.id=?`, workItemID).Scan(&snapshot.WorkItemID, &snapshot.RouteSnapshotID, &snapshot.Kind, &snapshot.Version, &snapshot.CompletionContract, &snapshot.VerifierID, &snapshot.ContractDigest, &definitionJSON, &snapshot.TaskEvidenceDigest)
 	if err != nil {
 		return WorkTaskSnapshot{}, err
 	}

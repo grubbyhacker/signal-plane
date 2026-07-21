@@ -6,323 +6,119 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-type fakeBroker struct {
-	lease, replacement workledger.SessionLease
-	acquire            AcquireRequest
-	reassign           ReassignRequest
-	create             CreateSessionRequest
-	turns              []SubmitTurnRequest
-	stream             StreamEventsRequest
-	events             []Event
-	err                error
-	seenReassign       map[string]workledger.SessionLease
-	statusState        string
-	statusErrorCode    string
-}
-
-func (f *fakeBroker) Acquire(_ context.Context, r AcquireRequest) (workledger.SessionLease, error) {
-	f.acquire = r
-	return f.lease, f.err
-}
-func (f *fakeBroker) Reassign(_ context.Context, r ReassignRequest) (BrokerReassignment, error) {
-	f.reassign = r
-	if f.seenReassign == nil {
-		f.seenReassign = make(map[string]workledger.SessionLease)
-	}
-	if prior, ok := f.seenReassign[r.IdempotencyKey]; ok {
-		if prior != f.replacement {
-			return BrokerReassignment{}, errors.New("idempotency key conflicts with successor")
-		}
-		return BrokerReassignment{Lease: prior, State: "broker_committed"}, f.err
-	}
-	f.seenReassign[r.IdempotencyKey] = f.replacement
-	return BrokerReassignment{Lease: f.replacement, State: "broker_committed"}, f.err
-}
-func (f *fakeBroker) ReassignmentStatus(_ context.Context, r ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
-	state := f.statusState
-	if state == "" {
-		state = "confirmed"
-	}
-	return BrokerReassignmentStatus{Lease: f.replacement, PredecessorWorker: f.reassign.PredecessorWorker, PredecessorEpoch: r.PredecessorEpoch, RebindIdempotencyKey: "broker-rebind-key", State: state, ErrorCode: f.statusErrorCode}, f.err
-}
-func (f *fakeBroker) CreateSession(_ context.Context, r CreateSessionRequest) (BrokerSession, error) {
-	f.create = r
-	return BrokerSession{SessionID: "agentd-session-1", Lease: f.lease}, f.err
-}
-func (f *fakeBroker) SubmitTurn(_ context.Context, r SubmitTurnRequest) (BrokerTurn, error) {
-	f.turns = append(f.turns, r)
-	return BrokerTurn{TurnID: "turn-1", Lease: f.lease}, f.err
-}
-func (f *fakeBroker) StreamEvents(_ context.Context, r StreamEventsRequest) (BrokerEvents, error) {
-	f.stream = r
-	return BrokerEvents{Lease: f.lease, Events: f.events}, f.err
-}
-func coordinatorFixture(t *testing.T) (*workledger.Store, workledger.WorkItem, workledger.ExecutorAttempt, time.Time) {
-	t.Helper()
-	return coordinatorFixtureAt(t, filepath.Join(t.TempDir(), "ledger.db"))
-}
 func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workledger.WorkItem, workledger.ExecutorAttempt, time.Time) {
 	t.Helper()
-	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	store, err := workledger.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := workledger.NewRegistry()
-	if err := registry.Register(&Executor{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := registry.RegisterTask(RepositoryChangeTask{}); err != nil {
-		t.Fatal(err)
-	}
-	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID, Task: NeutralRepositoryTaskSelection(strings.Repeat("a", 40), "agent/pr10-proof/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{NeutralRepositoryID}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
-	snap, err := store.ActivateRoute(context.Background(), route, registry, now)
+	reg := workledger.NewRegistry()
+	_ = reg.Register(&Executor{})
+	_ = reg.RegisterTask(GitHubGreenPRTask{})
+	route := workledger.RouteDefinition{ID: "agent-session", SchemaVersion: 1, SemanticVersion: "1", ExecutorID: ExecutorID, Task: GitHubGreenPRTaskSelection("agent/fleiglabs-repo-agent/test"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{GitHubGreenPRRepository}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
+	snap, err := store.ActivateRoute(context.Background(), route, reg, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := workledger.Event{SignalID: "signal-1", SourceDeliveryID: "delivery-1", TransportStream: "signals", TransportSequence: 1, Source: "manual", Namespace: NeutralRepositoryID, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "correlation-1", CausationID: "cause-1", PayloadDigest: "sha256:payload", EvidenceRef: "nats://signals", ReceivedAt: now}
-	if _, err := store.Admit(context.Background(), snap.ID, event, now); err != nil {
+	_, err = store.Admit(context.Background(), snap.ID, workledger.Event{SignalID: "s", SourceDeliveryID: "d", TransportStream: "x", TransportSequence: 1, Source: "manual", Namespace: GitHubGreenPRRepository, ObjectKind: "repository_task", ObjectID: "17", EventKind: "repository_change", Action: "requested", ActorClass: "user", SourceRevision: "abc", CorrelationID: "c", CausationID: "c", PayloadDigest: "sha256:" + strings.Repeat("b", 64), EvidenceRef: "nats://x", ReceivedAt: now}, now)
+	if err != nil {
 		t.Fatal(err)
 	}
 	item, attempt, ok, err := store.Claim(context.Background(), now)
 	if err != nil || !ok {
-		t.Fatalf("claim %v %v", ok, err)
+		t.Fatal(err)
 	}
 	return store, item, attempt, now
 }
-func lease(worker string, epoch int64) workledger.SessionLease {
-	return workledger.SessionLease{WorkerID: worker, AuthorityProfile: authorityProfile, ProfileVersion: "profile-v1", PolicyDigest: strings.Repeat("a", 64), SessionLineageID: strings.Repeat("1", 32), WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: epoch}
-}
-func usage(in, cached, out, reason int64) workledger.Usage {
-	return workledger.Usage{InputTokens: in, CachedInputTokens: cached, OutputTokens: out, ReasoningOutputTokens: reason, TotalTokens: in + out}
+func coordinatorFixture(t *testing.T) (*workledger.Store, workledger.WorkItem, workledger.ExecutorAttempt, time.Time) {
+	return coordinatorFixtureAt(t, filepath.Join(t.TempDir(), "db"))
 }
 
-func TestAgentdV1TokenUsageTotalsAndBreakdowns(t *testing.T) {
-	valid := workledger.Usage{InputTokens: 11, CachedInputTokens: 3, OutputTokens: 7, ReasoningOutputTokens: 2, TotalTokens: 18}
-	if !valid.Valid() {
-		t.Fatal("valid agentd tokenUsage rejected")
-	}
-	for _, malformed := range []workledger.Usage{
-		{InputTokens: 11, CachedInputTokens: 3, OutputTokens: 7, ReasoningOutputTokens: 2, TotalTokens: 23},
-		{InputTokens: 2, CachedInputTokens: 3, OutputTokens: 7, TotalTokens: 9},
-		{InputTokens: 11, OutputTokens: 1, ReasoningOutputTokens: 2, TotalTokens: 12},
+func TestRegisteredVerifierMappingsAndLocalOpaqueRevision(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		phase, packageOutcome, signal string
+	}{
+		{"pending", "waiting", "waiting"},
+		{"red", "continuation", "continuation_required"},
+		{"red", "missing_or_stale", "continuation_required"},
+		{"green", "satisfied", "satisfied"},
+		{"escalated", "escalated", "escalated"},
+		{"refused", "escalated", "escalated"},
+		{"escalated", "escalated", "escalated"},
 	} {
-		if malformed.Valid() {
-			t.Fatalf("malformed agentd tokenUsage accepted: %+v", malformed)
+		if !verifierPhaseMatches(tc.phase, tc.packageOutcome) || signalOutcome(tc.packageOutcome) != tc.signal {
+			t.Fatalf("mapping phase=%s outcome=%s", tc.phase, tc.packageOutcome)
 		}
 	}
+	local := &VerifierEvent{Phase: "refused", Outcome: "escalated", ContractDigest: digest, TaskEvidenceDigest: digest, HeadRevision: "local:unavailable:verifier:turn-42:observation:2", Reasons: []VerifierReason{{Code: "refused", EvidenceRef: "local:refused:" + digest}}, EvidenceRefs: []string{"local:refused:" + digest}}
+	if !validVerifierResult(local) {
+		t.Fatal("local refusal with an opaque revision was rejected")
+	}
+	local.Reasons = nil
+	if validVerifierResult(local) {
+		t.Fatal("non-satisfied verifier result without reasons was accepted")
+	}
 }
 
-func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
-	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
+func TestRegisteredLifecycleAcceptsExactTransportAndVerifierPhases(t *testing.T) {
+	store, item, attempt, _ := coordinatorFixture(t)
 	defer store.Close()
-	broker := &fakeBroker{lease: lease("worker-1", 1), events: []Event{{Cursor: 1, Kind: "attempt_started", EvidenceRef: "sha256:start"}, {Cursor: 2, Kind: "attempt_completed", EvidenceRef: "sha256:result", Usage: usage(3, 2, 5, 5)}}}
-	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	result, err := ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
-	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ResultDigest != "sha256:result" {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	if err := store.Complete(ctx, attempt.ID, result, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
-		t.Fatalf("runtime success did not leave work waiting: %v", err)
-	}
-	n, u, err := store.CoordinatorUsage(ctx, item.ID)
-	if err != nil || n != 1 || u != usage(3, 2, 5, 5) {
-		t.Fatalf("usage n=%d u=%+v err=%v", n, u, err)
-	}
-	if broker.create.BindingKey != "session:"+item.ID || broker.turns[0].IdempotencyKey != attempt.IdempotencyKey {
-		t.Fatalf("broker requests=%+v %+v", broker.create, broker.turns)
-	}
-}
-
-func TestCursorOrderingDuplicatesAndRestartReplay(t *testing.T) {
-	ctx := context.Background()
-	store, item, _, now := coordinatorFixture(t)
-	defer store.Close()
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	one := workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: usage(1, 0, 2, 0)}
-	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, one, now); err != nil || !ok {
-		t.Fatal(ok, err)
-	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}, now); err == nil {
-		t.Fatal("cursor gap accepted")
-	}
-	second := workledger.CoordinatorEvent{Cursor: 2, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, second, now); err != nil {
-		t.Fatalf("contiguous cursor rejected: %v", err)
-	}
-	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, one, now); err != nil || ok {
-		t.Fatalf("restart replay before cursor=%v %v", ok, err)
-	}
-	if ok, err := store.RecordCoordinatorEvent(ctx, item.ID, second, now); err != nil || ok {
-		t.Fatalf("restart duplicate=%v %v", ok, err)
-	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 2, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: usage(1, 0, 0, 0)}, now); err == nil {
-		t.Fatal("duplicate conflict accepted")
-	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 3, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", Usage: workledger.Usage{InputTokens: 1, TotalTokens: 2}}, now); err == nil {
-		t.Fatal("inconsistent total accepted")
-	}
-}
-
-func TestReassignmentIsExactEpochIdempotentAndPreservesSession(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "committed-reassignment-restart.db")
-	store, item, _, now := coordinatorFixtureAt(t, path)
-	t.Cleanup(func() { _ = store.Close() })
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetAgentdSession(ctx, item.ID, lease("worker-1", 1), "logical-session", now); err != nil {
-		t.Fatal(err)
-	}
-	broker := &fakeBroker{replacement: lease("worker-2", 2)}
-	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	b, err := ex.ReassignAfterLoss(ctx, item.ID, 1)
-	if err != nil || b.AgentdSessionID != "logical-session" {
-		t.Fatalf("replacement lost resume identity: %+v %v", b, err)
-	}
-	wantKey := reassignmentIdempotencyKey("session:"+item.ID, 1)
-	if broker.reassign.IdempotencyKey != wantKey {
-		t.Fatalf("reassignment idempotency key=%q want %q", broker.reassign.IdempotencyKey, wantKey)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	store, err = workledger.Open(path)
+	executor := &Executor{Store: store}
+	task, err := executor.registeredTask(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex.Store = store
-	broker.err = errors.New("broker must not be called for committed replay")
-	replayed, err := ex.ReassignAfterLoss(ctx, item.ID, 1)
-	if err != nil || replayed.WorkerID != "worker-2" || replayed.WorkerFenceEpoch != 2 {
-		t.Fatalf("committed replay derived a new generation: binding=%+v err=%v", replayed, err)
+	binding := workledger.SessionBinding{AgentdSessionID: "session", SubmittedTurnID: "turn", ModelEffectID: "model:key", WorkerID: "worker", WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: 1}
+	base := func(cursor int64, phase string) Event {
+		return Event{Cursor: cursor, SessionID: binding.AgentdSessionID, TurnID: binding.SubmittedTurnID, ModelEffectID: binding.ModelEffectID, Phase: phase, WorkerID: binding.WorkerID, StorageLineageID: binding.WorkerStorageLineageID, FenceEpoch: binding.WorkerFenceEpoch, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest}
 	}
-	if _, err := store.Reassignment(ctx, item.ID, 2); err == nil {
-		t.Fatal("committed replay created a successor-generation transition")
-	}
-	broker.err = nil
-	if _, err := broker.Reassign(ctx, ReassignRequest{BindingKey: "session:" + item.ID, PredecessorWorker: "worker-1", PredecessorEpoch: 1, IdempotencyKey: wantKey}); err != nil {
-		t.Fatalf("same-key same-successor replay denied: %v", err)
-	}
-	broker.replacement = lease("worker-3", 2)
-	if _, err := broker.Reassign(ctx, ReassignRequest{BindingKey: "session:" + item.ID, PredecessorWorker: "worker-1", PredecessorEpoch: 1, IdempotencyKey: wantKey}); err == nil {
-		t.Fatal("conflicting key/successor replay accepted")
-	}
-	if _, err := store.ReassignSession(ctx, item.ID, "worker-1", 1, lease("worker-2", 2), now); err != nil {
-		t.Fatalf("same broker successor not idempotent: %v", err)
-	}
-	if _, err := store.ReassignSession(ctx, item.ID, "worker-1", 1, lease("worker-3", 2), now); err == nil {
-		t.Fatal("different successor replay accepted")
-	}
-	if _, err := store.ReassignSession(ctx, item.ID, "worker-2", 2, lease("worker-3", 4), now); err == nil {
-		t.Fatal("nonconsecutive epoch accepted")
-	}
-}
-
-func TestConcurrentEventAndReassignmentFencesOneSide(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "concurrent.db")
-	store, item, _, now := coordinatorFixtureAt(t, path)
-	defer store.Close()
-	other, err := workledger.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, err := other.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_started"}, now)
-		errs <- err
-	}()
-	go func() {
-		defer wg.Done()
-		_, err := store.ReassignSession(ctx, item.ID, "worker-1", 1, lease("worker-2", 2), now)
-		errs <- err
-	}()
-	wg.Wait()
-	close(errs)
-	success := 0
-	for err := range errs {
-		if err == nil {
-			success++
+	for cursor, phase := range []string{"queued", "authorized", "running", "completed"} {
+		if !validEvent(base(int64(cursor+1), phase), binding, task) {
+			t.Fatalf("transport phase %q was rejected", phase)
 		}
 	}
-	if success == 0 {
-		t.Fatal("concurrent boundary made no durable progress")
+	pending := base(5, "pending")
+	pending.Verifier = &VerifierEvent{Phase: "pending", Outcome: "waiting", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "waiting"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if !validEvent(pending, binding, task) {
+		t.Fatal("pending verifier phase was rejected")
 	}
-	b, err := store.SessionBinding(ctx, item.ID)
-	if err != nil {
-		t.Fatal(err)
+	green := base(6, "green")
+	green.Verifier = &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if !validEvent(green, binding, task) {
+		t.Fatal("green verifier phase was rejected")
 	}
-	if b.WorkerID == "worker-2" && b.WorkerFenceEpoch != 2 {
-		t.Fatalf("torn reassignment binding: %+v", b)
+	queuedWithVerifier := base(1, "queued")
+	queuedWithVerifier.Verifier = green.Verifier
+	if validEvent(queuedWithVerifier, binding, task) {
+		t.Fatal("verifier coupled to queued transport phase was accepted")
 	}
-	if b.EventCursor != 0 && b.EventCursor != 1 {
-		t.Fatalf("torn event cursor: %+v", b)
+	if validEvent(base(5, "pending"), binding, task) {
+		t.Fatal("verifier-free pending phase was accepted")
 	}
-}
-
-func TestSubmitRetryUsesSameIdempotencyKey(t *testing.T) {
-	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
-	defer store.Close()
-	broker := &fakeBroker{lease: lease("worker-1", 1)}
-	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	_, _ = ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
-	_, _ = ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
-	if len(broker.turns) != 2 || broker.turns[0].IdempotencyKey != broker.turns[1].IdempotencyKey {
-		t.Fatalf("submit did not preserve idempotency: %+v", broker.turns)
-	}
-}
-func TestBrokerFailure(t *testing.T) {
-	store, item, _, now := coordinatorFixture(t)
-	defer store.Close()
-	if _, err := store.BindSessionLease(context.Background(), item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	ex := &Executor{Store: store, Broker: &fakeBroker{err: errors.New("down")}}
-	if _, err := ex.ReassignAfterLoss(context.Background(), item.ID, 1); err == nil {
-		t.Fatal("broker failure reassigned")
+	malformed := green
+	malformed.Verifier = &VerifierEvent{Phase: "pending", Outcome: "satisfied", ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}
+	if validEvent(malformed, binding, task) {
+		t.Fatal("malformed phase/verifier coupling was accepted")
 	}
 }
 
-func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "reassignment-restart.db")
-	store, item, attempt, now := coordinatorFixtureAt(t, path)
-	t.Cleanup(func() { _ = store.Close() })
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetAgentdSession(ctx, item.ID, lease("worker-1", 1), "agentd-session-1", now); err != nil {
-		t.Fatal(err)
-	}
-	broker := &fakeBroker{lease: lease("worker-1", 1), replacement: lease("worker-2", 2), statusState: "pending"}
+func TestRegisteredSubmitRecoversLostResponseWithDurableWorkItemKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, first, now := coordinatorFixtureAt(t, path)
+	broker := &lostResponseBroker{lease: fixtureTestLease()}
 	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
-		t.Fatal("pending broker adoption was committed")
+	firstResult, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+	if err != nil || firstResult.Outcome != workledger.OutcomeRetryableFailure {
+		t.Fatalf("first execute=%+v err=%v", firstResult, err)
 	}
-	pending, err := store.Reassignment(ctx, item.ID, 1)
-	if err != nil || pending.Phase != workledger.ReassignmentBrokerCommitted {
-		t.Fatalf("broker-committed crash point was not durable: transition=%+v err=%v", pending, err)
+	if err := store.Complete(t.Context(), first.ID, firstResult, now); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -330,42 +126,91 @@ func TestReassignmentSagaBlocksRoutingAndResumesAfterConfirmedAdoption(t *testin
 	store, err = workledger.Open(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	defer store.Close()
+	item, retryAttempt, ok, err := store.Claim(t.Context(), now.Add(time.Second))
+	if err != nil || !ok {
+		t.Fatalf("retry claim ok=%v err=%v", ok, err)
 	}
 	executor.Store = store
-	if err := store.RoutingReady(ctx, item.ID); err == nil {
-		t.Fatal("routing remained open during reassignment")
+	retryResult, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: retryAttempt})
+	if err != nil || retryResult.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("retry execute=%+v err=%v", retryResult, err)
 	}
-	result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
-	if err != nil || result.RetryClassification != "coordinator_reassignment" || len(broker.turns) != 0 {
-		t.Fatalf("routing barrier result=%+v turns=%d err=%v", result, len(broker.turns), err)
+	if len(broker.submitKeys) != 2 || broker.submitKeys[0] != broker.submitKeys[1] || broker.logicalSubmissions != 1 {
+		t.Fatalf("submit keys=%v logical submissions=%d", broker.submitKeys, broker.logicalSubmissions)
 	}
-	broker.statusState = "confirmed"
-	binding, err := executor.ReassignAfterLoss(ctx, item.ID, 1)
-	if err != nil || binding.WorkerID != "worker-2" || binding.WorkerFenceEpoch != 2 {
+	if err := store.Complete(t.Context(), retryAttempt.ID, retryResult, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	item, pollAttempt, ok, err := store.Claim(t.Context(), now.Add(6*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("poll claim ok=%v err=%v", ok, err)
+	}
+	if result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: pollAttempt}); err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("poll execute=%+v err=%v", result, err)
+	}
+	if len(broker.submitKeys) != 2 {
+		t.Fatalf("later poll submitted again: %v", broker.submitKeys)
+	}
+	binding, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || binding.RegisteredSubmitKey == "" || binding.RegisteredSubmitKey != binding.SubmittedIdempotencyKey {
 		t.Fatalf("binding=%+v err=%v", binding, err)
-	}
-	if err := store.RoutingReady(ctx, item.ID); err != nil {
-		t.Fatalf("confirmed reassignment did not reopen routing: %v", err)
-	}
-	transition, err := store.Reassignment(ctx, item.ID, 1)
-	if err != nil || transition.Phase != workledger.ReassignmentCoordinatorCommitted || transition.RebindIdempotencyKey != "broker-rebind-key" {
-		t.Fatalf("transition=%+v err=%v", transition, err)
 	}
 }
 
-func TestVerifierReceiptSurvivesRestartWithoutConsumingContinuationTwice(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "verifier-restart.db")
+func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
 	store, item, attempt, now := coordinatorFixtureAt(t, path)
-	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	lease := fixtureTestLease()
+	binding, err := store.BindSessionLease(t.Context(), item.ID, "agentd:binding:"+item.ID, lease, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/restart"}}
-	if err := (&Executor{Store: store, Now: func() time.Time { return now }}).RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
+	const historicalKey = "attempt:historical-submission-key"
+	if err := store.RecordRegisteredTurn(t.Context(), item.ID, lease, historicalKey, "historical-session", "historical-turn", "model:"+historicalKey, 7, now); err != nil {
+		t.Fatal(err)
+	}
+	if binding.RegisteredSubmitKey != "" {
+		t.Fatalf("pre-migration binding registered key=%q", binding.RegisteredSubmitKey)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	migrated, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || migrated.RegisteredSubmitKey != historicalKey || migrated.SubmittedIdempotencyKey != historicalKey || migrated.ActiveModelEffectID != "model:"+historicalKey {
+		t.Fatalf("migrated binding=%+v err=%v", migrated, err)
+	}
+	broker := &resumePollingBroker{lease: lease}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ExternalCorrelation != "historical-turn" {
+		t.Fatalf("resume execute=%+v err=%v", result, err)
+	}
+	if broker.submits != 0 || broker.cursor != 7 || broker.bindingKey != migrated.BindingKey {
+		t.Fatalf("resume submits=%d cursor=%d binding=%q", broker.submits, broker.cursor, broker.bindingKey)
+	}
+	resumed, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || resumed.RegisteredSubmitKey != historicalKey {
+		t.Fatalf("resumed binding=%+v err=%v", resumed, err)
+	}
+}
+
+func TestRegisteredContinuationEffectProgressionIsDurable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, first, now := coordinatorFixtureAt(t, path)
+	broker := &continuationBroker{lease: fixtureTestLease()}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	root, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+	if err != nil || root.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("root execute=%+v err=%v", root, err)
+	}
+	if err := store.Complete(t.Context(), first.ID, root, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -376,153 +221,263 @@ func TestVerifierReceiptSurvivesRestartWithoutConsumingContinuationTwice(t *test
 		t.Fatal(err)
 	}
 	defer store.Close()
-	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err != nil {
-		t.Fatalf("exact verifier replay after restart failed: %v", err)
-	}
-	conflict := result
-	conflict.HeadRevision = strings.Repeat("c", 40)
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
-		t.Fatal("conflicting verifier replay after restart was accepted")
-	}
-	if _, _, ok, err := store.Claim(ctx, now); err != nil || !ok {
-		t.Fatalf("exact replay consumed the continuation twice: ok=%v err=%v", ok, err)
-	}
-}
-
-func TestNamedVerifierTerminalTransitionAndBoundedContinuation(t *testing.T) {
-	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
-	defer store.Close()
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)}, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
-		t.Fatal(err)
-	}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
-		t.Fatalf("exact verifier replay was not idempotent: %v", err)
-	}
-	conflict := continuation
-	conflict.EvidenceRefs = []string{"evidence://verification/conflict"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, conflict); err == nil {
-		t.Fatal("conflicting verifier replay was accepted")
-	}
-	_, secondAttempt, ok, err := store.Claim(ctx, now)
+	item, continuation, ok, err := store.Claim(t.Context(), now.Add(5*time.Second))
 	if err != nil || !ok {
-		t.Fatalf("bounded continuation was not claimable: ok=%v err=%v", ok, err)
+		t.Fatalf("continuation claim ok=%v err=%v", ok, err)
 	}
-	if err := store.Complete(ctx, secondAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
+	executor.Store = store
+	broker.events = []Event{broker.event(6, 2, broker.continuationEffect, "authorized", nil)}
+	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: continuation})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("continuation execute=%+v err=%v", result, err)
+	}
+	if err := store.Complete(t.Context(), continuation.ID, result, now.Add(4*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	stale := continuation
-	stale.TaskEvidenceDigest = "sha256:stale"
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, stale); err == nil {
-		t.Fatal("stale verifier evidence accepted")
-	}
-	satisfied := continuation
-	satisfied.AttemptID = secondAttempt.ID
-	satisfied.Outcome, satisfied.ReasonCodes, satisfied.EvidenceRefs = "satisfied", nil, []string{"evidence://verification/2"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, satisfied); err != nil {
-		t.Fatalf("terminal verifier replay was not idempotent: %v", err)
-	}
-	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
-		t.Fatalf("satisfied work remained claimable: ok=%v err=%v", ok, err)
-	}
-}
-
-func TestReassignmentConflictIsDurablyEscalated(t *testing.T) {
-	ctx := context.Background()
-	store, item, _, now := coordinatorFixture(t)
-	defer store.Close()
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	broker := &fakeBroker{replacement: lease("worker-2", 2), statusState: "conflict", statusErrorCode: "agentd_rebind_conflict"}
-	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
-	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
-		t.Fatal("broker conflict was not surfaced")
-	}
-	transition, err := store.Reassignment(ctx, item.ID, 1)
-	if err != nil || transition.Phase != workledger.ReassignmentEscalated || transition.BrokerState != "conflict" || transition.ErrorCode != "agentd_rebind_conflict" {
-		t.Fatalf("conflict was not durable: transition=%+v err=%v", transition, err)
-	}
-	if _, err := executor.ReassignAfterLoss(ctx, item.ID, 1); err == nil {
-		t.Fatal("durably escalated replay was accepted")
-	}
-}
-
-func TestNamedVerifierCannotSatisfyWithoutDurableRuntimeCompletion(t *testing.T) {
-	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
-	defer store.Close()
-	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
+	store, err = workledger.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	result := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, result); err == nil {
-		t.Fatal("verifier satisfied work without a durable attempt_completed event")
-	}
-}
-
-func TestNamedVerifierEscalatesAfterContinuationBudgetIsExhausted(t *testing.T) {
-	ctx := context.Background()
-	store, item, attempt, now := coordinatorFixture(t)
 	defer store.Close()
-	if _, err := store.BindSessionLease(ctx, item.ID, "session:"+item.ID, lease("worker-1", 1), now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.RecordCoordinatorEvent(ctx, item.ID, workledger.CoordinatorEvent{Cursor: 1, WorkerID: "worker-1", WorkerFenceEpoch: 1, Kind: "attempt_completed", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)}, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Complete(ctx, attempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.WorkTaskSnapshot(ctx, item.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	executor := &Executor{Store: store, Now: func() time.Time { return now }}
-	continuation := workledger.VerifierResult{AttemptID: attempt.ID, VerifierID: snapshot.VerifierID, CompletionContract: snapshot.CompletionContract, ContractDigest: snapshot.ContractDigest, TaskEvidenceDigest: snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("b", 40), Outcome: "continuation", ReasonCodes: []string{"validation_missing"}, EvidenceRefs: []string{"evidence://verification/1"}}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
-		t.Fatal(err)
-	}
-	_, secondAttempt, ok, err := store.Claim(ctx, now)
+	item, terminal, ok, err := store.Claim(t.Context(), now.Add(10*time.Second))
 	if err != nil || !ok {
-		t.Fatalf("first continuation was not claimable: ok=%v err=%v", ok, err)
+		t.Fatalf("terminal claim ok=%v err=%v", ok, err)
 	}
-	if err := store.Complete(ctx, secondAttempt.ID, workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting}, now); err != nil {
-		t.Fatal(err)
+	executor.Store = store
+	broker.events = []Event{
+		broker.event(7, 3, broker.continuationEffect, "running", nil),
+		broker.event(8, 3, broker.continuationEffect, "completed", nil),
+		broker.event(9, 3, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
 	}
-	continuation.AttemptID = secondAttempt.ID
-	continuation.EvidenceRefs = []string{"evidence://verification/2"}
-	if err := executor.RecordRepositoryVerifierResult(ctx, item.ID, continuation); err != nil {
-		t.Fatal(err)
+	result, err = executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: terminal})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("terminal execute=%+v err=%v", result, err)
 	}
-	if _, _, ok, err := store.Claim(ctx, now); err != nil || ok {
-		t.Fatalf("exhausted continuation remained claimable: ok=%v err=%v", ok, err)
+	binding, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || binding.ModelEffectID != broker.rootEffect || binding.ActiveModelEffectID != broker.continuationEffect || binding.ActiveEffectAttempt != 3 || binding.EventCursor != 9 {
+		t.Fatalf("binding=%+v err=%v", binding, err)
 	}
-	if err := store.WakeWaiting(ctx, item.ID, now); err == nil {
-		t.Fatal("exhausted continuation remained waiting instead of escalating")
+	replay := workledger.RegisteredCoordinatorEvent{CoordinatorEvent: workledger.CoordinatorEvent{Cursor: 9, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_green", EvidenceRef: "agentd:registered-events:" + broker.continuationEffect + ":3:9"}, ModelEffectID: broker.continuationEffect, Attempt: 3, Phase: "green"}
+	if inserted, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err != nil || inserted {
+		t.Fatalf("identical replay inserted=%v err=%v", inserted, err)
+	}
+	replay.Attempt = 4
+	replay.EvidenceRef = "agentd:registered-events:" + broker.continuationEffect + ":4:9"
+	if _, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err == nil {
+		t.Fatal("conflicting replay was accepted")
+	}
+}
+
+func TestRegisteredContinuationEffectRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Event, string)
+	}{
+		{"substitution is not authorized", func(e *Event, root string) { e.Phase = "running" }},
+		{"wrong continuation attempt", func(e *Event, root string) { e.Attempt = 3 }},
+		{"conflicting continuation progression", func(e *Event, root string) { e.Attempt = 1 }},
+		{"stale root after progression", func(e *Event, root string) { e.ModelEffectID = root; e.Phase = "running" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, item, first, now := coordinatorFixture(t)
+			defer store.Close()
+			broker := &continuationBroker{lease: fixtureTestLease()}
+			executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+			root, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+			if err != nil || root.Outcome != workledger.OutcomeWaiting || store.Complete(t.Context(), first.ID, root, now) != nil {
+				t.Fatalf("root result=%+v err=%v", root, err)
+			}
+			item, next, ok, err := store.Claim(t.Context(), now.Add(5*time.Second))
+			if err != nil || !ok {
+				t.Fatalf("claim ok=%v err=%v", ok, err)
+			}
+			broker.events = []Event{broker.event(6, 2, broker.continuationEffect, "authorized", nil), broker.event(7, 3, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+			if tc.name == "stale root after progression" {
+				broker.events = broker.events[:1]
+				firstContinuation := broker.events[0]
+				if result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: next}); err != nil || result.Outcome != workledger.OutcomeWaiting {
+					t.Fatalf("authorize result=%+v err=%v", result, err)
+				}
+				binding, _ := store.SessionBinding(t.Context(), item.ID)
+				if binding.ActiveModelEffectID != firstContinuation.ModelEffectID {
+					t.Fatalf("continuation was not activated: %+v", binding)
+				}
+				broker.events = []Event{broker.event(7, 3, broker.rootEffect, "running", nil)}
+			} else {
+				tc.mutate(&broker.events[0], broker.rootEffect)
+			}
+			result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: next})
+			if err != nil || result.Outcome != workledger.OutcomeRetryableFailure || result.RetryClassification != "coordinator_fence" {
+				t.Fatalf("refusal result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+type continuationBroker struct {
+	lease                           workledger.SessionLease
+	rootEffect, continuationEffect  string
+	admissionDigest, evidenceDigest string
+	events                          []Event
+}
+
+func (b *continuationBroker) Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *continuationBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
+	b.rootEffect, b.continuationEffect = "model:"+request.IdempotencyKey, "model:continuation:"+request.IdempotencyKey
+	b.admissionDigest, b.evidenceDigest = request.AdmissionTaskDigest, request.TaskEvidenceDigest
+	return BrokerTurn{SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: b.rootEffect, Cursor: 1, Lease: b.lease}, nil
+}
+func (b *continuationBroker) event(cursor, attempt int64, effect, phase string, verifier *VerifierEvent) Event {
+	return Event{Cursor: cursor, Attempt: attempt, SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: effect, Phase: phase, WorkerID: b.lease.WorkerID, StorageLineageID: b.lease.WorkerStorageLineageID, FenceEpoch: b.lease.WorkerFenceEpoch, AdmissionTaskDigest: b.admissionDigest, TaskEvidenceDigest: b.evidenceDigest, Verifier: verifier}
+}
+func (b *continuationBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
+	if request.Cursor == 1 {
+		return BrokerEvents{Lease: b.lease, Events: []Event{
+			b.event(2, 0, b.rootEffect, "authorized", nil),
+			b.event(3, 1, b.rootEffect, "running", nil),
+			b.event(4, 1, b.rootEffect, "completed", nil),
+			b.event(5, 1, b.rootEffect, "red", &VerifierEvent{Phase: "red", Outcome: "continuation", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
+		}}, nil
+	}
+	if b.events == nil {
+		b.events = []Event{
+			b.event(6, 2, b.continuationEffect, "authorized", nil),
+			b.event(7, 3, b.continuationEffect, "running", nil),
+			b.event(8, 3, b.continuationEffect, "completed", nil),
+			b.event(9, 3, b.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
+		}
+	}
+	return BrokerEvents{Lease: b.lease, Events: b.events}, nil
+}
+func (b *continuationBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *continuationBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
+}
+
+type lostResponseBroker struct {
+	lease              workledger.SessionLease
+	submitKeys         []string
+	logicalSubmissions int
+	turn               BrokerTurn
+}
+
+type resumePollingBroker struct {
+	lease      workledger.SessionLease
+	submits    int
+	bindingKey string
+	cursor     int64
+}
+
+func (b *resumePollingBroker) Acquire(_ context.Context, _ AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *resumePollingBroker) SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error) {
+	b.submits++
+	return BrokerTurn{}, errors.New("submitted binding must only poll")
+}
+func (b *resumePollingBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
+	b.bindingKey, b.cursor = request.BindingKey, request.Cursor
+	return BrokerEvents{Lease: b.lease}, nil
+}
+func (b *resumePollingBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *resumePollingBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
+}
+
+func (b *lostResponseBroker) Acquire(_ context.Context, _ AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *lostResponseBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
+	b.submitKeys = append(b.submitKeys, request.IdempotencyKey)
+	if b.turn.TurnID == "" {
+		b.logicalSubmissions++
+		b.turn = BrokerTurn{SessionID: "lost-session", TurnID: "lost-turn", ModelEffectID: "model:" + request.IdempotencyKey, Cursor: 1, Lease: b.lease}
+		return BrokerTurn{}, errors.New("response lost after broker acceptance")
+	}
+	if request.IdempotencyKey != b.submitKeys[0] {
+		return BrokerTurn{}, errors.New("broker rejected changed replay key")
+	}
+	return b.turn, nil
+}
+func (b *lostResponseBroker) StreamEvents(_ context.Context, _ StreamEventsRequest) (BrokerEvents, error) {
+	return BrokerEvents{Lease: b.lease}, nil
+}
+func (b *lostResponseBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *lostResponseBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
+}
+
+func fixtureTestLease() workledger.SessionLease {
+	return workledger.SessionLease{WorkerID: "fixture-worker", AuthorityProfile: authorityProfile, ProfileVersion: "fixture-profile-v1", PolicyDigest: strings.Repeat("a", 64), SessionLineageID: strings.Repeat("1", 32), WorkerStorageLineageID: strings.Repeat("2", 32), WorkerFenceEpoch: 1}
+}
+
+func TestRecordVerifierEventRejectsDigestsOutsideRegisteredTaskSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Event)
+	}{
+		{
+			name: "wrong verifier contract digest",
+			mutate: func(event *Event) {
+				event.Verifier.ContractDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "wrong verifier task evidence digest",
+			mutate: func(event *Event) {
+				event.Verifier.TaskEvidenceDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "wrong outer task evidence digest",
+			mutate: func(event *Event) {
+				event.TaskEvidenceDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, item, attempt, now := coordinatorFixture(t)
+			defer store.Close()
+			executor := &Executor{Store: store, Now: func() time.Time { return now }}
+			task, err := executor.registeredTask(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := Event{
+				AdmissionTaskDigest: task.Digest,
+				TaskEvidenceDigest:  task.Snapshot.TaskEvidenceDigest,
+				Verifier: &VerifierEvent{
+					Phase:              "green",
+					Outcome:            "satisfied",
+					ContractDigest:     task.Snapshot.ContractDigest,
+					TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest,
+					HeadRevision:       strings.Repeat("a", 40),
+					EvidenceRefs:       []string{"fixture://github-green-pr-v1/verifier"},
+				},
+			}
+			tc.mutate(&event)
+			if err := executor.recordVerifierEvent(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}, workledger.SessionBinding{}, event); err == nil {
+				t.Fatal("well-formed verifier digests outside the registered snapshot were accepted")
+			}
+
+			event.TaskEvidenceDigest = task.Snapshot.TaskEvidenceDigest
+			event.Verifier.ContractDigest = task.Snapshot.ContractDigest
+			event.Verifier.TaskEvidenceDigest = task.Snapshot.TaskEvidenceDigest
+			event.Verifier.HeadRevision = strings.Repeat("b", 40)
+			if err := executor.recordVerifierEvent(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}, workledger.SessionBinding{}, event); err != nil {
+				t.Fatalf("rejected verifier result was persisted: %v", err)
+			}
+		})
 	}
 }
