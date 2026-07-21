@@ -183,7 +183,7 @@ func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
 	}
 	defer store.Close()
 	migrated, err := store.SessionBinding(t.Context(), item.ID)
-	if err != nil || migrated.RegisteredSubmitKey != historicalKey || migrated.SubmittedIdempotencyKey != historicalKey {
+	if err != nil || migrated.RegisteredSubmitKey != historicalKey || migrated.SubmittedIdempotencyKey != historicalKey || migrated.ActiveModelEffectID != "model:"+historicalKey {
 		t.Fatalf("migrated binding=%+v err=%v", migrated, err)
 	}
 	broker := &resumePollingBroker{lease: lease}
@@ -199,6 +199,152 @@ func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
 	if err != nil || resumed.RegisteredSubmitKey != historicalKey {
 		t.Fatalf("resumed binding=%+v err=%v", resumed, err)
 	}
+}
+
+func TestRegisteredContinuationEffectProgressionIsDurable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, first, now := coordinatorFixtureAt(t, path)
+	broker := &continuationBroker{lease: fixtureTestLease()}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	root, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+	if err != nil || root.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("root execute=%+v err=%v", root, err)
+	}
+	if err := store.Complete(t.Context(), first.ID, root, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, continuation, ok, err := store.Claim(t.Context(), now.Add(5*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("continuation claim ok=%v err=%v", ok, err)
+	}
+	executor.Store = store
+	broker.events = []Event{broker.event(3, 1, broker.continuationEffect, "authorized", nil)}
+	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: continuation})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("continuation execute=%+v err=%v", result, err)
+	}
+	if err := store.Complete(t.Context(), continuation.ID, result, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, terminal, ok, err := store.Claim(t.Context(), now.Add(10*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("terminal claim ok=%v err=%v", ok, err)
+	}
+	executor.Store = store
+	broker.events = []Event{broker.event(4, 1, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+	result, err = executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: terminal})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("terminal execute=%+v err=%v", result, err)
+	}
+	binding, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || binding.ModelEffectID != broker.rootEffect || binding.ActiveModelEffectID != broker.continuationEffect || binding.ActiveEffectAttempt != 1 || binding.EventCursor != 4 {
+		t.Fatalf("binding=%+v err=%v", binding, err)
+	}
+	replay := workledger.RegisteredCoordinatorEvent{CoordinatorEvent: workledger.CoordinatorEvent{Cursor: 4, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_green", EvidenceRef: "agentd:registered-events:" + broker.continuationEffect + ":1:4"}, ModelEffectID: broker.continuationEffect, Attempt: 1, Phase: "green"}
+	if inserted, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err != nil || inserted {
+		t.Fatalf("identical replay inserted=%v err=%v", inserted, err)
+	}
+	replay.Attempt = 2
+	replay.EvidenceRef = "agentd:registered-events:" + broker.continuationEffect + ":2:4"
+	if _, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err == nil {
+		t.Fatal("conflicting replay was accepted")
+	}
+}
+
+func TestRegisteredContinuationEffectRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Event, string)
+	}{
+		{"substitution is not authorized", func(e *Event, root string) { e.Phase = "running" }},
+		{"wrong continuation attempt", func(e *Event, root string) { e.Attempt = 2 }},
+		{"conflicting continuation progression", func(e *Event, root string) { e.Attempt = 0 }},
+		{"stale root after progression", func(e *Event, root string) { e.ModelEffectID = root; e.Phase = "running" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, item, first, now := coordinatorFixture(t)
+			defer store.Close()
+			broker := &continuationBroker{lease: fixtureTestLease()}
+			executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+			root, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+			if err != nil || root.Outcome != workledger.OutcomeWaiting || store.Complete(t.Context(), first.ID, root, now) != nil {
+				t.Fatalf("root result=%+v err=%v", root, err)
+			}
+			item, next, ok, err := store.Claim(t.Context(), now.Add(5*time.Second))
+			if err != nil || !ok {
+				t.Fatalf("claim ok=%v err=%v", ok, err)
+			}
+			broker.events = []Event{broker.event(3, 1, broker.continuationEffect, "authorized", nil), broker.event(4, 1, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+			if tc.name == "stale root after progression" {
+				broker.events = broker.events[:1]
+				firstContinuation := broker.events[0]
+				if result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: next}); err != nil || result.Outcome != workledger.OutcomeWaiting {
+					t.Fatalf("authorize result=%+v err=%v", result, err)
+				}
+				binding, _ := store.SessionBinding(t.Context(), item.ID)
+				if binding.ActiveModelEffectID != firstContinuation.ModelEffectID {
+					t.Fatalf("continuation was not activated: %+v", binding)
+				}
+				broker.events = []Event{broker.event(4, 1, broker.rootEffect, "running", nil)}
+			} else {
+				tc.mutate(&broker.events[0], broker.rootEffect)
+			}
+			result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: next})
+			if err != nil || result.Outcome != workledger.OutcomeRetryableFailure || result.RetryClassification != "coordinator_fence" {
+				t.Fatalf("refusal result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+type continuationBroker struct {
+	lease                           workledger.SessionLease
+	rootEffect, continuationEffect  string
+	admissionDigest, evidenceDigest string
+	events                          []Event
+}
+
+func (b *continuationBroker) Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *continuationBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
+	b.rootEffect, b.continuationEffect = "model:"+request.IdempotencyKey, "model:continuation:"+request.IdempotencyKey
+	b.admissionDigest, b.evidenceDigest = request.AdmissionTaskDigest, request.TaskEvidenceDigest
+	return BrokerTurn{SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: b.rootEffect, Cursor: 1, Lease: b.lease}, nil
+}
+func (b *continuationBroker) event(cursor, attempt int64, effect, phase string, verifier *VerifierEvent) Event {
+	return Event{Cursor: cursor, Attempt: attempt, SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: effect, Phase: phase, WorkerID: b.lease.WorkerID, StorageLineageID: b.lease.WorkerStorageLineageID, FenceEpoch: b.lease.WorkerFenceEpoch, AdmissionTaskDigest: b.admissionDigest, TaskEvidenceDigest: b.evidenceDigest, Verifier: verifier}
+}
+func (b *continuationBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
+	if request.Cursor == 1 {
+		return BrokerEvents{Lease: b.lease, Events: []Event{b.event(2, 0, b.rootEffect, "red", &VerifierEvent{Phase: "red", Outcome: "continuation", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}}, nil
+	}
+	if b.events == nil {
+		b.events = []Event{b.event(3, 1, b.continuationEffect, "authorized", nil), b.event(4, 1, b.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+	}
+	return BrokerEvents{Lease: b.lease, Events: b.events}, nil
+}
+func (b *continuationBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *continuationBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
 }
 
 type lostResponseBroker struct {

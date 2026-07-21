@@ -18,12 +18,12 @@ const durablePollInterval = 5 * time.Second
 const durableWaitDeadline = 30 * time.Minute
 
 type SessionBinding struct {
-	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest       string
-	SessionLineageID, WorkerID, WorkerStorageLineageID                           string
-	AgentdSessionID, CheckpointRef, State                                        string
-	RegisteredSubmitKey, SubmittedIdempotencyKey, ModelEffectID, SubmittedTurnID string
-	EventCursor, WorkerFenceEpoch                                                int64
-	CreatedAt, UpdatedAt                                                         time.Time
+	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest                            string
+	SessionLineageID, WorkerID, WorkerStorageLineageID                                                string
+	AgentdSessionID, CheckpointRef, State                                                             string
+	RegisteredSubmitKey, SubmittedIdempotencyKey, ModelEffectID, ActiveModelEffectID, SubmittedTurnID string
+	EventCursor, WorkerFenceEpoch, ActiveEffectAttempt                                                int64
+	CreatedAt, UpdatedAt                                                                              time.Time
 }
 
 type SessionLease struct {
@@ -38,6 +38,15 @@ type CoordinatorEvent struct {
 	WorkerID, Kind, EvidenceRef string
 	WorkerFenceEpoch            int64
 	Usage                       Usage
+}
+
+// RegisteredCoordinatorEvent is an authenticated registered-lifecycle event.
+// Its effect identity is kept separately from the immutable submitted root.
+type RegisteredCoordinatorEvent struct {
+	CoordinatorEvent
+	ModelEffectID string
+	Attempt       int64
+	Phase         string
 }
 
 type ReassignmentPhase string
@@ -126,10 +135,10 @@ func sameSessionLease(binding SessionBinding, lease SessionLease) bool {
 func (store *Store) SessionBinding(ctx context.Context, workItemID string) (SessionBinding, error) {
 	var binding SessionBinding
 	var created, updated int64
-	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,registered_submit_key,submitted_idempotency_key,model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
+	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,registered_submit_key,submitted_idempotency_key,model_effect_id,active_model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),active_effect_attempt,state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
 		&binding.WorkItemID, &binding.BindingKey, &binding.AuthorityProfile, &binding.ProfileVersion, &binding.PolicyDigest,
 		&binding.SessionLineageID, &binding.WorkerID, &binding.WorkerStorageLineageID, &binding.WorkerFenceEpoch,
-		&binding.AgentdSessionID, &binding.RegisteredSubmitKey, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
+		&binding.AgentdSessionID, &binding.RegisteredSubmitKey, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.ActiveModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.ActiveEffectAttempt, &binding.State, &created, &updated,
 	)
 	if err != nil {
 		return SessionBinding{}, err
@@ -171,7 +180,7 @@ func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string,
 	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || cursor <= 0 || !validLease(lease) {
 		return errors.New("submitted turn identity is incomplete")
 	}
-	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,submitted_turn_id=?,event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, turnID, cursor, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,active_model_effect_id=?,active_effect_attempt=0,submitted_turn_id=?,event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, modelEffectID, turnID, cursor, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
 	if err != nil {
 		return err
 	}
@@ -182,7 +191,7 @@ func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string,
 	if err != nil {
 		return err
 	}
-	if !sameSessionLease(binding, lease) || binding.AgentdSessionID != sessionID || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID || binding.EventCursor != cursor {
+	if !sameSessionLease(binding, lease) || binding.AgentdSessionID != sessionID || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.ActiveModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID || binding.EventCursor != cursor {
 		return errors.New("submitted turn conflicts with durable model effect")
 	}
 	return nil
@@ -255,6 +264,70 @@ func (store *Store) RecordCoordinatorEvent(ctx context.Context, workItemID strin
 		changed, _ = result.RowsAffected()
 		if changed != 1 {
 			return errors.New("coordinator cursor CAS lost")
+		}
+		inserted = true
+		return nil
+	})
+	return inserted, err
+}
+
+// RecordRegisteredCoordinatorEvent appends an exact ordered event and, only
+// for the authorized next continuation, advances the durable active effect.
+// The root model effect in session_bindings is intentionally never updated.
+func (store *Store) RecordRegisteredCoordinatorEvent(ctx context.Context, workItemID string, event RegisteredCoordinatorEvent, now time.Time) (bool, error) {
+	if event.Cursor <= 0 || event.WorkerID == "" || event.WorkerFenceEpoch <= 0 || event.Kind == "" || event.ModelEffectID == "" || event.Attempt < 0 || event.Phase == "" || !event.Usage.Valid() {
+		return false, errors.New("invalid registered coordinator event")
+	}
+	inserted := false
+	err := store.immediate(ctx, func(conn *sql.Conn) error {
+		var key, worker, profileVersion, policyDigest, storageLineage, rootEffect, activeEffect string
+		var epoch, cursor, activeAttempt int64
+		if err := conn.QueryRowContext(ctx, `SELECT binding_key,worker_id,profile_version,policy_digest,worker_storage_lineage_id,worker_fence_epoch,CAST(event_cursor AS INTEGER),model_effect_id,active_model_effect_id,active_effect_attempt FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(&key, &worker, &profileVersion, &policyDigest, &storageLineage, &epoch, &cursor, &rootEffect, &activeEffect, &activeAttempt); err != nil {
+			return err
+		}
+		if worker != event.WorkerID || epoch != event.WorkerFenceEpoch {
+			return errors.New("stale predecessor event rejected")
+		}
+		if event.Cursor <= cursor {
+			return store.matchCoordinatorEvent(ctx, conn, key, event.CoordinatorEvent)
+		}
+		if event.Cursor != cursor+1 {
+			return fmt.Errorf("coordinator event cursor gap: got %d after %d", event.Cursor, cursor)
+		}
+		if activeEffect == "" {
+			return errors.New("registered event active model effect is missing")
+		}
+		advance := event.ModelEffectID != activeEffect
+		if advance {
+			if activeEffect != rootEffect {
+				return errors.New("registered continuation effect already advanced")
+			}
+			var outcome string
+			if err := conn.QueryRowContext(ctx, `SELECT outcome FROM verifier_results WHERE work_item_id=?`, workItemID).Scan(&outcome); err != nil || outcome != "continuation_required" {
+				return errors.New("continuation effect lacks a durable root continuation verdict")
+			}
+			if event.Phase != "authorized" || event.Attempt != activeAttempt+1 {
+				return errors.New("continuation effect progression is invalid")
+			}
+		} else if event.Attempt < activeAttempt || event.Attempt > activeAttempt+1 {
+			return errors.New("registered event attempt progression is invalid")
+		}
+		result, err := conn.ExecContext(ctx, `INSERT INTO coordinator_events(binding_key,cursor,worker_id,fence_epoch,event_kind,evidence_ref,input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, key, event.Cursor, event.WorkerID, event.WorkerFenceEpoch, event.Kind, event.EvidenceRef, event.Usage.InputTokens, event.Usage.CachedInputTokens, event.Usage.OutputTokens, event.Usage.ReasoningOutputTokens, event.Usage.TotalTokens, millis(now))
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("coordinator event insert lost")
+		}
+		if advance {
+			activeEffect = event.ModelEffectID
+		}
+		result, err = conn.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=?,active_model_effect_id=?,active_effect_attempt=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND worker_storage_lineage_id=? AND event_cursor=?`, event.Cursor, activeEffect, event.Attempt, millis(now), workItemID, event.WorkerID, event.WorkerFenceEpoch, profileVersion, policyDigest, storageLineage, cursor)
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("registered coordinator cursor CAS lost")
 		}
 		inserted = true
 		return nil

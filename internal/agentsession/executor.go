@@ -155,7 +155,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 			return retry("coordinator_fence", "submitted turn conflicts"), nil
 		}
 		turnID = turn.TurnID
-		binding.AgentdSessionID, binding.ModelEffectID, binding.EventCursor = turn.SessionID, turn.ModelEffectID, turn.Cursor
+		binding.AgentdSessionID, binding.SubmittedTurnID, binding.ModelEffectID, binding.ActiveModelEffectID, binding.EventCursor = turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.ModelEffectID, turn.Cursor
 	}
 	task, err := e.registeredTask(ctx, request)
 	if err != nil {
@@ -172,7 +172,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		if !validEvent(event, binding, task) {
 			return retry("agentd_protocol", "agent event invalid"), nil
 		}
-		if _, err := e.Store.RecordCoordinatorEvent(ctx, request.WorkItem.ID, workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_" + event.Phase, EvidenceRef: "agentd:registered-events:" + event.ModelEffectID + ":" + fmt.Sprint(event.Cursor)}, e.now()); err != nil {
+		if _, err := e.Store.RecordRegisteredCoordinatorEvent(ctx, request.WorkItem.ID, workledger.RegisteredCoordinatorEvent{CoordinatorEvent: workledger.CoordinatorEvent{Cursor: event.Cursor, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_" + event.Phase, EvidenceRef: "agentd:registered-events:" + event.ModelEffectID + ":" + fmt.Sprint(event.Attempt) + ":" + fmt.Sprint(event.Cursor)}, ModelEffectID: event.ModelEffectID, Attempt: event.Attempt, Phase: event.Phase}, e.now()); err != nil {
 			return retry("coordinator_fence", "agent event rejected"), nil
 		}
 		if event.Verifier != nil {
@@ -189,7 +189,7 @@ func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
 func validEvent(e Event, binding workledger.SessionBinding, task RegisteredTask) bool {
-	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest != task.Digest || e.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest {
+	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID == "" || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest != task.Digest || e.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest {
 		return false
 	}
 	return validEventShape(e)
