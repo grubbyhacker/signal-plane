@@ -356,9 +356,16 @@ func (store *Store) Claim(ctx context.Context, now time.Time) (WorkItem, Executo
 		return WorkItem{}, ExecutorAttempt{}, false, err
 	}
 	defer tx.Rollback()
+	// Deadline exhaustion is terminal escalation and must not consume a model continuation.
+	if _, err := tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE state=? AND wait_deadline_at IS NOT NULL AND wait_deadline_at<=?`, StateFailed, millis(now), millis(now), StateWaiting, millis(now)); err != nil {
+		return WorkItem{}, ExecutorAttempt{}, false, err
+	}
 	var item WorkItem
 	err = tx.QueryRowContext(ctx, `SELECT w.id,w.route_snapshot_id,w.route_id,w.semantic_object_key,w.source,w.namespace,w.object_kind,w.object_id,w.source_revision,w.serialization_key,w.state,w.state_version,w.superseded_by_id,w.latest_executor_correlation,w.created_at,w.updated_at,w.terminal_at,w.next_attempt_at FROM work_items w WHERE w.state IN (?,?) AND w.next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM serialization_leases l WHERE l.serialization_key=w.serialization_key) ORDER BY w.next_attempt_at,w.created_at LIMIT 1`, StateAdmitted, StateWaiting, millis(now)).Scan(workItemScan(&item)...)
 	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return WorkItem{}, ExecutorAttempt{}, false, err
+		}
 		return WorkItem{}, ExecutorAttempt{}, false, nil
 	}
 	if err != nil {
@@ -473,12 +480,23 @@ func (store *Store) Complete(ctx context.Context, attemptID string, result Execu
 			}
 		case OutcomeWaiting:
 			attemptResult, nextState, terminal = AttemptRetryScheduled, StateWaiting, nil
-			next = nil
+			if result.NextAttemptAt == nil {
+				value := now.Add(durablePollInterval)
+				result.NextAttemptAt = &value
+			}
+			if result.DeadlineAt == nil {
+				value := now.Add(durableWaitDeadline)
+				result.DeadlineAt = &value
+			}
+			if !result.NextAttemptAt.After(now) || !result.DeadlineAt.After(*result.NextAttemptAt) {
+				return errors.New("waiting result requires future schedule and deadline")
+			}
+			next = millis(*result.NextAttemptAt)
 		default:
 			return fmt.Errorf("unsupported executor outcome %q", result.Outcome)
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE executor_attempts SET state=?,retry_classification=?,external_correlation=?,result_digest=?,sanitized_error=?,completed_at=? WHERE id=?`, attemptResult, result.RetryClassification, result.ExternalCorrelation, result.ResultDigest, result.SanitizedError, millis(now), attemptID); err == nil {
-			_, err = tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,latest_executor_correlation=?,updated_at=?,terminal_at=?,next_attempt_at=? WHERE id=? AND state=?`, nextState, result.ExternalCorrelation, millis(now), terminal, next, workID, StateActive)
+			_, err = tx.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,latest_executor_correlation=?,updated_at=?,terminal_at=?,next_attempt_at=?,wait_deadline_at=CASE WHEN ? THEN COALESCE(wait_deadline_at,?) ELSE wait_deadline_at END WHERE id=? AND state=?`, nextState, result.ExternalCorrelation, millis(now), terminal, next, result.Outcome == OutcomeWaiting, optionalMillis(result.DeadlineAt), workID, StateActive)
 		}
 	}
 	if err != nil {

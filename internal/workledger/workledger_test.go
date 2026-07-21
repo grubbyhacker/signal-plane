@@ -432,14 +432,48 @@ func TestRouteVersionCreatesNewWorkAndWaitingRequiresWakeup(t *testing.T) {
 	if err := store.Complete(ctx, attempt.ID, ExecutorResult{Outcome: OutcomeWaiting}, now.Add(4*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, claimed, err := store.Claim(ctx, now.Add(24*time.Hour)); err != nil || claimed {
-		t.Fatalf("externally waiting work became due without wakeup: %v %v", claimed, err)
+	if _, _, claimed, err := store.Claim(ctx, now.Add(9*time.Second)); err != nil || !claimed {
+		t.Fatalf("scheduled waiting work was not claimable: %v %v", claimed, err)
 	}
-	if err := store.WakeWaiting(ctx, item.ID, now.Add(24*time.Hour)); err != nil {
+}
+
+func TestWaitingDeadlineEscalatesWithoutContinuation(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "deadline.db"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, claimed, err := store.Claim(ctx, now.Add(24*time.Hour)); err != nil || !claimed {
-		t.Fatalf("woken work was not claimable: %v %v", claimed, err)
+	defer store.Close()
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: "deadline", Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	route := testRoute()
+	route.ExecutorID = "deadline"
+	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := store.Admit(ctx, snapshot.ID, testEvent("deadline-delivery", 91, "deadline"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, ok, err := store.Claim(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim=%v err=%v", ok, err)
+	}
+	if err := store.Complete(ctx, attempt.ID, ExecutorResult{Outcome: OutcomeWaiting}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := store.Claim(ctx, now.Add(durableWaitDeadline+time.Second)); err != nil || ok {
+		t.Fatalf("deadline claim=%v err=%v", ok, err)
+	}
+	var state WorkState
+	var continuations int
+	var deadline sql.NullInt64
+	if err := store.db.QueryRowContext(ctx, `SELECT state,continuation_count,wait_deadline_at FROM work_items WHERE id=?`, admitted.WorkItem.ID).Scan(&state, &continuations, &deadline); err != nil || state != StateFailed || continuations != 0 {
+		t.Fatalf("deadline state=%s continuations=%d deadline=%+v err=%v", state, continuations, deadline, err)
 	}
 }
 

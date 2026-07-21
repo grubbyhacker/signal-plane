@@ -132,9 +132,6 @@ func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 	if err := store.Complete(ctx, attempt.ID, result, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
-		t.Fatalf("runtime success did not leave work waiting: %v", err)
-	}
 	n, u, err := store.CoordinatorUsage(ctx, item.ID)
 	if err != nil || n != 1 || u != usage(3, 2, 5, 5) {
 		t.Fatalf("usage n=%d u=%+v err=%v", n, u, err)
@@ -187,8 +184,9 @@ func TestStreamedVerifierEventsDriveLiveLedgerTransitions(t *testing.T) {
 				t.Fatalf("outcome=%s claimed=%v err=%v", test.outcome, claimed, err)
 			}
 			if test.outcome == "waiting" {
-				if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
-					t.Fatalf("waiting verdict was not pollable: %v", err)
+				_, _, due, dueErr := store.Claim(ctx, now.Add(pollInterval))
+				if dueErr != nil || !due {
+					t.Fatalf("waiting verdict was not scheduled: due=%v err=%v", due, dueErr)
 				}
 			}
 		})
@@ -383,8 +381,41 @@ func TestSubmitRetryUsesSameIdempotencyKey(t *testing.T) {
 	ex := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
 	_, _ = ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
 	_, _ = ex.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
-	if len(broker.turns) != 2 || broker.turns[0].IdempotencyKey != broker.turns[1].IdempotencyKey {
-		t.Fatalf("submit did not preserve idempotency: %+v", broker.turns)
+	if len(broker.turns) != 1 || broker.turns[0].IdempotencyKey != attempt.IdempotencyKey {
+		t.Fatalf("poll replay submitted a second model turn: %+v", broker.turns)
+	}
+}
+
+func TestPendingThenGreenUsesDistinctPollAttemptWithoutSecondSubmit(t *testing.T) {
+	ctx := context.Background()
+	store, item, submitAttempt, now := coordinatorFixture(t)
+	defer store.Close()
+	broker := &fakeBroker{lease: lease("worker-1", 1)}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	task, err := executor.registeredTask(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: submitAttempt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.events = []Event{{Cursor: 1, Kind: "verifier_evaluated", SessionID: "agentd-session-1", TurnID: "turn-1", AttemptID: submitAttempt.ID, EvidenceRef: "sha256:pending", Verifier: &VerifierEvent{WorkItemID: item.ID, AttemptID: submitAttempt.ID, AdmissionTaskDigest: task.Digest, VerifierID: GitHubGreenPRContract, CompletionContract: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvaluationRevision: strings.Repeat("a", 40), Outcome: "waiting", ReasonCodes: []string{"pending"}, EvidenceRefs: []string{"evidence://pending"}, WorkerID: "worker-1", SessionID: "agentd-session-1", FenceEpoch: 1}}}
+	if result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: submitAttempt}); err != nil {
+		t.Fatal(err)
+	} else if err := store.Complete(ctx, submitAttempt.ID, result, now); err != nil {
+		t.Fatal(err)
+	}
+	_, pollAttempt, ok, err := store.Claim(ctx, now.Add(pollInterval))
+	if err != nil || !ok || pollAttempt.ID == submitAttempt.ID {
+		t.Fatalf("poll attempt=%+v ok=%v err=%v", pollAttempt, ok, err)
+	}
+	broker.events = []Event{{Cursor: 2, Kind: "attempt_completed", SessionID: "agentd-session-1", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)}, {Cursor: 3, Kind: "verifier_evaluated", SessionID: "agentd-session-1", TurnID: "turn-1", AttemptID: pollAttempt.ID, EvidenceRef: "sha256:green", Verifier: &VerifierEvent{WorkItemID: item.ID, AttemptID: pollAttempt.ID, AdmissionTaskDigest: task.Digest, VerifierID: GitHubGreenPRContract, CompletionContract: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("a", 40), EvaluationRevision: strings.Repeat("a", 40), Outcome: "satisfied", EvidenceRefs: []string{"evidence://green"}, WorkerID: "worker-1", SessionID: "agentd-session-1", FenceEpoch: 1}}}
+	if _, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: pollAttempt}); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.turns) != 1 || broker.turns[0].IdempotencyKey != submitAttempt.IdempotencyKey {
+		t.Fatalf("poll re-submitted model: %+v", broker.turns)
+	}
+	binding, err := store.SessionBinding(ctx, item.ID)
+	if err != nil || binding.SubmittedIdempotencyKey != submitAttempt.IdempotencyKey || binding.ModelEffectID != "model:"+submitAttempt.IdempotencyKey || binding.SubmittedTurnID != "turn-1" {
+		t.Fatalf("submitted/model mapping=%+v err=%v", binding, err)
 	}
 }
 func TestBrokerFailure(t *testing.T) {
@@ -557,10 +588,7 @@ func TestGitHubGreenPRWaitingDoesNotSpendContinuation(t *testing.T) {
 	if err := executor.RecordGitHubGreenPRResult(ctx, item.ID, waiting); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
-		t.Fatalf("waiting observation did not remain pollable: %v", err)
-	}
-	_, pollAttempt, ok, err := store.Claim(ctx, now)
+	_, pollAttempt, ok, err := store.Claim(ctx, now.Add(pollInterval))
 	if err != nil || !ok {
 		t.Fatalf("poll wake was not claimable: ok=%v err=%v", ok, err)
 	}

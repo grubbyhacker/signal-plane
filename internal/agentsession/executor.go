@@ -13,6 +13,8 @@ import (
 
 const ExecutorID = "agent_session_v1"
 const authorityProfile = "general-writer-v1"
+const pollInterval = 5 * time.Second
+const waitDeadline = 30 * time.Minute
 
 // Broker is the only authority that addresses agentd. Signal Plane supplies
 // durable binding/evidence identifiers, never a worker, profile, or runtime.
@@ -126,15 +128,24 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		}
 		binding.AgentdSessionID = created.SessionID
 	}
-	turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, IdempotencyKey: request.Attempt.IdempotencyKey})
-	if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
-		return retry("agentd_submit", "broker turn submit unavailable"), nil
+	turnID := binding.SubmittedTurnID
+	if binding.SubmittedIdempotencyKey == "" {
+		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, IdempotencyKey: request.Attempt.IdempotencyKey})
+		if err != nil || turn.TurnID == "" || !sameLease(binding, turn.Lease) {
+			return retry("agentd_submit", "broker turn submit unavailable"), nil
+		}
+		if err := e.Store.RecordSubmittedTurn(ctx, request.WorkItem.ID, turn.Lease, request.Attempt.IdempotencyKey, turn.TurnID, e.now()); err != nil {
+			return retry("coordinator_fence", "submitted turn conflicts"), nil
+		}
+		turnID = turn.TurnID
 	}
 	batch, err := e.Broker.StreamEvents(ctx, StreamEventsRequest{BindingKey: binding.BindingKey, Cursor: binding.EventCursor})
 	if err != nil || !sameLease(binding, batch.Lease) {
 		return retry("agentd_events", "broker event stream unavailable"), nil
 	}
-	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turn.TurnID}
+	now := e.now()
+	next, deadline := now.Add(pollInterval), now.Add(waitDeadline)
+	result := workledger.ExecutorResult{Outcome: workledger.OutcomeWaiting, ExternalCorrelation: turnID, NextAttemptAt: &next, DeadlineAt: &deadline}
 	for _, event := range batch.Events {
 		if !validEvent(event) {
 			return retry("agentd_protocol", "agent event invalid"), nil

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ExecutorDescriptor struct {
@@ -48,6 +49,8 @@ type ExecutorResult struct {
 	ExternalCorrelation string
 	SanitizedError      string
 	ResultDigest        string
+	NextAttemptAt       *time.Time
+	DeadlineAt          *time.Time
 }
 
 type Executor interface {

@@ -13,10 +13,14 @@ import (
 	"time"
 )
 
+const durablePollInterval = 5 * time.Second
+const durableWaitDeadline = 30 * time.Minute
+
 type SessionBinding struct {
 	WorkItemID, BindingKey, AuthorityProfile, ProfileVersion, PolicyDigest string
 	SessionLineageID, WorkerID, WorkerStorageLineageID                     string
 	AgentdSessionID, CheckpointRef, State                                  string
+	SubmittedIdempotencyKey, ModelEffectID, SubmittedTurnID                string
 	EventCursor, WorkerFenceEpoch                                          int64
 	CreatedAt, UpdatedAt                                                   time.Time
 }
@@ -115,16 +119,40 @@ func sameSessionLease(binding SessionBinding, lease SessionLease) bool {
 func (store *Store) SessionBinding(ctx context.Context, workItemID string) (SessionBinding, error) {
 	var binding SessionBinding
 	var created, updated int64
-	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
+	err := store.db.QueryRowContext(ctx, `SELECT work_item_id,binding_key,authority_profile,profile_version,policy_digest,session_lineage_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,agentd_session_id,submitted_idempotency_key,model_effect_id,submitted_turn_id,checkpoint_ref,CAST(event_cursor AS INTEGER),state,created_at,updated_at FROM session_bindings WHERE work_item_id=?`, workItemID).Scan(
 		&binding.WorkItemID, &binding.BindingKey, &binding.AuthorityProfile, &binding.ProfileVersion, &binding.PolicyDigest,
 		&binding.SessionLineageID, &binding.WorkerID, &binding.WorkerStorageLineageID, &binding.WorkerFenceEpoch,
-		&binding.AgentdSessionID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
+		&binding.AgentdSessionID, &binding.SubmittedIdempotencyKey, &binding.ModelEffectID, &binding.SubmittedTurnID, &binding.CheckpointRef, &binding.EventCursor, &binding.State, &created, &updated,
 	)
 	if err != nil {
 		return SessionBinding{}, err
 	}
 	binding.CreatedAt, binding.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	return binding, nil
+}
+
+// RecordSubmittedTurn persists the relationship between the Signal attempt
+// submission key and agentd's distinct canonical effect model:<key>.
+func (store *Store) RecordSubmittedTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, turnID string, now time.Time) error {
+	if idempotencyKey == "" || turnID == "" || !validLease(lease) {
+		return errors.New("submitted turn identity is incomplete")
+	}
+	modelEffectID := "model:" + idempotencyKey
+	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET submitted_idempotency_key=?,model_effect_id=?,submitted_turn_id=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, idempotencyKey, modelEffectID, turnID, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed == 1 {
+		return nil
+	}
+	binding, err := store.SessionBinding(ctx, workItemID)
+	if err != nil {
+		return err
+	}
+	if !sameSessionLease(binding, lease) || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID {
+		return errors.New("submitted turn conflicts with durable model effect")
+	}
+	return nil
 }
 
 func (store *Store) RoutingReady(ctx context.Context, workItemID string) error {
@@ -477,7 +505,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		case "satisfied":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateCompleted, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		case "waiting":
-			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,updated_at=? WHERE id=? AND state=?`, millis(now), workItemID, StateWaiting)
+			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,next_attempt_at=?,wait_deadline_at=COALESCE(wait_deadline_at,?),updated_at=? WHERE id=? AND state=?`, millis(now.Add(durablePollInterval)), millis(now.Add(durableWaitDeadline)), millis(now), workItemID, StateWaiting)
 		case "continuation_required":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		case "escalated":
@@ -489,7 +517,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		// A live agentd verdict arrives while the executor attempt still owns the
 		// serialization lease.  Commit the attempt and work transition together;
 		// Complete recognizes the durable verifier receipt as an idempotent handoff.
-		finalAttemptState, workState, next := AttemptRetryScheduled, StateWaiting, any(nil)
+		finalAttemptState, workState, next := AttemptRetryScheduled, StateWaiting, any(millis(now.Add(durablePollInterval)))
 		terminal := any(nil)
 		if result.Outcome == "continuation_required" {
 			next = millis(now)
@@ -503,7 +531,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if _, err = conn.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE id=? AND state=?`, finalAttemptState, millis(now), result.AttemptID, AttemptRunning); err != nil {
 			return err
 		}
-		if _, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, workState, continuations, terminal, next, millis(now), workItemID, StateActive); err != nil {
+		if _, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=?,wait_deadline_at=CASE WHEN ? THEN COALESCE(wait_deadline_at,?) ELSE wait_deadline_at END,updated_at=? WHERE id=? AND state=?`, workState, continuations, terminal, next, result.Outcome == "waiting", millis(now.Add(durableWaitDeadline)), millis(now), workItemID, StateActive); err != nil {
 			return err
 		}
 		_, err = conn.ExecContext(ctx, `DELETE FROM serialization_leases WHERE attempt_id=?`, result.AttemptID)

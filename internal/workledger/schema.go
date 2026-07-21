@@ -35,7 +35,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS coordinator_reassignments (work_item_id TEXT NOT NULL REFERENCES work_items(id), predecessor_fence_epoch INTEGER NOT NULL CHECK(predecessor_fence_epoch>0), idempotency_key TEXT NOT NULL, rebind_idempotency_key TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL CHECK(phase IN ('requested','broker_committed','agentd_adopted','coordinator_committed','escalated')), session_lineage_id TEXT NOT NULL, authority_profile TEXT NOT NULL, profile_version TEXT NOT NULL, policy_digest TEXT NOT NULL, storage_lineage_id TEXT NOT NULL, predecessor_worker_id TEXT NOT NULL, successor_worker_id TEXT NOT NULL DEFAULT '', successor_fence_epoch INTEGER NOT NULL DEFAULT 0, broker_state TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,predecessor_fence_epoch), UNIQUE(idempotency_key))`,
 		`CREATE TABLE IF NOT EXISTS verifier_results (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, evaluation_revision TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL CHECK(outcome IN ('waiting','continuation_required','satisfied','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS verifier_result_receipts (work_item_id TEXT NOT NULL REFERENCES work_items(id), attempt_id TEXT NOT NULL REFERENCES executor_attempts(id), result_digest TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,attempt_id))`,
-		`PRAGMA user_version=12`,
+		`PRAGMA user_version=13`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -64,6 +64,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	for _, column := range []struct{ name, definition string }{
 		{"task_evidence_digest", `task_evidence_digest TEXT NOT NULL DEFAULT ''`},
 		{"continuation_count", `continuation_count INTEGER NOT NULL DEFAULT 0`},
+		{"wait_deadline_at", `wait_deadline_at INTEGER`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "work_items", column.name, column.definition); err != nil {
 			return err
@@ -76,6 +77,9 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		{"worker_storage_lineage_id", `worker_storage_lineage_id TEXT NOT NULL DEFAULT ''`},
 		{"worker_fence_epoch", `worker_fence_epoch INTEGER NOT NULL DEFAULT 1`},
 		{"agentd_session_id", `agentd_session_id TEXT NOT NULL DEFAULT ''`},
+		{"submitted_idempotency_key", `submitted_idempotency_key TEXT NOT NULL DEFAULT ''`},
+		{"model_effect_id", `model_effect_id TEXT NOT NULL DEFAULT ''`},
+		{"submitted_turn_id", `submitted_turn_id TEXT NOT NULL DEFAULT ''`},
 		{"event_cursor", `event_cursor INTEGER NOT NULL DEFAULT 0`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "session_bindings", column.name, column.definition); err != nil {
