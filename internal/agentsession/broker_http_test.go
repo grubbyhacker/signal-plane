@@ -78,6 +78,20 @@ func TestHTTPBrokerRequiresContiguousAgentdEvents(t *testing.T) {
 	}
 }
 
+func TestHTTPBrokerStrictlyDecodesTypedVerifierEvent(t *testing.T) {
+	payload := []byte(`{"verifier":{"workItemId":"work-1","attemptId":"attempt-1","admissionTaskDigest":"sha256:admission","verifierId":"github_green_pr_v1","completionContract":"github_green_pr_v1","contractDigest":"sha256:contract","taskEvidenceDigest":"sha256:task","headRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evaluationRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"continuation_required","reasonCodes":["checks_failed"],"evidenceRefs":["evidence://agentd/1"],"workerId":"worker-1","sessionId":"session-1","fenceEpoch":3}}`)
+	event, err := decodeVerifierEvent(payload)
+	if err != nil || event.WorkItemID != "work-1" || event.AttemptID != "attempt-1" || event.EvaluationRevision != strings.Repeat("b", 40) || event.FenceEpoch != 3 {
+		t.Fatalf("verifier=%+v err=%v", event, err)
+	}
+	if !verifierKindMatches("verifier_continuation", event.Outcome) || verifierKindMatches("verifier_evaluated", event.Outcome) {
+		t.Fatal("verifier outcome/event-kind contract was not enforced")
+	}
+	if _, err := decodeVerifierEvent([]byte(`{"verifier":{"workItemId":"work-1","unknown":"forbidden"}}`)); err == nil {
+		t.Fatal("unknown verifier field was accepted")
+	}
+}
+
 func TestHTTPBrokerSubmitTurnSendsOnlyRegisteredCommandIdentifiers(t *testing.T) {
 	leaseFixture := mustFixture(t, "lease-v1.json")
 	var admission struct {

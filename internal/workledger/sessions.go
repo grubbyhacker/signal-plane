@@ -56,7 +56,7 @@ type Reassignment struct {
 
 type VerifierResult struct {
 	AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-	HeadRevision, Outcome                                                         string
+	HeadRevision, EvaluationRevision, Outcome                                     string
 	ReasonCodes, EvidenceRefs                                                     []string
 }
 
@@ -412,9 +412,9 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	evidenceJSON, _ := json.Marshal(evidence)
 	identityJSON, _ := json.Marshal(struct {
 		AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-		HeadRevision, Outcome                                                         string
+		HeadRevision, EvaluationRevision, Outcome                                     string
 		ReasonCodes, EvidenceRefs                                                     []string
-	}{result.AttemptID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, reasons, evidence})
+	}{result.AttemptID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, reasons, evidence})
 	resultDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(identityJSON))
 	return store.immediate(ctx, func(conn *sql.Conn) error {
 		var verifierID, contract, digest, taskEvidence, state string
@@ -435,8 +435,8 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 			return err
 		}
 		var attemptState, receiptDigest string
-		if err := conn.QueryRowContext(ctx, `SELECT state FROM executor_attempts WHERE id=? AND work_item_id=?`, result.AttemptID, workItemID).Scan(&attemptState); err != nil || (attemptState != string(AttemptSucceeded) && attemptState != string(AttemptRetryScheduled)) {
-			return errors.New("verifier result requires its completed waiting attempt")
+		if err := conn.QueryRowContext(ctx, `SELECT state FROM executor_attempts WHERE id=? AND work_item_id=?`, result.AttemptID, workItemID).Scan(&attemptState); err != nil {
+			return errors.New("verifier result requires its bound attempt")
 		}
 		err = conn.QueryRowContext(ctx, `SELECT result_digest FROM verifier_result_receipts WHERE work_item_id=? AND attempt_id=?`, workItemID, result.AttemptID).Scan(&receiptDigest)
 		if err == nil {
@@ -448,8 +448,10 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if state != string(StateWaiting) {
-			return errors.New("verifier result requires waiting work")
+		activeAttempt := state == string(StateActive) && attemptState == string(AttemptRunning)
+		waitingAttempt := state == string(StateWaiting) && (attemptState == string(AttemptSucceeded) || attemptState == string(AttemptRetryScheduled))
+		if !activeAttempt && !waitingAttempt {
+			return errors.New("verifier result requires its active or completed waiting attempt")
 		}
 		if result.Outcome == "satisfied" {
 			var completed int
@@ -467,7 +469,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if _, err = conn.ExecContext(ctx, `INSERT INTO verifier_result_receipts(work_item_id,attempt_id,result_digest,recorded_at) VALUES(?,?,?,?)`, workItemID, result.AttemptID, resultDigest, millis(now)); err != nil {
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
+		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,evaluation_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,evaluation_revision=excluded.evaluation_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
 		if err != nil {
 			return err
 		}
@@ -481,6 +483,30 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		case "escalated":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateFailed, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		}
+		if err != nil || !activeAttempt {
+			return err
+		}
+		// A live agentd verdict arrives while the executor attempt still owns the
+		// serialization lease.  Commit the attempt and work transition together;
+		// Complete recognizes the durable verifier receipt as an idempotent handoff.
+		finalAttemptState, workState, next := AttemptRetryScheduled, StateWaiting, any(nil)
+		terminal := any(nil)
+		if result.Outcome == "continuation_required" {
+			next = millis(now)
+		}
+		if result.Outcome == "satisfied" {
+			finalAttemptState, workState, terminal = AttemptSucceeded, StateCompleted, millis(now)
+		}
+		if result.Outcome == "escalated" {
+			finalAttemptState, workState, terminal = AttemptFailed, StateFailed, millis(now)
+		}
+		if _, err = conn.ExecContext(ctx, `UPDATE executor_attempts SET state=?,completed_at=? WHERE id=? AND state=?`, finalAttemptState, millis(now), result.AttemptID, AttemptRunning); err != nil {
+			return err
+		}
+		if _, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, workState, continuations, terminal, next, millis(now), workItemID, StateActive); err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, `DELETE FROM serialization_leases WHERE attempt_id=?`, result.AttemptID)
 		return err
 	})
 }

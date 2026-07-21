@@ -436,6 +436,10 @@ func (store *Store) Complete(ctx context.Context, attemptID string, result Execu
 		return err
 	}
 	if attemptState != AttemptRunning {
+		var receipt int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM verifier_result_receipts WHERE work_item_id=? AND attempt_id=?`, workID, attemptID).Scan(&receipt); err == nil && receipt == 1 {
+			return tx.Commit()
+		}
 		return errors.New("attempt is not running")
 	}
 	var workState WorkState

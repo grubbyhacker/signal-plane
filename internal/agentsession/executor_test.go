@@ -144,6 +144,93 @@ func TestCoordinatorRuntimeSuccessIsEvidenceNotTaskCompletion(t *testing.T) {
 	}
 }
 
+func TestStreamedVerifierEventsDriveLiveLedgerTransitions(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name, outcome string
+		wantClaim     bool
+	}{
+		{"waiting", "waiting", false},
+		{"continuation", "continuation_required", true},
+		{"satisfied", "satisfied", false},
+		{"escalated", "escalated", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, item, attempt, now := coordinatorFixture(t)
+			defer store.Close()
+			broker := &fakeBroker{lease: lease("worker-1", 1)}
+			executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+			task, err := executor.registeredTask(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := []Event{}
+			if test.outcome == "satisfied" {
+				events = append(events, Event{Cursor: 1, Kind: "attempt_completed", SessionID: "agentd-session-1", EvidenceRef: "sha256:runtime", Usage: usage(1, 0, 1, 0)})
+			}
+			cursor := int64(len(events) + 1)
+			reasons := []string{"pending"}
+			if test.outcome == "satisfied" {
+				reasons = nil
+			}
+			events = append(events, Event{Cursor: cursor, Kind: verifierKind(test.outcome), SessionID: "agentd-session-1", TurnID: "turn-1", AttemptID: attempt.ID, EvidenceRef: "sha256:verifier-" + test.outcome, Verifier: &VerifierEvent{WorkItemID: item.ID, AttemptID: attempt.ID, AdmissionTaskDigest: task.Digest, VerifierID: GitHubGreenPRContract, CompletionContract: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("c", 40), EvaluationRevision: strings.Repeat("d", 40), Outcome: test.outcome, ReasonCodes: reasons, EvidenceRefs: []string{"evidence://agentd/" + test.outcome}, WorkerID: "worker-1", SessionID: "agentd-session-1", FenceEpoch: 1}})
+			broker.events = events
+			result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+			if err != nil || result.Outcome != workledger.OutcomeWaiting {
+				t.Fatalf("execute result=%+v err=%v", result, err)
+			}
+			if err := store.Complete(ctx, attempt.ID, result, now); err != nil { // receipt makes router handoff idempotent
+				t.Fatal(err)
+			}
+			_, _, claimed, err := store.Claim(ctx, now)
+			if err != nil || claimed != test.wantClaim {
+				t.Fatalf("outcome=%s claimed=%v err=%v", test.outcome, claimed, err)
+			}
+			if test.outcome == "waiting" {
+				if err := store.WakeWaiting(ctx, item.ID, now); err != nil {
+					t.Fatalf("waiting verdict was not pollable: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func verifierKind(outcome string) string {
+	if outcome == "continuation_required" {
+		return "verifier_continuation"
+	}
+	if outcome == "escalated" {
+		return "verifier_escalated"
+	}
+	return "verifier_evaluated"
+}
+
+func TestStreamedVerifierRejectsStaleFenceAndConflictingReplay(t *testing.T) {
+	ctx := context.Background()
+	store, item, attempt, now := coordinatorFixture(t)
+	defer store.Close()
+	broker := &fakeBroker{lease: lease("worker-1", 1)}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	task, err := executor.registeredTask(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Event{Cursor: 1, Kind: "verifier_evaluated", SessionID: "agentd-session-1", TurnID: "turn-1", AttemptID: attempt.ID, EvidenceRef: "sha256:verifier", Verifier: &VerifierEvent{WorkItemID: item.ID, AttemptID: attempt.ID, AdmissionTaskDigest: task.Digest, VerifierID: GitHubGreenPRContract, CompletionContract: GitHubGreenPRContract, ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, HeadRevision: strings.Repeat("c", 40), EvaluationRevision: strings.Repeat("d", 40), Outcome: "waiting", ReasonCodes: []string{"pending"}, EvidenceRefs: []string{"evidence://agentd/pending"}, WorkerID: "worker-1", SessionID: "agentd-session-1", FenceEpoch: 2}}
+	broker.events = []Event{base}
+	if result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}); err != nil || result.RetryClassification != "agentd_verifier" {
+		t.Fatalf("stale fence result=%+v err=%v", result, err)
+	}
+
+	// A replay with the same cursor but altered verdict evidence is rejected by
+	// the durable coordinator event identity before it can change the ledger.
+	base.Verifier.FenceEpoch = 1
+	base.EvidenceRef = "sha256:conflicting-verifier"
+	broker.events = []Event{base}
+	if result, err := executor.Execute(ctx, workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}); err != nil || result.RetryClassification != "coordinator_fence" {
+		t.Fatalf("conflict result=%+v err=%v", result, err)
+	}
+}
+
 func TestSubmitTurnRequestExcludesCallerTaskAndPrompt(t *testing.T) {
 	typeOfRequest := reflect.TypeOf(SubmitTurnRequest{})
 	if typeOfRequest.NumField() != 2 || typeOfRequest.Field(0).Name != "BindingKey" || typeOfRequest.Field(1).Name != "IdempotencyKey" {

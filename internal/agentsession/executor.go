@@ -70,9 +70,23 @@ type BrokerReassignmentStatus struct {
 	State, ErrorCode     string
 }
 type Event struct {
-	Cursor            int64
-	Kind, EvidenceRef string
-	Usage             workledger.Usage
+	Cursor                       int64
+	Kind, EvidenceRef, SessionID string
+	TurnID, AttemptID            string
+	Usage                        workledger.Usage
+	Verifier                     *VerifierEvent
+}
+
+// VerifierEvent is the authenticated agentd verdict.  It deliberately keeps
+// the identity fields separate from EvidenceRef: verdict semantics must never
+// be reconstructed from a hash of an opaque event payload.
+type VerifierEvent struct {
+	WorkItemID, AttemptID, AdmissionTaskDigest                    string
+	VerifierID, CompletionContract, ContractDigest                string
+	TaskEvidenceDigest, HeadRevision, EvaluationRevision, Outcome string
+	WorkerID, SessionID                                           string
+	FenceEpoch                                                    int64
+	ReasonCodes, EvidenceRefs                                     []string
 }
 
 type Executor struct {
@@ -131,6 +145,11 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 		if event.Kind == "attempt_completed" {
 			result.ResultDigest = event.EvidenceRef
 		}
+		if event.Verifier != nil {
+			if err := e.recordVerifierEvent(ctx, request, binding, event); err != nil {
+				return retry("agentd_verifier", "agent verifier event rejected"), nil
+			}
+		}
 	}
 	// Runtime success is durable evidence only. PR 10 owns semantic verification
 	// and is the only boundary allowed to complete the work item.
@@ -140,7 +159,32 @@ func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
 func validEvent(e Event) bool {
-	return e.Cursor > 0 && knownAgentdEvent(e.Kind) && e.EvidenceRef != "" && e.Usage.Valid()
+	if e.Cursor <= 0 || !knownAgentdEvent(e.Kind) || e.EvidenceRef == "" || !e.Usage.Valid() {
+		return false
+	}
+	if e.Verifier == nil {
+		return true
+	}
+	v := e.Verifier
+	return e.SessionID != "" && (e.Kind == "verifier_evaluated" || e.Kind == "verifier_continuation" || e.Kind == "verifier_failed" || e.Kind == "verifier_escalated") &&
+		v.WorkItemID != "" && v.AttemptID != "" && v.AdmissionTaskDigest != "" && v.VerifierID != "" && v.CompletionContract != "" &&
+		v.ContractDigest != "" && v.TaskEvidenceDigest != "" && v.HeadRevision != "" && v.EvaluationRevision != "" &&
+		v.Outcome != "" && v.WorkerID != "" && v.SessionID != "" && v.FenceEpoch > 0 && len(v.EvidenceRefs) > 0
+}
+
+func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.ExecutorRequest, binding workledger.SessionBinding, event Event) error {
+	v := event.Verifier
+	if event.SessionID != binding.AgentdSessionID || event.AttemptID != request.Attempt.ID || event.TurnID == "" || v.WorkItemID != request.WorkItem.ID || v.AttemptID != request.Attempt.ID || v.WorkerID != binding.WorkerID || v.SessionID != binding.AgentdSessionID || v.FenceEpoch != binding.WorkerFenceEpoch {
+		return errors.New("agent verifier event identity does not bind current execution")
+	}
+	task, err := e.registeredTask(ctx, request)
+	if err != nil || v.AdmissionTaskDigest != task.Digest {
+		return errors.New("agent verifier event admission identity is stale")
+	}
+	if err := e.RecordGitHubGreenPRResult(ctx, request.WorkItem.ID, workledger.VerifierResult{AttemptID: v.AttemptID, VerifierID: v.VerifierID, CompletionContract: v.CompletionContract, ContractDigest: v.ContractDigest, TaskEvidenceDigest: v.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.EvaluationRevision, Outcome: v.Outcome, ReasonCodes: v.ReasonCodes, EvidenceRefs: v.EvidenceRefs}); err != nil {
+		return err
+	}
+	return nil
 }
 func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
 	return l.WorkerID == b.WorkerID && l.WorkerFenceEpoch == b.WorkerFenceEpoch && l.ProfileVersion == b.ProfileVersion && l.PolicyDigest == b.PolicyDigest && l.SessionLineageID == b.SessionLineageID && l.WorkerStorageLineageID == b.WorkerStorageLineageID && l.AuthorityProfile == b.AuthorityProfile

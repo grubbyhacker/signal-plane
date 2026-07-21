@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -112,7 +113,7 @@ func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := future.Exec(`PRAGMA user_version=12`); err != nil {
+	if _, err := future.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, SchemaVersion+1)); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.Close(); err != nil {
