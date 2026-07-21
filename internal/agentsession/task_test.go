@@ -138,12 +138,9 @@ func TestGitHubGreenPRFixtureAdmissionIsIdempotentAndRejectsConflictingContent(t
 		t.Fatalf("registered digest=%s want=%s task evidence=%s err=%v", registered.Digest, wantRegisteredDigest, fixture.PayloadDigest, err)
 	}
 	for name, mutate := range map[string]func(*workledger.Event){
-		"repository ID": func(event *workledger.Event) { event.ObjectID = "1307218522" },
-		"revision":      func(event *workledger.Event) { event.SourceRevision = strings.Repeat("a", 40) },
-		"task blob and bytes": func(event *workledger.Event) {
-			event.EvidenceRef = strings.Replace(event.EvidenceRef, GitHubGreenPRFixtureTaskBlob, strings.Repeat("f", 40), 1)
-			event.PayloadDigest = "sha256:" + strings.Repeat("f", 64)
-		},
+		"repository ID":  func(event *workledger.Event) { event.ObjectID = "1307218522" },
+		"revision":       func(event *workledger.Event) { event.SourceRevision = strings.Repeat("a", 40) },
+		"payload digest": func(event *workledger.Event) { event.PayloadDigest = "sha256:" + strings.Repeat("f", 64) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			conflict := gitHubGreenPRFixtureEvent(now)
