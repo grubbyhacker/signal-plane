@@ -226,7 +226,7 @@ func TestRegisteredContinuationEffectProgressionIsDurable(t *testing.T) {
 		t.Fatalf("continuation claim ok=%v err=%v", ok, err)
 	}
 	executor.Store = store
-	broker.events = []Event{broker.event(3, 1, broker.continuationEffect, "authorized", nil)}
+	broker.events = []Event{broker.event(6, 2, broker.continuationEffect, "authorized", nil)}
 	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: continuation})
 	if err != nil || result.Outcome != workledger.OutcomeWaiting {
 		t.Fatalf("continuation execute=%+v err=%v", result, err)
@@ -247,21 +247,25 @@ func TestRegisteredContinuationEffectProgressionIsDurable(t *testing.T) {
 		t.Fatalf("terminal claim ok=%v err=%v", ok, err)
 	}
 	executor.Store = store
-	broker.events = []Event{broker.event(4, 1, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+	broker.events = []Event{
+		broker.event(7, 3, broker.continuationEffect, "running", nil),
+		broker.event(8, 3, broker.continuationEffect, "completed", nil),
+		broker.event(9, 3, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
+	}
 	result, err = executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: terminal})
 	if err != nil || result.Outcome != workledger.OutcomeWaiting {
 		t.Fatalf("terminal execute=%+v err=%v", result, err)
 	}
 	binding, err := store.SessionBinding(t.Context(), item.ID)
-	if err != nil || binding.ModelEffectID != broker.rootEffect || binding.ActiveModelEffectID != broker.continuationEffect || binding.ActiveEffectAttempt != 1 || binding.EventCursor != 4 {
+	if err != nil || binding.ModelEffectID != broker.rootEffect || binding.ActiveModelEffectID != broker.continuationEffect || binding.ActiveEffectAttempt != 3 || binding.EventCursor != 9 {
 		t.Fatalf("binding=%+v err=%v", binding, err)
 	}
-	replay := workledger.RegisteredCoordinatorEvent{CoordinatorEvent: workledger.CoordinatorEvent{Cursor: 4, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_green", EvidenceRef: "agentd:registered-events:" + broker.continuationEffect + ":1:4"}, ModelEffectID: broker.continuationEffect, Attempt: 1, Phase: "green"}
+	replay := workledger.RegisteredCoordinatorEvent{CoordinatorEvent: workledger.CoordinatorEvent{Cursor: 9, WorkerID: binding.WorkerID, WorkerFenceEpoch: binding.WorkerFenceEpoch, Kind: "registered_green", EvidenceRef: "agentd:registered-events:" + broker.continuationEffect + ":3:9"}, ModelEffectID: broker.continuationEffect, Attempt: 3, Phase: "green"}
 	if inserted, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err != nil || inserted {
 		t.Fatalf("identical replay inserted=%v err=%v", inserted, err)
 	}
-	replay.Attempt = 2
-	replay.EvidenceRef = "agentd:registered-events:" + broker.continuationEffect + ":2:4"
+	replay.Attempt = 4
+	replay.EvidenceRef = "agentd:registered-events:" + broker.continuationEffect + ":4:9"
 	if _, err := store.RecordRegisteredCoordinatorEvent(t.Context(), item.ID, replay, now.Add(10*time.Second)); err == nil {
 		t.Fatal("conflicting replay was accepted")
 	}
@@ -273,8 +277,8 @@ func TestRegisteredContinuationEffectRefusals(t *testing.T) {
 		mutate func(*Event, string)
 	}{
 		{"substitution is not authorized", func(e *Event, root string) { e.Phase = "running" }},
-		{"wrong continuation attempt", func(e *Event, root string) { e.Attempt = 2 }},
-		{"conflicting continuation progression", func(e *Event, root string) { e.Attempt = 0 }},
+		{"wrong continuation attempt", func(e *Event, root string) { e.Attempt = 3 }},
+		{"conflicting continuation progression", func(e *Event, root string) { e.Attempt = 1 }},
 		{"stale root after progression", func(e *Event, root string) { e.ModelEffectID = root; e.Phase = "running" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,7 +294,7 @@ func TestRegisteredContinuationEffectRefusals(t *testing.T) {
 			if err != nil || !ok {
 				t.Fatalf("claim ok=%v err=%v", ok, err)
 			}
-			broker.events = []Event{broker.event(3, 1, broker.continuationEffect, "authorized", nil), broker.event(4, 1, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+			broker.events = []Event{broker.event(6, 2, broker.continuationEffect, "authorized", nil), broker.event(7, 3, broker.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: broker.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
 			if tc.name == "stale root after progression" {
 				broker.events = broker.events[:1]
 				firstContinuation := broker.events[0]
@@ -301,7 +305,7 @@ func TestRegisteredContinuationEffectRefusals(t *testing.T) {
 				if binding.ActiveModelEffectID != firstContinuation.ModelEffectID {
 					t.Fatalf("continuation was not activated: %+v", binding)
 				}
-				broker.events = []Event{broker.event(4, 1, broker.rootEffect, "running", nil)}
+				broker.events = []Event{broker.event(7, 3, broker.rootEffect, "running", nil)}
 			} else {
 				tc.mutate(&broker.events[0], broker.rootEffect)
 			}
@@ -333,10 +337,20 @@ func (b *continuationBroker) event(cursor, attempt int64, effect, phase string, 
 }
 func (b *continuationBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
 	if request.Cursor == 1 {
-		return BrokerEvents{Lease: b.lease, Events: []Event{b.event(2, 0, b.rootEffect, "red", &VerifierEvent{Phase: "red", Outcome: "continuation", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}}, nil
+		return BrokerEvents{Lease: b.lease, Events: []Event{
+			b.event(2, 0, b.rootEffect, "authorized", nil),
+			b.event(3, 1, b.rootEffect, "running", nil),
+			b.event(4, 1, b.rootEffect, "completed", nil),
+			b.event(5, 1, b.rootEffect, "red", &VerifierEvent{Phase: "red", Outcome: "continuation", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("a", 40), Reasons: []VerifierReason{{Code: "missing"}}, EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
+		}}, nil
 	}
 	if b.events == nil {
-		b.events = []Event{b.event(3, 1, b.continuationEffect, "authorized", nil), b.event(4, 1, b.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}})}
+		b.events = []Event{
+			b.event(6, 2, b.continuationEffect, "authorized", nil),
+			b.event(7, 3, b.continuationEffect, "running", nil),
+			b.event(8, 3, b.continuationEffect, "completed", nil),
+			b.event(9, 3, b.continuationEffect, "green", &VerifierEvent{Phase: "green", Outcome: "satisfied", ContractDigest: gitHubGreenPRDigest, TaskEvidenceDigest: b.evidenceDigest, HeadRevision: strings.Repeat("b", 40), EvidenceRefs: []string{"fixture://github-green-pr-v1/verifier"}}),
+		}
 	}
 	return BrokerEvents{Lease: b.lease, Events: b.events}, nil
 }
