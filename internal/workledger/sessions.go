@@ -10,6 +10,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -59,9 +60,15 @@ type Reassignment struct {
 }
 
 type VerifierResult struct {
-	AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-	HeadRevision, EvaluationRevision, Outcome                                     string
-	ReasonCodes, EvidenceRefs                                                     []string
+	AttemptID, ContractDigest, TaskEvidenceDigest string
+	// EvaluationRevision is the durable representation projection of the
+	// package headRevision, not a provider fact.
+	HeadRevision, EvaluationRevision, Outcome string
+	ReasonCodes, EvidenceRefs                 []string
+}
+
+func boundedVerifierRevision(value string) bool {
+	return value != "" && len(value) <= 512 && !strings.ContainsAny(value, "\r\n")
 }
 
 func (u Usage) Valid() bool {
@@ -141,7 +148,7 @@ func (store *Store) RecordSubmittedTurn(ctx context.Context, workItemID string, 
 // before the coordinator schedules any poll. A restart therefore polls after
 // the persisted cursor and never submits or continues the model turn again.
 func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, sessionID, turnID, modelEffectID string, cursor int64, now time.Time) error {
-	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || cursor < 0 || !validLease(lease) {
+	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || cursor <= 0 || !validLease(lease) {
 		return errors.New("submitted turn identity is incomplete")
 	}
 	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,submitted_turn_id=?,event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, turnID, cursor, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
@@ -421,14 +428,11 @@ func (store *Store) CoordinatorUsage(ctx context.Context, workItemID string) (us
 	return
 }
 
-func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string, result VerifierResult, maxContinuations int, now time.Time) error {
-	if maxContinuations < 0 || maxContinuations > 8 {
-		return errors.New("verifier continuation bound is invalid")
-	}
+func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string, result VerifierResult, now time.Time) error {
 	if result.Outcome != "waiting" && result.Outcome != "continuation_required" && result.Outcome != "satisfied" && result.Outcome != "escalated" {
 		return errors.New("unknown verifier outcome")
 	}
-	if result.AttemptID == "" || !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(result.HeadRevision) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || result.TaskEvidenceDigest == "" || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 || len(result.ReasonCodes) > 32 {
+	if result.AttemptID == "" || !boundedVerifierRevision(result.HeadRevision) || result.EvaluationRevision != result.HeadRevision || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.ContractDigest) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(result.TaskEvidenceDigest) || len(result.EvidenceRefs) == 0 || len(result.EvidenceRefs) > 64 {
 		return errors.New("verifier result identity is incomplete")
 	}
 	if result.Outcome == "satisfied" && len(result.ReasonCodes) != 0 {
@@ -445,10 +449,10 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 	reasonJSON, _ := json.Marshal(reasons)
 	evidenceJSON, _ := json.Marshal(evidence)
 	identityJSON, _ := json.Marshal(struct {
-		AttemptID, VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-		HeadRevision, EvaluationRevision, Outcome                                     string
-		ReasonCodes, EvidenceRefs                                                     []string
-	}{result.AttemptID, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, reasons, evidence})
+		AttemptID, ContractDigest, TaskEvidenceDigest string
+		HeadRevision, EvaluationRevision, Outcome     string
+		ReasonCodes, EvidenceRefs                     []string
+	}{result.AttemptID, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, reasons, evidence})
 	resultDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(identityJSON))
 	return store.immediate(ctx, func(conn *sql.Conn) error {
 		var verifierID, contract, digest, taskEvidence, state string
@@ -457,7 +461,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if err != nil {
 			return err
 		}
-		if verifierID != result.VerifierID || contract != result.CompletionContract || digest != result.ContractDigest || taskEvidence != result.TaskEvidenceDigest {
+		if digest != result.ContractDigest || taskEvidence != result.TaskEvidenceDigest {
 			return errors.New("stale verifier result rejected")
 		}
 		var priorAttemptID string
@@ -487,17 +491,10 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		if !activeAttempt && !waitingAttempt {
 			return errors.New("verifier result requires its active or completed waiting attempt")
 		}
-		if result.Outcome == "continuation_required" {
-			if continuations >= maxContinuations {
-				result.Outcome = "escalated"
-			} else {
-				continuations++
-			}
-		}
 		if _, err = conn.ExecContext(ctx, `INSERT INTO verifier_result_receipts(work_item_id,attempt_id,result_digest,recorded_at) VALUES(?,?,?,?)`, workItemID, result.AttemptID, resultDigest, millis(now)); err != nil {
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,evaluation_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,evaluation_revision=excluded.evaluation_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, result.VerifierID, result.CompletionContract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
+		_, err = conn.ExecContext(ctx, `INSERT INTO verifier_results(work_item_id,attempt_id,result_digest,verifier_id,completion_contract,contract_digest,task_evidence_digest,head_revision,evaluation_revision,outcome,reason_codes_json,evidence_refs_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(work_item_id) DO UPDATE SET attempt_id=excluded.attempt_id,result_digest=excluded.result_digest,verifier_id=excluded.verifier_id,completion_contract=excluded.completion_contract,contract_digest=excluded.contract_digest,task_evidence_digest=excluded.task_evidence_digest,head_revision=excluded.head_revision,evaluation_revision=excluded.evaluation_revision,outcome=excluded.outcome,reason_codes_json=excluded.reason_codes_json,evidence_refs_json=excluded.evidence_refs_json,recorded_at=excluded.recorded_at`, workItemID, result.AttemptID, resultDigest, verifierID, contract, result.ContractDigest, result.TaskEvidenceDigest, result.HeadRevision, result.EvaluationRevision, result.Outcome, string(reasonJSON), string(evidenceJSON), millis(now))
 		if err != nil {
 			return err
 		}
@@ -507,7 +504,7 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		case "waiting":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,next_attempt_at=?,wait_deadline_at=COALESCE(wait_deadline_at,?),updated_at=? WHERE id=? AND state=?`, millis(now.Add(durablePollInterval)), millis(now.Add(durableWaitDeadline)), millis(now), workItemID, StateWaiting)
 		case "continuation_required":
-			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now), millis(now), workItemID, StateWaiting)
+			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state_version=state_version+1,continuation_count=?,next_attempt_at=?,updated_at=? WHERE id=? AND state=?`, continuations, millis(now.Add(durablePollInterval)), millis(now), workItemID, StateWaiting)
 		case "escalated":
 			_, err = conn.ExecContext(ctx, `UPDATE work_items SET state=?,state_version=state_version+1,continuation_count=?,terminal_at=?,next_attempt_at=NULL,updated_at=? WHERE id=? AND state=?`, StateFailed, continuations, millis(now), millis(now), workItemID, StateWaiting)
 		}
@@ -519,9 +516,6 @@ func (store *Store) RecordVerifierResult(ctx context.Context, workItemID string,
 		// Complete recognizes the durable verifier receipt as an idempotent handoff.
 		finalAttemptState, workState, next := AttemptRetryScheduled, StateWaiting, any(millis(now.Add(durablePollInterval)))
 		terminal := any(nil)
-		if result.Outcome == "continuation_required" {
-			next = millis(now)
-		}
 		if result.Outcome == "satisfied" {
 			finalAttemptState, workState, terminal = AttemptSucceeded, StateCompleted, millis(now)
 		}

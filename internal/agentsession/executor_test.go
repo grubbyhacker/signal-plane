@@ -37,3 +37,30 @@ func coordinatorFixtureAt(t *testing.T, path string) (*workledger.Store, workled
 func coordinatorFixture(t *testing.T) (*workledger.Store, workledger.WorkItem, workledger.ExecutorAttempt, time.Time) {
 	return coordinatorFixtureAt(t, filepath.Join(t.TempDir(), "db"))
 }
+
+func TestRegisteredVerifierMappingsAndLocalOpaqueRevision(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		phase, packageOutcome, signal string
+	}{
+		{"pending", "waiting", "waiting"},
+		{"red", "continuation", "continuation_required"},
+		{"red", "missing_or_stale", "continuation_required"},
+		{"green", "satisfied", "satisfied"},
+		{"escalated", "escalated", "escalated"},
+		{"refused", "escalated", "escalated"},
+		{"escalated", "escalated", "escalated"},
+	} {
+		if !verifierPhaseMatches(tc.phase, tc.packageOutcome) || signalOutcome(tc.packageOutcome) != tc.signal {
+			t.Fatalf("mapping phase=%s outcome=%s", tc.phase, tc.packageOutcome)
+		}
+	}
+	local := &VerifierEvent{Phase: "refused", Outcome: "escalated", ContractDigest: digest, TaskEvidenceDigest: digest, HeadRevision: "local:unavailable:verifier:turn-42:observation:2", Reasons: []VerifierReason{{Code: "refused", EvidenceRef: "local:refused:" + digest}}, EvidenceRefs: []string{"local:refused:" + digest}}
+	if !validVerifierResult(local) {
+		t.Fatal("local refusal with an opaque revision was rejected")
+	}
+	local.Reasons = nil
+	if validVerifierResult(local) {
+		t.Fatal("non-satisfied verifier result without reasons was accepted")
+	}
+}

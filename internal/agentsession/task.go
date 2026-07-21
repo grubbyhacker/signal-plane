@@ -88,8 +88,8 @@ func GitHubGreenPRTaskSelection(branchRef string) *workledger.TaskSelection {
 }
 
 func (e *Executor) RecordGitHubGreenPRResult(ctx context.Context, workItemID string, result workledger.VerifierResult) error {
-	if e.Store == nil || result.VerifierID != GitHubGreenPRContract || result.CompletionContract != GitHubGreenPRContract {
+	if e.Store == nil {
 		return errors.New("registered github green PR observation is required")
 	}
-	return e.Store.RecordVerifierResult(ctx, workItemID, result, 1, e.now())
+	return e.Store.RecordVerifierResult(ctx, workItemID, result, e.now())
 }

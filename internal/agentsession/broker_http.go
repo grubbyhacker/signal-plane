@@ -122,7 +122,7 @@ func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequ
 		return BrokerTurn{}, err
 	}
 	lease, err := response.Lease.normalized()
-	if err != nil || response.Version != "agentd/registered-turn/v2" || response.SessionID == "" || response.TurnID == "" || response.ModelEffectID != "model:"+request.IdempotencyKey || response.Phase != "queued" || response.Cursor < 0 {
+	if err != nil || response.Version != "agentd/registered-turn/v2" || response.SessionID == "" || response.TurnID == "" || response.ModelEffectID != "model:"+request.IdempotencyKey || response.Phase != "queued" || response.Cursor <= 0 {
 		return BrokerTurn{}, errors.New("broker turn result is invalid")
 	}
 	return BrokerTurn{SessionID: response.SessionID, TurnID: response.TurnID, ModelEffectID: response.ModelEffectID, Cursor: response.Cursor, Lease: lease}, nil
@@ -148,7 +148,7 @@ func (broker *HTTPBroker) StreamEvents(ctx context.Context, request StreamEvents
 	events := make([]Event, 0, len(response.Events))
 	previous := request.Cursor
 	for _, wire := range response.Events {
-		if wire.Cursor != previous+1 || wire.SessionID == "" || wire.TurnID == "" || wire.ModelEffectID == "" || wire.Attempt != 0 || wire.Phase == "" || wire.WorkerID == "" || wire.StorageLineageID == "" || wire.FenceEpoch <= 0 || wire.AdmissionTaskDigest == "" || wire.TaskEvidenceDigest == "" {
+		if wire.Cursor != previous+1 || wire.SessionID == "" || wire.TurnID == "" || wire.ModelEffectID == "" || wire.Attempt < 0 || wire.Phase == "" || wire.WorkerID == "" || wire.StorageLineageID == "" || wire.FenceEpoch < 0 || wire.AdmissionTaskDigest == "" || wire.TaskEvidenceDigest == "" {
 			return BrokerEvents{}, errors.New("broker event stream is non-contiguous or malformed")
 		}
 		event := Event{Cursor: wire.Cursor, Attempt: wire.Attempt, SessionID: wire.SessionID, TurnID: wire.TurnID, ModelEffectID: wire.ModelEffectID, Phase: wire.Phase, WorkerID: wire.WorkerID, StorageLineageID: wire.StorageLineageID, FenceEpoch: wire.FenceEpoch, AdmissionTaskDigest: wire.AdmissionTaskDigest, TaskEvidenceDigest: wire.TaskEvidenceDigest, Verifier: wire.Verifier}
@@ -174,56 +174,6 @@ type registeredEventWire struct {
 	AdmissionTaskDigest string         `json:"admissionTaskDigest"`
 	TaskEvidenceDigest  string         `json:"taskEvidenceDigest"`
 	Verifier            *VerifierEvent `json:"verifier,omitempty"`
-}
-
-func isVerifierEvent(kind string) bool {
-	return kind == "verifier_evaluated" || kind == "verifier_continuation" || kind == "verifier_failed" || kind == "verifier_escalated"
-}
-
-func verifierKindMatches(kind, outcome string) bool {
-	switch kind {
-	case "verifier_evaluated":
-		return outcome == "waiting" || outcome == "satisfied"
-	case "verifier_continuation":
-		return outcome == "continuation_required"
-	case "verifier_failed", "verifier_escalated":
-		return outcome == "escalated"
-	default:
-		return false
-	}
-}
-
-func decodeVerifierEvent(payload json.RawMessage) (*VerifierEvent, error) {
-	var wire struct {
-		Verifier struct {
-			WorkItemID          string   `json:"workItemId"`
-			AttemptID           string   `json:"attemptId"`
-			AdmissionTaskDigest string   `json:"admissionTaskDigest"`
-			VerifierID          string   `json:"verifierId"`
-			CompletionContract  string   `json:"completionContract"`
-			ContractDigest      string   `json:"contractDigest"`
-			TaskEvidenceDigest  string   `json:"taskEvidenceDigest"`
-			HeadRevision        string   `json:"headRevision"`
-			EvaluationRevision  string   `json:"evaluationRevision"`
-			Outcome             string   `json:"outcome"`
-			ReasonCodes         []string `json:"reasonCodes"`
-			EvidenceRefs        []string `json:"evidenceRefs"`
-			WorkerID            string   `json:"workerId"`
-			SessionID           string   `json:"sessionId"`
-			FenceEpoch          int64    `json:"fenceEpoch"`
-		} `json:"verifier"`
-	}
-	if err := decodeStrict(payload, &wire); err != nil {
-		return nil, errors.New("verifier event payload is invalid")
-	}
-	v := wire.Verifier
-	if v.WorkItemID == "" || v.AttemptID == "" || v.AdmissionTaskDigest == "" || v.VerifierID == "" || v.CompletionContract == "" || v.ContractDigest == "" || v.TaskEvidenceDigest == "" || v.HeadRevision == "" || v.EvaluationRevision == "" || v.Outcome == "" || v.WorkerID == "" || v.SessionID == "" || v.FenceEpoch <= 0 || len(v.EvidenceRefs) == 0 {
-		return nil, errors.New("verifier event payload identity is incomplete")
-	}
-	if (v.Outcome == "satisfied" && len(v.ReasonCodes) != 0) || (v.Outcome != "satisfied" && len(v.ReasonCodes) == 0) {
-		return nil, errors.New("verifier event payload outcome is invalid")
-	}
-	return &VerifierEvent{WorkItemID: v.WorkItemID, AttemptID: v.AttemptID, AdmissionTaskDigest: v.AdmissionTaskDigest, VerifierID: v.VerifierID, CompletionContract: v.CompletionContract, ContractDigest: v.ContractDigest, TaskEvidenceDigest: v.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.EvaluationRevision, Outcome: v.Outcome, ReasonCodes: v.ReasonCodes, EvidenceRefs: v.EvidenceRefs, WorkerID: v.WorkerID, SessionID: v.SessionID, FenceEpoch: v.FenceEpoch}, nil
 }
 
 func (broker *HTTPBroker) Reassign(ctx context.Context, request ReassignRequest) (BrokerReassignment, error) {

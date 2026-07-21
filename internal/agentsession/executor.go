@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
@@ -92,17 +93,20 @@ type Event struct {
 // the identity fields separate from EvidenceRef: verdict semantics must never
 // be reconstructed from a hash of an opaque event payload.
 type VerifierEvent struct {
-	Phase              string   `json:"phase"`
-	Outcome            string   `json:"outcome"`
-	HeadRevision       string   `json:"headRevision"`
-	EvaluationRevision string   `json:"evaluationRevision"`
-	ReasonCodes        []string `json:"reasonCodes"`
-	EvidenceRefs       []string `json:"evidenceRefs"`
-	// Ignored legacy envelope fields retained for source compatibility.
-	WorkItemID, AttemptID, AdmissionTaskDigest                         string
-	VerifierID, CompletionContract, ContractDigest, TaskEvidenceDigest string
-	WorkerID, SessionID                                                string
-	FenceEpoch                                                         int64
+	Phase              string           `json:"phase"`
+	Outcome            string           `json:"outcome"`
+	ContractDigest     string           `json:"contractDigest"`
+	TaskEvidenceDigest string           `json:"taskEvidenceDigest"`
+	HeadRevision       string           `json:"headRevision"`
+	Reasons            []VerifierReason `json:"reasons"`
+	EvidenceRefs       []string         `json:"evidenceRefs"`
+}
+
+// VerifierReason is the package-owned reason statement associated with a
+// registered verifier result.
+type VerifierReason struct {
+	Code        string `json:"code"`
+	EvidenceRef string `json:"evidenceRef,omitempty"`
 }
 
 type Executor struct {
@@ -139,7 +143,7 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 			return retry("agentd_submit", "registered task is unavailable"), nil
 		}
 		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: request.Attempt.IdempotencyKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
-		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+request.Attempt.IdempotencyKey || turn.Cursor < 0 || !sameLease(binding, turn.Lease) {
+		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+request.Attempt.IdempotencyKey || turn.Cursor <= 0 || !sameLease(binding, turn.Lease) {
 			return retry("agentd_submit", "broker turn submit unavailable"), nil
 		}
 		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, request.Attempt.IdempotencyKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.Cursor, e.now()); err != nil {
@@ -176,10 +180,10 @@ func retry(classification, message string) workledger.ExecutorResult {
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeRetryableFailure, RetryClassification: classification, SanitizedError: message}
 }
 func validEvent(e Event, binding workledger.SessionBinding, request workledger.ExecutorRequest) bool {
-	if e.Cursor <= 0 || e.Attempt != 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest == "" || e.TaskEvidenceDigest == "" {
+	if e.Cursor <= 0 || e.Attempt < 0 || e.SessionID != binding.AgentdSessionID || e.TurnID != binding.SubmittedTurnID || e.ModelEffectID != binding.ModelEffectID || e.WorkerID != binding.WorkerID || e.StorageLineageID != binding.WorkerStorageLineageID || e.FenceEpoch != binding.WorkerFenceEpoch || e.AdmissionTaskDigest == "" || e.TaskEvidenceDigest == "" {
 		return false
 	}
-	return e.Phase == "queued" || (e.Verifier != nil && verifierPhaseMatches(e.Verifier.Phase, e.Verifier.Outcome))
+	return (e.Phase == "queued" && e.Verifier == nil) || (e.Verifier != nil && e.Phase == e.Verifier.Phase && validVerifierResult(e.Verifier))
 }
 
 func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.ExecutorRequest, binding workledger.SessionBinding, event Event) error {
@@ -188,13 +192,44 @@ func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.E
 	if err != nil || event.AdmissionTaskDigest != task.Digest {
 		return errors.New("agent verifier event admission identity is stale")
 	}
-	if err := e.RecordGitHubGreenPRResult(ctx, request.WorkItem.ID, workledger.VerifierResult{AttemptID: request.Attempt.ID, VerifierID: task.Snapshot.VerifierID, CompletionContract: task.Snapshot.CompletionContract, ContractDigest: task.Snapshot.ContractDigest, TaskEvidenceDigest: event.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.EvaluationRevision, Outcome: v.Outcome, ReasonCodes: v.ReasonCodes, EvidenceRefs: v.EvidenceRefs}); err != nil {
+	reasons := make([]string, len(v.Reasons))
+	for i, reason := range v.Reasons {
+		reasons[i] = reason.Code
+	}
+	if err := e.RecordGitHubGreenPRResult(ctx, request.WorkItem.ID, workledger.VerifierResult{AttemptID: request.Attempt.ID, ContractDigest: v.ContractDigest, TaskEvidenceDigest: v.TaskEvidenceDigest, HeadRevision: v.HeadRevision, EvaluationRevision: v.HeadRevision, Outcome: signalOutcome(v.Outcome), ReasonCodes: reasons, EvidenceRefs: v.EvidenceRefs}); err != nil {
 		return err
 	}
 	return nil
 }
 func verifierPhaseMatches(phase, outcome string) bool {
-	return (phase == "pending" && outcome == "waiting") || (phase == "green" && outcome == "satisfied") || (phase == "red" && outcome == "escalated") || (phase == "refused" && outcome == "escalated") || (phase == "escalated" && outcome == "escalated")
+	return (phase == "pending" && outcome == "waiting") || (phase == "green" && outcome == "satisfied") || (phase == "red" && (outcome == "continuation" || outcome == "missing_or_stale")) || ((phase == "refused" || phase == "escalated") && outcome == "escalated")
+}
+
+func validVerifierResult(v *VerifierEvent) bool {
+	if !verifierPhaseMatches(v.Phase, v.Outcome) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(v.ContractDigest) || !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(v.TaskEvidenceDigest) || !boundedOpaque(v.HeadRevision) || len(v.EvidenceRefs) == 0 || len(v.EvidenceRefs) > 64 {
+		return false
+	}
+	if (v.Outcome == "satisfied") != (len(v.Reasons) == 0) {
+		return false
+	}
+	for _, reason := range v.Reasons {
+		if !boundedOpaque(reason.Code) || (reason.EvidenceRef != "" && !boundedOpaque(reason.EvidenceRef)) {
+			return false
+		}
+	}
+	for _, ref := range v.EvidenceRefs {
+		if !boundedOpaque(ref) {
+			return false
+		}
+	}
+	return true
+}
+
+func signalOutcome(outcome string) string {
+	if outcome == "continuation" || outcome == "missing_or_stale" {
+		return "continuation_required"
+	}
+	return outcome
 }
 func sameLease(b workledger.SessionBinding, l workledger.SessionLease) bool {
 	return l.WorkerID == b.WorkerID && l.WorkerFenceEpoch == b.WorkerFenceEpoch && l.ProfileVersion == b.ProfileVersion && l.PolicyDigest == b.PolicyDigest && l.SessionLineageID == b.SessionLineageID && l.WorkerStorageLineageID == b.WorkerStorageLineageID && l.AuthorityProfile == b.AuthorityProfile

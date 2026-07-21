@@ -56,18 +56,26 @@ conflicting replay fails without advancing the watermark.
 
 Agent runtime completion is evidence, not task completion. The registered
 repository verifier is the only path from `waiting` to a terminal success. Its
-result must match the immutable task contract digest, task evidence digest, and
-named completion contract, identify an exact repository head, and cite durable
-evidence. A satisfied result additionally requires an `attempt_completed`
-coordinator event.
+wire is exactly the package result plus phase: `phase`, `outcome`,
+`contractDigest`, `taskEvidenceDigest`, bounded opaque `headRevision`,
+`reasons`, and `evidenceRefs`. Signal validates that package shape and phase
+mapping, but does not require legacy work-item, attempt, session, fence,
+verifier, completion-contract, or evaluation-revision members on that wire.
+`evaluation_revision`, where retained in the ledger, is exactly a
+representation projection of the package `headRevision`, not a provider fact.
+This permits source-owned local refusal and deadline revisions without
+inventing a GitHub SHA.
 
-The repository task permits one durable continuation. A second continuation
+The repository task permits one durable continuation. Agentd owns that
+continuation; Signal maps package `continuation` and `missing_or_stale` to a
+durable poll only and never submits a second turn. A second continuation
 request exhausts the budget and moves the work item to failed escalation rather
 than opening an unbounded agent loop. Workspace cleanup remains an agentd
 responsibility and is therefore outside this repository's janitor boundary.
-Verifier results carry the exact executor-attempt identity. A canonical receipt
-for that attempt makes exact replay idempotent, including after terminal commit,
-while a different result for the same attempt fails closed.
+Verifier results carry the exact executor-attempt identity at Signal's
+persistence boundary. A canonical receipt for that attempt makes exact replay
+idempotent, including after terminal commit, while a different result for the
+same attempt fails closed.
 
 ## Deliberately deferred
 

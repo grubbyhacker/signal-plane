@@ -71,6 +71,48 @@ func TestRegisteredTurnRejectsWrongVersionAndExtraFields(t *testing.T) {
 	}
 }
 
+func TestRegisteredEventsAcceptPackageVerifierAndRejectLegacyMembers(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("..", "..", "testdata", "agentd", "registered-turn-v2.golden.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Events map[string]json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(golden, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	fixture.Events["lease"] = testLeaseJSON(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority-workers/coordinator/v1/registered-events" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fixture.Events)
+	}))
+	defer server.Close()
+	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
+	batch, err := broker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0})
+	if err != nil || len(batch.Events) != 2 || batch.Events[1].Attempt != 1 || batch.Events[1].Verifier == nil || batch.Events[1].Verifier.Outcome != "waiting" {
+		t.Fatalf("batch=%+v err=%v", batch, err)
+	}
+
+	var invalid map[string]any
+	encoded, _ := json.Marshal(fixture.Events)
+	_ = json.Unmarshal(encoded, &invalid)
+	events := invalid["events"].([]any)
+	verifier := events[1].(map[string]any)["verifier"].(map[string]any)
+	verifier["workItemId"] = "legacy-wire-member"
+	invalidServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(invalid)
+	}))
+	defer invalidServer.Close()
+	invalidBroker, _ := NewHTTPBroker(invalidServer.URL, "token", invalidServer.Client())
+	if _, err := invalidBroker.StreamEvents(t.Context(), StreamEventsRequest{BindingKey: "binding", Cursor: 0}); err == nil {
+		t.Fatal("legacy verifier member was accepted")
+	}
+}
+
 func testLeaseJSON(t *testing.T) json.RawMessage {
 	t.Helper()
 	return json.RawMessage(`{"principal":"p","profile":"general-writer-v1","worker_id":"worker-42","session_lineage_id":"11111111111111111111111111111111","worker_storage_lineage_id":"22222222222222222222222222222222","worker_fence_epoch":7,"profile_version":"v1","policy_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","session_binding_digest":"x","idempotency_key_digest":"y","created_at":"now","released_at":"","replay":false}`)
