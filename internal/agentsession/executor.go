@@ -137,12 +137,12 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 	if err != nil {
 		return retry("coordinator_acquire", "authority session unavailable"), nil
 	}
-	binding, err = e.Store.BindRegisteredSubmitKey(ctx, request.WorkItem.ID, bindingLease(binding), registeredSubmitKey(binding), e.now())
-	if err != nil {
-		return retry("coordinator_fence", "registered submit key unavailable"), nil
-	}
 	turnID := binding.SubmittedTurnID
-	if binding.SubmittedIdempotencyKey == "" {
+	if binding.SubmittedTurnID == "" {
+		binding, err = e.Store.BindRegisteredSubmitKey(ctx, request.WorkItem.ID, bindingLease(binding), registeredSubmitKey(binding), e.now())
+		if err != nil {
+			return retry("coordinator_fence", "registered submit key unavailable"), nil
+		}
 		task, taskErr := e.registeredTask(ctx, request)
 		if taskErr != nil {
 			return retry("agentd_submit", "registered task is unavailable"), nil

@@ -159,11 +159,78 @@ func TestRegisteredSubmitRecoversLostResponseWithDurableWorkItemKey(t *testing.T
 	}
 }
 
+func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, attempt, now := coordinatorFixtureAt(t, path)
+	lease := fixtureTestLease()
+	binding, err := store.BindSessionLease(t.Context(), item.ID, "agentd:binding:"+item.ID, lease, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const historicalKey = "attempt:historical-submission-key"
+	if err := store.RecordRegisteredTurn(t.Context(), item.ID, lease, historicalKey, "historical-session", "historical-turn", "model:"+historicalKey, 7, now); err != nil {
+		t.Fatal(err)
+	}
+	if binding.RegisteredSubmitKey != "" {
+		t.Fatalf("pre-migration binding registered key=%q", binding.RegisteredSubmitKey)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	migrated, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || migrated.RegisteredSubmitKey != historicalKey || migrated.SubmittedIdempotencyKey != historicalKey {
+		t.Fatalf("migrated binding=%+v err=%v", migrated, err)
+	}
+	broker := &resumePollingBroker{lease: lease}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ExternalCorrelation != "historical-turn" {
+		t.Fatalf("resume execute=%+v err=%v", result, err)
+	}
+	if broker.submits != 0 || broker.cursor != 7 || broker.bindingKey != migrated.BindingKey {
+		t.Fatalf("resume submits=%d cursor=%d binding=%q", broker.submits, broker.cursor, broker.bindingKey)
+	}
+	resumed, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || resumed.RegisteredSubmitKey != historicalKey {
+		t.Fatalf("resumed binding=%+v err=%v", resumed, err)
+	}
+}
+
 type lostResponseBroker struct {
 	lease              workledger.SessionLease
 	submitKeys         []string
 	logicalSubmissions int
 	turn               BrokerTurn
+}
+
+type resumePollingBroker struct {
+	lease      workledger.SessionLease
+	submits    int
+	bindingKey string
+	cursor     int64
+}
+
+func (b *resumePollingBroker) Acquire(_ context.Context, _ AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *resumePollingBroker) SubmitTurn(context.Context, SubmitTurnRequest) (BrokerTurn, error) {
+	b.submits++
+	return BrokerTurn{}, errors.New("submitted binding must only poll")
+}
+func (b *resumePollingBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
+	b.bindingKey, b.cursor = request.BindingKey, request.Cursor
+	return BrokerEvents{Lease: b.lease}, nil
+}
+func (b *resumePollingBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *resumePollingBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
 }
 
 func (b *lostResponseBroker) Acquire(_ context.Context, _ AcquireRequest) (workledger.SessionLease, error) {
