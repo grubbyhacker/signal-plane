@@ -10,13 +10,18 @@ import (
 // These values are intentionally not configuration. They identify the sole
 // deterministic fixture that may exercise the disabled coordinator.
 const (
-	GitHubGreenPRFixtureRouteID       = "github-green-pr-fixture-v1"
-	GitHubGreenPRFixtureBranchRef     = "agent/fleiglabs-repo-agent/fixture"
-	GitHubGreenPRFixtureTaskDigest    = "sha256:33fb8d40a88f14bc2e86652e541422d43e8c8e9a1bd7770a58fb0a9bdab93c77"
-	gitHubGreenPRFixtureDeliveryID    = "github-green-pr-fixture-admission-v1"
-	gitHubGreenPRFixtureSignalID      = "signal-github-green-pr-fixture-v1"
-	gitHubGreenPRFixtureSourceRev     = "9d8c4ed0a4a0ad12d1d4e3870a3c7f9a0c6b5e4f"
-	gitHubGreenPRFixtureTransportName = "fixture-github-green-pr-v1"
+	GitHubGreenPRFixtureRouteID            = "github-green-pr-fixture-v1"
+	GitHubGreenPRFixtureBranchRef          = "agent/fleiglabs-repo-agent/fixture"
+	GitHubGreenPRFixtureRepositoryID       = "1307218521"
+	GitHubGreenPRFixtureRepositoryNodeID   = "R_kgDOTeqSWQ"
+	GitHubGreenPRFixtureTaskPath           = "fixture-task.md"
+	GitHubGreenPRFixtureSourceRevision     = "b70aada3ef3f2dc08e7eb5ceeee5712957fd4bbd"
+	GitHubGreenPRFixtureTaskBlob           = "2de603bfa26af4aa8a33f88876a3f424cadb5da5"
+	GitHubGreenPRFixtureTaskEvidenceDigest = "sha256:2308599ce4b16df188920bd4725dbe0d85361e44d83276146ccfa986653ecd6c"
+	gitHubGreenPRFixtureDeliveryID         = "github-green-pr-fixture-admission-v1"
+	gitHubGreenPRFixtureSignalID           = "signal-github-green-pr-fixture-v1"
+	gitHubGreenPRFixtureTransportName      = "fixture-github-green-pr-v1"
+	gitHubGreenPRFixtureEvidenceRef        = "github://R_kgDOTeqSWQ/repositories/1307218521/grubbyhacker/repository-worker-lifecycle-test/contents/fixture-task.md?ref=b70aada3ef3f2dc08e7eb5ceeee5712957fd4bbd&git_blob=2de603bfa26af4aa8a33f88876a3f424cadb5da5"
 )
 
 // GitHubGreenPRFixtureRoute is the sole route admitted by the fixture command
@@ -73,15 +78,15 @@ func gitHubGreenPRFixtureEvent(now time.Time) workledger.Event {
 		Source:            "manual",
 		Namespace:         GitHubGreenPRRepository,
 		ObjectKind:        "repository_task",
-		ObjectID:          GitHubGreenPRFixtureRouteID,
+		ObjectID:          GitHubGreenPRFixtureRepositoryID,
 		EventKind:         "repository_change",
 		Action:            "requested",
 		ActorClass:        "fixture",
-		SourceRevision:    gitHubGreenPRFixtureSourceRev,
+		SourceRevision:    GitHubGreenPRFixtureSourceRevision,
 		CorrelationID:     GitHubGreenPRFixtureRouteID,
 		CausationID:       gitHubGreenPRFixtureDeliveryID,
-		PayloadDigest:     GitHubGreenPRFixtureTaskDigest,
-		EvidenceRef:       "fixture://github-green-pr-v1/admission",
+		PayloadDigest:     GitHubGreenPRFixtureTaskEvidenceDigest,
+		EvidenceRef:       gitHubGreenPRFixtureEvidenceRef,
 		ReceivedAt:        now.UTC(),
 	}
 }

@@ -98,6 +98,11 @@ func TestGitHubGreenPRTaskRejectsPredecessorIdentifiers(t *testing.T) {
 func TestGitHubGreenPRFixtureAdmissionIsIdempotentAndRejectsConflictingContent(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	route := GitHubGreenPRFixtureRoute()
+	var parameters GitHubGreenPRParameters
+	if err := json.Unmarshal(route.Task.Parameters, &parameters); err != nil || parameters.BaseBranch != "main" || parameters.BranchRef != GitHubGreenPRFixtureBranchRef {
+		t.Fatalf("fixture route did not retain the fixed base and worker branch namespace: %+v err=%v", parameters, err)
+	}
 	store, err := workledger.Open(filepath.Join(t.TempDir(), "fixture.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -111,18 +116,46 @@ func TestGitHubGreenPRFixtureAdmissionIsIdempotentAndRejectsConflictingContent(t
 	if err != nil || first.Duplicate {
 		t.Fatalf("first admission=%+v err=%v", first, err)
 	}
-	duplicate, err := AdmitGitHubGreenPRFixture(ctx, store, registry, now.Add(time.Second))
+	duplicate, err := AdmitGitHubGreenPRFixture(ctx, store, registry, now.Add(24*time.Hour))
 	if err != nil || !duplicate.Duplicate || duplicate.WorkItem.ID != first.WorkItem.ID {
 		t.Fatalf("duplicate admission=%+v err=%v", duplicate, err)
 	}
-	conflict := gitHubGreenPRFixtureEvent(now)
-	conflict.PayloadDigest = "sha256:" + strings.Repeat("f", 64)
-	snapshot, err := store.MatchRoute(ctx, conflict)
+	fixture := gitHubGreenPRFixtureEvent(now)
+	if fixture.ObjectID != GitHubGreenPRFixtureRepositoryID || fixture.SourceRevision != GitHubGreenPRFixtureSourceRevision || fixture.PayloadDigest != GitHubGreenPRFixtureTaskEvidenceDigest || fixture.EvidenceRef != gitHubGreenPRFixtureEvidenceRef {
+		t.Fatalf("fixture is not bound to inspected coordinates: %+v", fixture)
+	}
+	for _, coordinate := range []string{GitHubGreenPRRepository, GitHubGreenPRFixtureRepositoryNodeID, GitHubGreenPRFixtureRepositoryID, GitHubGreenPRFixtureTaskPath, GitHubGreenPRFixtureSourceRevision, GitHubGreenPRFixtureTaskBlob} {
+		if !strings.Contains(fixture.EvidenceRef, coordinate) {
+			t.Fatalf("fixture evidence does not contain %q: %s", coordinate, fixture.EvidenceRef)
+		}
+	}
+	registered, err := (&Executor{Store: store}).registeredTask(ctx, workledger.ExecutorRequest{WorkItem: first.WorkItem})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Admit(ctx, snapshot.ID, conflict, now); err == nil {
-		t.Fatal("fixture delivery with conflicting task evidence digest was accepted")
+	wantRegisteredDigest, err := admissionTaskDigest(registered.Source, registered.Snapshot)
+	if err != nil || registered.Digest != wantRegisteredDigest || registered.Digest == fixture.PayloadDigest {
+		t.Fatalf("registered digest=%s want=%s task evidence=%s err=%v", registered.Digest, wantRegisteredDigest, fixture.PayloadDigest, err)
+	}
+	for name, mutate := range map[string]func(*workledger.Event){
+		"repository ID": func(event *workledger.Event) { event.ObjectID = "1307218522" },
+		"revision":      func(event *workledger.Event) { event.SourceRevision = strings.Repeat("a", 40) },
+		"task blob and bytes": func(event *workledger.Event) {
+			event.EvidenceRef = strings.Replace(event.EvidenceRef, GitHubGreenPRFixtureTaskBlob, strings.Repeat("f", 40), 1)
+			event.PayloadDigest = "sha256:" + strings.Repeat("f", 64)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conflict := gitHubGreenPRFixtureEvent(now)
+			mutate(&conflict)
+			snapshot, err := store.MatchRoute(ctx, conflict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Admit(ctx, snapshot.ID, conflict, now.Add(48*time.Hour)); err == nil {
+				t.Fatal("fixture delivery with altered inspected coordinates was accepted")
+			}
+		})
 	}
 }
 
