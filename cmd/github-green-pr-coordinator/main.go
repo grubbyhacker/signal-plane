@@ -37,14 +37,11 @@ func main() {
 		fail(err)
 	}
 	defer store.Close()
-	registry := workledger.NewRegistry()
-	if err := registry.Register(&agentsession.Executor{Store: store, Broker: broker}); err != nil {
+	registry, err := agentsession.RegisterGitHubGreenPRFixture(store, broker)
+	if err != nil {
 		fail(err)
 	}
-	if err := registry.RegisterTask(agentsession.GitHubGreenPRTask{}); err != nil {
-		fail(err)
-	}
-	if _, err := store.ActivateRoute(context.Background(), fixtureRoute(), registry, time.Now().UTC()); err != nil {
+	if _, err := store.ActivateRoute(context.Background(), agentsession.GitHubGreenPRFixtureRoute(), registry, time.Now().UTC()); err != nil {
 		fail(err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -70,10 +67,6 @@ func run(ctx context.Context, store *workledger.Store, executor workledger.Execu
 		case <-tick.C:
 		}
 	}
-}
-
-func fixtureRoute() workledger.RouteDefinition {
-	return workledger.RouteDefinition{ID: "github-green-pr-fixture-v1", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: agentsession.ExecutorID, Task: agentsession.GitHubGreenPRTaskSelection("agent/fleiglabs-repo-agent/fixture"), Admission: workledger.AdmissionPolicy{Sources: []string{"manual"}, Namespaces: []string{agentsession.GitHubGreenPRRepository}, ObjectKinds: []string{"repository_task"}, Events: []string{"repository_change"}, Actions: []string{"requested"}}, Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject}, Retry: workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}}}
 }
 
 func envDefault(name, fallback string) string {

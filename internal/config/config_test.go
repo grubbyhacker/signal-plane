@@ -75,6 +75,17 @@ func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
 	}
 }
 
+func TestValidateEnabledCoordinatorRequiresOnlyItsFixedStartupContract(t *testing.T) {
+	cfg := Config{Gateway: GatewayConfig{Addr: ":8080"}, NATS: NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}}, Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}}, Coordinator: CoordinatorConfig{Enabled: true, DatabasePath: "fixture.db", BrokerURL: "http://broker.internal:8091", BrokerTokenEnv: "FIXTURE_TOKEN", PollInterval: "1s"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixed coordinator startup config rejected: %v", err)
+	}
+	cfg.Coordinator.BrokerURL = "http://broker.internal:8091/choice?runtime=model"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("coordinator accepted caller-selectable broker URL")
+	}
+}
+
 func TestValidateWorkRouterAuthModesFailClosed(t *testing.T) {
 	base := Config{Gateway: GatewayConfig{Addr: ":8080"}, NATS: NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}}, Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}}}
 	base.WorkRouter = WorkRouterConfig{Enabled: true, Subject: "signals.github.webhook", Durable: "resume-release-router", DatabasePath: "jobs.db", YKMURL: "https://mcp.fleiglabs.cc/mcp", YKMAuthMode: "cloudflare_access", GitHubPrivateKeyPath: "/run/secrets/app.pem", YKMClientIDEnv: "CF_ID", YKMClientSecretEnv: "CF_SECRET"}

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,37 @@ func TestGitHubGreenPRTaskRejectsPredecessorIdentifiers(t *testing.T) {
 		if _, err := (GitHubGreenPRTask{}).CanonicalizeParameters(json.RawMessage(raw)); err == nil {
 			t.Fatalf("predecessor task parameters accepted: %s", raw)
 		}
+	}
+}
+
+func TestGitHubGreenPRFixtureAdmissionIsIdempotentAndRejectsConflictingContent(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	store, err := workledger.Open(filepath.Join(t.TempDir(), "fixture.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry, err := RegisterGitHubGreenPRFixture(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := AdmitGitHubGreenPRFixture(ctx, store, registry, now)
+	if err != nil || first.Duplicate {
+		t.Fatalf("first admission=%+v err=%v", first, err)
+	}
+	duplicate, err := AdmitGitHubGreenPRFixture(ctx, store, registry, now.Add(time.Second))
+	if err != nil || !duplicate.Duplicate || duplicate.WorkItem.ID != first.WorkItem.ID {
+		t.Fatalf("duplicate admission=%+v err=%v", duplicate, err)
+	}
+	conflict := gitHubGreenPRFixtureEvent(now)
+	conflict.PayloadDigest = "sha256:" + strings.Repeat("f", 64)
+	snapshot, err := store.MatchRoute(ctx, conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Admit(ctx, snapshot.ID, conflict, now); err == nil {
+		t.Fatal("fixture delivery with conflicting task evidence digest was accepted")
 	}
 }
 
