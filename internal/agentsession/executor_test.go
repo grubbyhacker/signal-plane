@@ -64,3 +64,63 @@ func TestRegisteredVerifierMappingsAndLocalOpaqueRevision(t *testing.T) {
 		t.Fatal("non-satisfied verifier result without reasons was accepted")
 	}
 }
+
+func TestRecordVerifierEventRejectsDigestsOutsideRegisteredTaskSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Event)
+	}{
+		{
+			name: "wrong verifier contract digest",
+			mutate: func(event *Event) {
+				event.Verifier.ContractDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "wrong verifier task evidence digest",
+			mutate: func(event *Event) {
+				event.Verifier.TaskEvidenceDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+		{
+			name: "wrong outer task evidence digest",
+			mutate: func(event *Event) {
+				event.TaskEvidenceDigest = "sha256:" + strings.Repeat("c", 64)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, item, attempt, now := coordinatorFixture(t)
+			defer store.Close()
+			executor := &Executor{Store: store, Now: func() time.Time { return now }}
+			task, err := executor.registeredTask(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := Event{
+				AdmissionTaskDigest: task.Digest,
+				TaskEvidenceDigest:  task.Snapshot.TaskEvidenceDigest,
+				Verifier: &VerifierEvent{
+					Phase:              "green",
+					Outcome:            "satisfied",
+					ContractDigest:     task.Snapshot.ContractDigest,
+					TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest,
+					HeadRevision:       strings.Repeat("a", 40),
+					EvidenceRefs:       []string{"fixture://github-green-pr-v1/verifier"},
+				},
+			}
+			tc.mutate(&event)
+			if err := executor.recordVerifierEvent(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}, workledger.SessionBinding{}, event); err == nil {
+				t.Fatal("well-formed verifier digests outside the registered snapshot were accepted")
+			}
+
+			event.TaskEvidenceDigest = task.Snapshot.TaskEvidenceDigest
+			event.Verifier.ContractDigest = task.Snapshot.ContractDigest
+			event.Verifier.TaskEvidenceDigest = task.Snapshot.TaskEvidenceDigest
+			event.Verifier.HeadRevision = strings.Repeat("b", 40)
+			if err := executor.recordVerifierEvent(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: attempt}, workledger.SessionBinding{}, event); err != nil {
+				t.Fatalf("rejected verifier result was persisted: %v", err)
+			}
+		})
+	}
+}

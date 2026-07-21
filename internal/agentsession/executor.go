@@ -189,7 +189,11 @@ func validEvent(e Event, binding workledger.SessionBinding, request workledger.E
 func (e *Executor) recordVerifierEvent(ctx context.Context, request workledger.ExecutorRequest, binding workledger.SessionBinding, event Event) error {
 	v := event.Verifier
 	task, err := e.registeredTask(ctx, request)
-	if err != nil || event.AdmissionTaskDigest != task.Digest {
+	if err != nil ||
+		event.AdmissionTaskDigest != task.Digest ||
+		event.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest ||
+		v.ContractDigest != task.Snapshot.ContractDigest ||
+		v.TaskEvidenceDigest != task.Snapshot.TaskEvidenceDigest {
 		return errors.New("agent verifier event admission identity is stale")
 	}
 	reasons := make([]string, len(v.Reasons))
