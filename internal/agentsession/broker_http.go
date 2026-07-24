@@ -126,7 +126,7 @@ func (broker *HTTPBroker) SubmitTurn(ctx context.Context, request SubmitTurnRequ
 	if err != nil || response.Version != "agentd/registered-turn/v2" || response.SessionID == "" || response.TurnID == "" || response.ModelEffectID != "model:"+request.IdempotencyKey || response.Phase != "queued" || response.Cursor <= 0 {
 		return BrokerTurn{}, errors.New("broker turn result is invalid")
 	}
-	return BrokerTurn{SessionID: response.SessionID, TurnID: response.TurnID, ModelEffectID: response.ModelEffectID, Cursor: response.Cursor, Lease: lease}, nil
+	return BrokerTurn{SessionID: response.SessionID, TurnID: response.TurnID, ModelEffectID: response.ModelEffectID, SubmitCursor: response.Cursor, Lease: lease}, nil
 }
 
 func (broker *HTTPBroker) StreamEvents(ctx context.Context, request StreamEventsRequest) (BrokerEvents, error) {

@@ -159,6 +159,48 @@ func TestRegisteredSubmitRecoversLostResponseWithDurableWorkItemKey(t *testing.T
 	}
 }
 
+func TestRegisteredSubmitCursorDoesNotAdvanceEventCursorAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	store, item, first, now := coordinatorFixtureAt(t, path)
+	broker := &cursorBoundaryBroker{lease: fixtureTestLease()}
+	executor := &Executor{Store: store, Broker: broker, Now: func() time.Time { return now }}
+
+	result, err := executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: first})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("initial execute=%+v err=%v", result, err)
+	}
+	binding, err := store.SessionBinding(t.Context(), item.ID)
+	if err != nil || binding.EventCursor != 1 {
+		t.Fatalf("initial binding=%+v err=%v", binding, err)
+	}
+	if err := store.Complete(t.Context(), first.ID, result, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = workledger.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, poll, ok, err := store.Claim(t.Context(), now.Add(pollInterval))
+	if err != nil || !ok {
+		t.Fatalf("poll claim ok=%v err=%v", ok, err)
+	}
+	executor.Store = store
+	result, err = executor.Execute(t.Context(), workledger.ExecutorRequest{WorkItem: item, Attempt: poll})
+	if err != nil || result.Outcome != workledger.OutcomeWaiting {
+		t.Fatalf("replay execute=%+v err=%v", result, err)
+	}
+	if len(broker.eventCursors) != 2 || broker.eventCursors[0] != 0 || broker.eventCursors[1] != 1 {
+		t.Fatalf("registered event cursors=%v want=[0 1]", broker.eventCursors)
+	}
+	if broker.submits != 1 {
+		t.Fatalf("submits=%d want 1", broker.submits)
+	}
+}
+
 func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	store, item, attempt, now := coordinatorFixtureAt(t, path)
@@ -192,7 +234,7 @@ func TestMigratedSubmittedBindingResumesPollingWithoutSubmitting(t *testing.T) {
 	if err != nil || result.Outcome != workledger.OutcomeWaiting || result.ExternalCorrelation != "historical-turn" {
 		t.Fatalf("resume execute=%+v err=%v", result, err)
 	}
-	if broker.submits != 0 || broker.cursor != 7 || broker.bindingKey != migrated.BindingKey {
+	if broker.submits != 0 || broker.cursor != 0 || broker.bindingKey != migrated.BindingKey {
 		t.Fatalf("resume submits=%d cursor=%d binding=%q", broker.submits, broker.cursor, broker.bindingKey)
 	}
 	resumed, err := store.SessionBinding(t.Context(), item.ID)
@@ -324,20 +366,56 @@ type continuationBroker struct {
 	events                          []Event
 }
 
+type cursorBoundaryBroker struct {
+	lease                               workledger.SessionLease
+	submits                             int
+	eventCursors                        []int64
+	sessionID, turnID, modelEffectID    string
+	admissionDigest, taskEvidenceDigest string
+}
+
+func (b *cursorBoundaryBroker) Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error) {
+	return b.lease, nil
+}
+func (b *cursorBoundaryBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
+	b.submits++
+	b.sessionID, b.turnID, b.modelEffectID = "cursor-session", "cursor-turn", "model:"+request.IdempotencyKey
+	b.admissionDigest, b.taskEvidenceDigest = request.AdmissionTaskDigest, request.TaskEvidenceDigest
+	return BrokerTurn{SessionID: b.sessionID, TurnID: b.turnID, ModelEffectID: b.modelEffectID, SubmitCursor: 1, Lease: b.lease}, nil
+}
+func (b *cursorBoundaryBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
+	b.eventCursors = append(b.eventCursors, request.Cursor)
+	switch request.Cursor {
+	case 0:
+		return BrokerEvents{Lease: b.lease, Events: []Event{{Cursor: 1, SessionID: b.sessionID, TurnID: b.turnID, ModelEffectID: b.modelEffectID, Phase: "queued", WorkerID: b.lease.WorkerID, StorageLineageID: b.lease.WorkerStorageLineageID, FenceEpoch: b.lease.WorkerFenceEpoch, AdmissionTaskDigest: b.admissionDigest, TaskEvidenceDigest: b.taskEvidenceDigest}}}, nil
+	case 1:
+		return BrokerEvents{Lease: b.lease}, nil
+	default:
+		return BrokerEvents{}, errors.New("registered events must begin at durable cursor zero and advance only after an event")
+	}
+}
+func (b *cursorBoundaryBroker) Reassign(context.Context, ReassignRequest) (BrokerReassignment, error) {
+	return BrokerReassignment{}, errors.New("unexpected reassignment")
+}
+func (b *cursorBoundaryBroker) ReassignmentStatus(context.Context, ReassignmentStatusRequest) (BrokerReassignmentStatus, error) {
+	return BrokerReassignmentStatus{}, errors.New("unexpected reassignment")
+}
+
 func (b *continuationBroker) Acquire(context.Context, AcquireRequest) (workledger.SessionLease, error) {
 	return b.lease, nil
 }
 func (b *continuationBroker) SubmitTurn(_ context.Context, request SubmitTurnRequest) (BrokerTurn, error) {
 	b.rootEffect, b.continuationEffect = "model:"+request.IdempotencyKey, "model:continuation:"+request.IdempotencyKey
 	b.admissionDigest, b.evidenceDigest = request.AdmissionTaskDigest, request.TaskEvidenceDigest
-	return BrokerTurn{SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: b.rootEffect, Cursor: 1, Lease: b.lease}, nil
+	return BrokerTurn{SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: b.rootEffect, SubmitCursor: 1, Lease: b.lease}, nil
 }
 func (b *continuationBroker) event(cursor, attempt int64, effect, phase string, verifier *VerifierEvent) Event {
 	return Event{Cursor: cursor, Attempt: attempt, SessionID: "continuation-session", TurnID: "continuation-turn", ModelEffectID: effect, Phase: phase, WorkerID: b.lease.WorkerID, StorageLineageID: b.lease.WorkerStorageLineageID, FenceEpoch: b.lease.WorkerFenceEpoch, AdmissionTaskDigest: b.admissionDigest, TaskEvidenceDigest: b.evidenceDigest, Verifier: verifier}
 }
 func (b *continuationBroker) StreamEvents(_ context.Context, request StreamEventsRequest) (BrokerEvents, error) {
-	if request.Cursor == 1 {
+	if request.Cursor == 0 {
 		return BrokerEvents{Lease: b.lease, Events: []Event{
+			b.event(1, 0, b.rootEffect, "queued", nil),
 			b.event(2, 0, b.rootEffect, "authorized", nil),
 			b.event(3, 1, b.rootEffect, "running", nil),
 			b.event(4, 1, b.rootEffect, "completed", nil),
@@ -400,7 +478,7 @@ func (b *lostResponseBroker) SubmitTurn(_ context.Context, request SubmitTurnReq
 	b.submitKeys = append(b.submitKeys, request.IdempotencyKey)
 	if b.turn.TurnID == "" {
 		b.logicalSubmissions++
-		b.turn = BrokerTurn{SessionID: "lost-session", TurnID: "lost-turn", ModelEffectID: "model:" + request.IdempotencyKey, Cursor: 1, Lease: b.lease}
+		b.turn = BrokerTurn{SessionID: "lost-session", TurnID: "lost-turn", ModelEffectID: "model:" + request.IdempotencyKey, SubmitCursor: 1, Lease: b.lease}
 		return BrokerTurn{}, errors.New("response lost after broker acceptance")
 	}
 	if request.IdempotencyKey != b.submitKeys[0] {

@@ -174,13 +174,13 @@ func (store *Store) RecordSubmittedTurn(ctx context.Context, workItemID string, 
 }
 
 // RecordRegisteredTurn durably records the exact agentd v2 acceptance mapping
-// before the coordinator schedules any poll. A restart therefore polls after
-// the persisted cursor and never submits or continues the model turn again.
-func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, sessionID, turnID, modelEffectID string, cursor int64, now time.Time) error {
-	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || cursor <= 0 || !validLease(lease) {
+// before the coordinator schedules any poll. submitCursor acknowledges the
+// submission only; registered-events always begin at durable cursor zero.
+func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string, lease SessionLease, idempotencyKey, sessionID, turnID, modelEffectID string, submitCursor int64, now time.Time) error {
+	if idempotencyKey == "" || sessionID == "" || turnID == "" || modelEffectID != "model:"+idempotencyKey || submitCursor < 0 || !validLease(lease) {
 		return errors.New("submitted turn identity is incomplete")
 	}
-	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,active_model_effect_id=?,active_effect_attempt=0,submitted_turn_id=?,event_cursor=?,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, modelEffectID, turnID, cursor, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
+	result, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET agentd_session_id=?,submitted_idempotency_key=?,model_effect_id=?,active_model_effect_id=?,active_effect_attempt=0,submitted_turn_id=?,event_cursor=0,updated_at=? WHERE work_item_id=? AND worker_id=? AND worker_fence_epoch=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND worker_storage_lineage_id=? AND submitted_idempotency_key=''`, sessionID, idempotencyKey, modelEffectID, modelEffectID, turnID, millis(now), workItemID, lease.WorkerID, lease.WorkerFenceEpoch, lease.ProfileVersion, lease.PolicyDigest, lease.SessionLineageID, lease.WorkerStorageLineageID)
 	if err != nil {
 		return err
 	}
@@ -191,7 +191,7 @@ func (store *Store) RecordRegisteredTurn(ctx context.Context, workItemID string,
 	if err != nil {
 		return err
 	}
-	if !sameSessionLease(binding, lease) || binding.AgentdSessionID != sessionID || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.ActiveModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID || binding.EventCursor != cursor {
+	if !sameSessionLease(binding, lease) || binding.AgentdSessionID != sessionID || binding.SubmittedIdempotencyKey != idempotencyKey || binding.ModelEffectID != modelEffectID || binding.ActiveModelEffectID != modelEffectID || binding.SubmittedTurnID != turnID || binding.EventCursor != 0 {
 		return errors.New("submitted turn conflicts with durable model effect")
 	}
 	return nil
