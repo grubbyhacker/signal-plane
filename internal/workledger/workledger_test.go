@@ -82,6 +82,48 @@ func TestSessionBindingIsDurableAndRejectsConflictingWorker(t *testing.T) {
 	}
 }
 
+func TestMigrationRepairsSubmitCursorStoredWithoutRegisteredEvents(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cursor-repair.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	route := testRoute()
+	registry := NewRegistry()
+	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: route.ExecutorID, Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := store.Admit(ctx, snapshot.ID, testEvent("cursor-repair", 1, "revision"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.BindSession(ctx, admission.WorkItem.ID, "session:"+admission.WorkItem.ID, "general-writer-v1", "worker-1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=1 WHERE work_item_id=?`, admission.WorkItem.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repaired, err := store.SessionBinding(ctx, admission.WorkItem.ID)
+	if err != nil || repaired.BindingKey != binding.BindingKey || repaired.EventCursor != 0 {
+		t.Fatalf("repaired binding=%+v err=%v", repaired, err)
+	}
+}
+
 func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "migration.db")

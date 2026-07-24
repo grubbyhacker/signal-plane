@@ -59,7 +59,7 @@ func TestRegisteredTurnGoldenContractIsStrict(t *testing.T) {
 	_ = json.Unmarshal(fixture.Request, &request)
 	broker, _ := NewHTTPBroker(server.URL, "token", server.Client())
 	turn, err := broker.SubmitTurn(t.Context(), SubmitTurnRequest{BindingKey: "session:work-42", Version: request.Version, IdempotencyKey: request.IdempotencyKey, TaskKind: request.TaskKind, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.TaskEvidenceDigest, Parameters: request.Parameters})
-	if err != nil || turn.SessionID != "session-42" || turn.TurnID != "turn:turn-42" || turn.ModelEffectID != "model:turn-42" || turn.Cursor != 1 {
+	if err != nil || turn.SessionID != "session-42" || turn.TurnID != "turn:turn-42" || turn.ModelEffectID != "model:turn-42" || turn.SubmitCursor != 1 {
 		t.Fatalf("turn=%+v err=%v", turn, err)
 	}
 }

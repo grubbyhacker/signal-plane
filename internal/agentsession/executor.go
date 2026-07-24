@@ -61,8 +61,10 @@ type StreamEventsRequest struct {
 }
 type BrokerTurn struct {
 	SessionID, TurnID, ModelEffectID string
-	Cursor                           int64
-	Lease                            workledger.SessionLease
+	// SubmitCursor acknowledges registered-turn submission. It is distinct from
+	// the registered-events cursor, which starts at the durable origin (zero).
+	SubmitCursor int64
+	Lease        workledger.SessionLease
 }
 type BrokerEvents struct {
 	Lease  workledger.SessionLease
@@ -148,14 +150,17 @@ func (e *Executor) Execute(ctx context.Context, request workledger.ExecutorReque
 			return retry("agentd_submit", "registered task is unavailable"), nil
 		}
 		turn, err := e.Broker.SubmitTurn(ctx, SubmitTurnRequest{BindingKey: binding.BindingKey, Version: "agentd/registered-lifecycle/v1", IdempotencyKey: binding.RegisteredSubmitKey, TaskKind: task.Snapshot.TaskKind, AdmissionTaskDigest: task.Digest, TaskEvidenceDigest: task.Snapshot.TaskEvidenceDigest, Parameters: task.Snapshot.Parameters})
-		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+binding.RegisteredSubmitKey || turn.Cursor <= 0 || !sameLease(binding, turn.Lease) {
+		if err != nil || turn.SessionID == "" || turn.TurnID == "" || turn.ModelEffectID != "model:"+binding.RegisteredSubmitKey || turn.SubmitCursor <= 0 || !sameLease(binding, turn.Lease) {
 			return retry("agentd_submit", "broker turn submit unavailable"), nil
 		}
-		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, binding.RegisteredSubmitKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.Cursor, e.now()); err != nil {
+		if err := e.Store.RecordRegisteredTurn(ctx, request.WorkItem.ID, turn.Lease, binding.RegisteredSubmitKey, turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.SubmitCursor, e.now()); err != nil {
 			return retry("coordinator_fence", "submitted turn conflicts"), nil
 		}
 		turnID = turn.TurnID
-		binding.AgentdSessionID, binding.SubmittedTurnID, binding.ModelEffectID, binding.ActiveModelEffectID, binding.EventCursor = turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.ModelEffectID, turn.Cursor
+		binding.AgentdSessionID, binding.SubmittedTurnID, binding.ModelEffectID, binding.ActiveModelEffectID = turn.SessionID, turn.TurnID, turn.ModelEffectID, turn.ModelEffectID
+		// The submit acknowledgement does not advance registered-events. The
+		// broker's durable event cursor begins at zero for a new binding.
+		binding.EventCursor = 0
 	}
 	task, err := e.registeredTask(ctx, request)
 	if err != nil {

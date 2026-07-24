@@ -35,7 +35,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS coordinator_reassignments (work_item_id TEXT NOT NULL REFERENCES work_items(id), predecessor_fence_epoch INTEGER NOT NULL CHECK(predecessor_fence_epoch>0), idempotency_key TEXT NOT NULL, rebind_idempotency_key TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL CHECK(phase IN ('requested','broker_committed','agentd_adopted','coordinator_committed','escalated')), session_lineage_id TEXT NOT NULL, authority_profile TEXT NOT NULL, profile_version TEXT NOT NULL, policy_digest TEXT NOT NULL, storage_lineage_id TEXT NOT NULL, predecessor_worker_id TEXT NOT NULL, successor_worker_id TEXT NOT NULL DEFAULT '', successor_fence_epoch INTEGER NOT NULL DEFAULT 0, broker_state TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,predecessor_fence_epoch), UNIQUE(idempotency_key))`,
 		`CREATE TABLE IF NOT EXISTS verifier_results (work_item_id TEXT PRIMARY KEY REFERENCES work_items(id), attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, evaluation_revision TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL CHECK(outcome IN ('waiting','continuation_required','satisfied','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS verifier_result_receipts (work_item_id TEXT NOT NULL REFERENCES work_items(id), attempt_id TEXT NOT NULL REFERENCES executor_attempts(id), result_digest TEXT NOT NULL, recorded_at INTEGER NOT NULL, PRIMARY KEY(work_item_id,attempt_id))`,
-		`PRAGMA user_version=15`,
+		`PRAGMA user_version=16`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -111,6 +111,12 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	// legacy sentinel before the int64 cursor reader takes over.
 	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=0 WHERE CAST(event_cursor AS TEXT)=''`); err != nil {
 		return err
+	}
+	// Registered-turn acknowledgements used to be stored as event cursors. A
+	// nonzero cursor without any recorded event cannot be a valid event-stream
+	// position, so reset only those stranded bindings to the durable origin.
+	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=0 WHERE event_cursor<>0 AND NOT EXISTS (SELECT 1 FROM coordinator_events WHERE coordinator_events.binding_key=session_bindings.binding_key)`); err != nil {
+		return fmt.Errorf("repair registered event cursors: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE session_bindings SET registered_submit_key=submitted_idempotency_key WHERE registered_submit_key='' AND submitted_idempotency_key<>''`); err != nil {
 		return fmt.Errorf("backfill registered submit keys: %w", err)
