@@ -13,7 +13,11 @@ def main() -> int:
     publish = PUBLISH.read_text(encoding="utf-8")
     deploy = DEPLOY.read_text(encoding="utf-8")
 
-    required_publish = "type=sha,prefix=sha-,format=long"
+    required_publish_fragments = (
+        "type=sha,prefix=sha-,format=long",
+        "org.opencontainers.image.source=https://github.com/${{ github.repository }}",
+        "io.vps-ops.green-pr.target=default",
+    )
     required_deploy_fragments = (
         "ghcr.io/grubbyhacker/signal-plane:sha-"
         "${{ steps.deploy_inputs.outputs.deploy_sha }}",
@@ -29,11 +33,12 @@ def main() -> int:
     )
 
     errors: list[str] = []
-    if required_publish not in publish:
-        errors.append(
-            "publish-image.yml must publish sha-<full 40-character commit> "
-            "with docker metadata format=long"
-        )
+    for fragment in required_publish_fragments:
+        if fragment not in publish:
+            errors.append(
+                "publish-image.yml must publish main and full-SHA images with required OCI labels: "
+                f"missing {fragment!r}"
+            )
     for fragment in required_deploy_fragments:
         if fragment not in deploy:
             errors.append(
