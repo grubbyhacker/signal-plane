@@ -26,18 +26,7 @@ type Config struct {
 	Dispatcher  DispatcherConfig  `yaml:"dispatcher"`
 	WorkRouter  WorkRouterConfig  `yaml:"work_router"`
 	PushScanner PushScannerConfig `yaml:"push_scanner"`
-	Coordinator CoordinatorConfig `yaml:"coordinator"`
 	Routes      []Route           `yaml:"routes"`
-}
-
-// CoordinatorConfig is deliberately separate from the production dispatcher.
-// vps-ops may enable it only in the fixture topology.
-type CoordinatorConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	DatabasePath   string `yaml:"database_path"`
-	BrokerURL      string `yaml:"broker_url"`
-	BrokerTokenEnv string `yaml:"broker_token_env"`
-	PollInterval   string `yaml:"poll_interval"`
 }
 
 type PushScannerConfig struct {
@@ -202,12 +191,6 @@ func applyEnv(cfg *Config) {
 	if cfg.Dispatcher.Workers == 0 {
 		cfg.Dispatcher.Workers = 1
 	}
-	if cfg.Coordinator.DatabasePath == "" {
-		cfg.Coordinator.DatabasePath = "github-green-pr-coordinator.db"
-	}
-	if cfg.Coordinator.PollInterval == "" {
-		cfg.Coordinator.PollInterval = "1s"
-	}
 	if cfg.WorkRouter.Addr == "" {
 		cfg.WorkRouter.Addr = ":8083"
 	}
@@ -354,20 +337,6 @@ func (cfg Config) Validate() error {
 			return errors.New("push_scanner bounds exceed the reviewed broker and scanner limits")
 		}
 	}
-	if cfg.Coordinator.Enabled {
-		c := cfg.Coordinator
-		if c.DatabasePath == "" || c.BrokerURL == "" || c.BrokerTokenEnv == "" {
-			return errors.New("enabled coordinator requires database_path, broker_url, and broker_token_env")
-		}
-		if interval, err := time.ParseDuration(c.PollInterval); err != nil || interval <= 0 || interval > time.Minute {
-			return errors.New("coordinator poll_interval must be positive and at most one minute")
-		}
-		parsed, err := url.Parse(c.BrokerURL)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return errors.New("coordinator broker_url must be a private HTTP(S) base URL")
-		}
-	}
-
 	seen := map[string]string{}
 	for _, route := range cfg.Routes {
 		if err := route.Validate(); err != nil {
