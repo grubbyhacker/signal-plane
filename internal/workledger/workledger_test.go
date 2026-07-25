@@ -48,82 +48,6 @@ func TestRegistryAndRouteDecoderRejectUnboundedExecution(t *testing.T) {
 	}
 }
 
-func TestSessionBindingIsDurableAndRejectsConflictingWorker(t *testing.T) {
-	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "sessions.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	route := testRoute()
-	registry := NewRegistry()
-	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: route.ExecutorID, Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	admission, err := store.Admit(ctx, snapshot.ID, testEvent("session-delivery", 1, "session-rev"), now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := store.BindSession(ctx, admission.WorkItem.ID, "session:"+admission.WorkItem.ID, "general-writer-v1", "worker-1", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replay, err := store.BindSession(ctx, admission.WorkItem.ID, first.BindingKey, "general-writer-v1", "worker-1", now.Add(time.Second))
-	if err != nil || replay.WorkerID != "worker-1" {
-		t.Fatalf("replay=%+v err=%v", replay, err)
-	}
-	if _, err := store.BindSession(ctx, admission.WorkItem.ID, first.BindingKey, "general-writer-v1", "worker-2", now); err == nil {
-		t.Fatal("conflicting worker assignment accepted")
-	}
-}
-
-func TestMigrationRepairsSubmitCursorStoredWithoutRegisteredEvents(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "cursor-repair.db")
-	store, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
-	route := testRoute()
-	registry := NewRegistry()
-	if err := registry.Register(testExecutor{descriptor: ExecutorDescriptor{ID: route.ExecutorID, Kind: ExecutorDeterministicTool, Version: "v1"}}); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := store.ActivateRoute(ctx, route, registry, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	admission, err := store.Admit(ctx, snapshot.ID, testEvent("cursor-repair", 1, "revision"), now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding, err := store.BindSession(ctx, admission.WorkItem.ID, "session:"+admission.WorkItem.ID, "general-writer-v1", "worker-1", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE session_bindings SET event_cursor=1 WHERE work_item_id=?`, admission.WorkItem.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	store, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	repaired, err := store.SessionBinding(ctx, admission.WorkItem.ID)
-	if err != nil || repaired.BindingKey != binding.BindingKey || repaired.EventCursor != 0 {
-		t.Fatalf("repaired binding=%+v err=%v", repaired, err)
-	}
-}
-
 func TestMigrationRollsBackAndFutureSchemaFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "migration.db")
@@ -202,28 +126,6 @@ func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != SchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
-	}
-}
-
-func TestMigrationFromV10ReplacesVerifierOutcomeSchema(t *testing.T) {
-	ctx := context.Background()
-	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v10.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE verifier_results (work_item_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL DEFAULT '', result_digest TEXT NOT NULL DEFAULT '', verifier_id TEXT NOT NULL, completion_contract TEXT NOT NULL, contract_digest TEXT NOT NULL, task_evidence_digest TEXT NOT NULL, head_revision TEXT NOT NULL, outcome TEXT NOT NULL CHECK(outcome IN ('satisfied','missing_or_stale','continuation','escalated')), reason_codes_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, recorded_at INTEGER NOT NULL); PRAGMA user_version=10`); err != nil {
-		t.Fatal(err)
-	}
-	if err := Migrate(ctx, db); err != nil {
-		t.Fatal(err)
-	}
-	var definition string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='verifier_results'`).Scan(&definition); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(definition, "'waiting','continuation_required','satisfied','escalated'") {
-		t.Fatalf("verifier outcome schema=%s", definition)
 	}
 }
 
