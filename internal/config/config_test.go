@@ -44,13 +44,17 @@ routes:
 	}
 }
 
-func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
+func TestValidateDispatcherRequiresFixedBrokerOriginAndReviewedRoutes(t *testing.T) {
 	base := Config{
 		Gateway: GatewayConfig{Addr: ":8080"},
 		NATS:    NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}},
 		Dispatcher: DispatcherConfig{
 			Enabled: true, Subject: "signals.github.>", Durable: "dispatcher", DatabasePath: "jobs.db",
-			BrokerURL: "https://broker.internal" + BrokerProfilePath, BrokerTokenEnv: "BROKER_TOKEN", Workers: 1,
+			BrokerURL: "https://broker.internal", BrokerTokenEnv: "BROKER_TOKEN", Workers: 1,
+			RepositoryTaskRoutes: []RepositoryTaskRoute{{
+				ID: "thoughts-optimize-images", Repository: "grubbyhacker/thoughts",
+				Event: "issues", Action: "labeled", Label: "automation:requested", Profile: "thoughts-optimize-images",
+			}},
 		},
 		Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}},
 	}
@@ -64,14 +68,19 @@ func TestValidateDispatcherRequiresFixedProfileEndpoint(t *testing.T) {
 	}
 	for _, invalid := range []string{
 		"https://broker.internal/v1/jobs",
-		"https://broker.internal" + BrokerProfilePath + "/",
-		"https://broker.internal" + BrokerProfilePath + "?profile=other",
+		"https://broker.internal/v1/launch-profiles/thoughts-optimize-images/launch",
+		"https://broker.internal?profile=other",
 	} {
 		cfg := base
 		cfg.Dispatcher.BrokerURL = invalid
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), BrokerProfilePath) {
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "broker origin") {
 			t.Fatalf("broker_url %q error=%v", invalid, err)
 		}
+	}
+	noRoutes := base
+	noRoutes.Dispatcher.RepositoryTaskRoutes = nil
+	if err := noRoutes.Validate(); err == nil || !strings.Contains(err.Error(), "repository_task_route") {
+		t.Fatalf("missing route error=%v", err)
 	}
 }
 

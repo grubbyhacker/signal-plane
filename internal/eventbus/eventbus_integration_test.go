@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/nats-io/nats-server/v2/server"
@@ -46,7 +47,11 @@ func TestGitHubDispatcherFileJetStreamEndToEndAndPublishDedupe(t *testing.T) {
 	}
 	defer store.Close()
 	metrics := dispatcher.NewMetrics()
-	if !dispatcher.Process(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Unix(1, 0)) {
+	routes := []config.RepositoryTaskRoute{{
+		ID: "fixture", Repository: "example/automation-target", Event: "issues",
+		Action: "labeled", Label: "automation:requested", Profile: "repository-task",
+	}}
+	if !dispatcher.Process(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics, store, routes, dispatcher.NATSDelivery{Message: msg}, time.Unix(1, 0)) {
 		t.Fatal("delivery not processed")
 	}
 	deliveries, jobs, err := store.Counts(context.Background())

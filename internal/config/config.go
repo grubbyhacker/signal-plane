@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,7 +18,6 @@ const (
 	DefaultStreamName  = "SIGNALS"
 	DefaultSubject     = "signals.>"
 	DefaultMaxBody     = int64(1 << 20)
-	BrokerProfilePath  = "/v1/launch-profiles/codex-issue-implement/launch"
 )
 
 type Config struct {
@@ -83,15 +83,25 @@ type WorkRouterConfig struct {
 }
 
 type DispatcherConfig struct {
-	Enabled               bool   `yaml:"enabled"`
-	Addr                  string `yaml:"addr"`
-	Subject               string `yaml:"subject"`
-	Durable               string `yaml:"durable"`
-	DatabasePath          string `yaml:"database_path"`
-	BrokerURL             string `yaml:"broker_url"`
-	BrokerTokenEnv        string `yaml:"broker_token_env"`
-	Workers               int    `yaml:"workers"`
-	RecoveryStartSequence uint64 `yaml:"recovery_start_sequence"`
+	Enabled               bool                  `yaml:"enabled"`
+	Addr                  string                `yaml:"addr"`
+	Subject               string                `yaml:"subject"`
+	Durable               string                `yaml:"durable"`
+	DatabasePath          string                `yaml:"database_path"`
+	BrokerURL             string                `yaml:"broker_url"`
+	BrokerTokenEnv        string                `yaml:"broker_token_env"`
+	Workers               int                   `yaml:"workers"`
+	RecoveryStartSequence uint64                `yaml:"recovery_start_sequence"`
+	RepositoryTaskRoutes  []RepositoryTaskRoute `yaml:"repository_task_routes"`
+}
+
+type RepositoryTaskRoute struct {
+	ID         string `yaml:"id"`
+	Repository string `yaml:"repository"`
+	Event      string `yaml:"event"`
+	Action     string `yaml:"action"`
+	Label      string `yaml:"label"`
+	Profile    string `yaml:"profile"`
 }
 
 type GatewayConfig struct {
@@ -277,8 +287,11 @@ func (cfg Config) Validate() error {
 			return errors.New("enabled dispatcher requires exactly one worker")
 		}
 		brokerURL, err := url.Parse(cfg.Dispatcher.BrokerURL)
-		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || brokerURL.EscapedPath() != BrokerProfilePath || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
-			return fmt.Errorf("enabled dispatcher broker_url must be the exact codex issue profile endpoint ending in %s", BrokerProfilePath)
+		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || (brokerURL.EscapedPath() != "" && brokerURL.EscapedPath() != "/") || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
+			return errors.New("enabled dispatcher broker_url must be a fixed broker origin without path, query, credentials, or fragment")
+		}
+		if err := validateRepositoryTaskRoutes(cfg.Dispatcher.RepositoryTaskRoutes); err != nil {
+			return err
 		}
 	}
 	if cfg.WorkRouter.Enabled {
@@ -346,6 +359,32 @@ func (cfg Config) Validate() error {
 			return fmt.Errorf("route path %q is used by both %q and %q", route.Path, previous, route.ID)
 		}
 		seen[route.Path] = route.ID
+	}
+	return nil
+}
+
+func validateRepositoryTaskRoutes(routes []RepositoryTaskRoute) error {
+	if len(routes) == 0 {
+		return errors.New("enabled dispatcher requires at least one repository_task_route")
+	}
+	ids := map[string]bool{}
+	admissions := map[string]bool{}
+	validName := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$`)
+	for _, route := range routes {
+		if !validName.MatchString(route.ID) || !validName.MatchString(route.Profile) {
+			return errors.New("dispatcher repository task route id and profile must be bounded names")
+		}
+		if strings.TrimSpace(route.Repository) != route.Repository || strings.Count(route.Repository, "/") != 1 {
+			return errors.New("dispatcher repository task route repository must be an exact owner/repository")
+		}
+		if route.Event != "issues" || route.Action != "labeled" || route.Label == "" {
+			return errors.New("dispatcher repository task routes must select an issues/labeled event and a nonempty label")
+		}
+		admission := strings.Join([]string{route.Repository, route.Event, route.Action, route.Label}, "\x00")
+		if ids[route.ID] || admissions[admission] {
+			return errors.New("dispatcher repository task routes must have unique ids and non-overlapping admission")
+		}
+		ids[route.ID], admissions[admission] = true, true
 	}
 	return nil
 }

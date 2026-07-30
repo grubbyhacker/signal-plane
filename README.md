@@ -41,13 +41,12 @@ isolated in `github-task-dispatcher`.
 - `signal-observer`: NATS consumer used to watch accepted events flow through
   the stream. It retains a durable pull consumer and acknowledges only after
   successful decode and observer logging.
-- `github-task-dispatcher`: disabled by default and retained to preserve the
-  proven persistence, idempotency, serialization, status, and recovery
-  mechanics while the generalized router is built. Its predicate matches only
-  the synthetic `example/automation-target` fixture; no production admission,
-  webhook, or broker authorization exists for that repository. It stores only
-  delivery/job control data in SQLite WAL and calls the private broker's
-  `codex-issue-implement` profile when exercised by tests.
+- `github-task-dispatcher`: disabled by default until deployment supplies a
+  reviewed repository-task route. Each route binds an exact repository,
+  `issues/labeled` event, label, and broker launch profile. Provider payloads
+  can select only one of those routes; they cannot select images, commands,
+  credentials, tasks, models, or launch arguments. The dispatcher stores only
+  delivery/job control data in SQLite WAL.
 - `internal/workledger`: source-neutral admission, deduplication,
   serialization, supersession, retry, and interrupted-attempt recovery behind
   a SQLite store. GitHub is the first authenticated ingress adapter. The core
@@ -94,7 +93,7 @@ is `POST dispatcher.broker_url` with this fixed shape:
 
 It requires `broker_token_env` and uses `Authorization: Bearer ...`; it
 sets the semantic `Idempotency-Key`
-`github-task-dispatcher:v2:<repo>:issue:<issue-number>:codex-issue-implement`;
+`repository-task-dispatcher:v1:<route>:<repo>:issue:<issue-number>:<profile>`;
 the broker's required `source_delivery_id` parameter is a stable semantic hash
 of repository, issue, and profile. The real GitHub delivery ID remains only in
 SQLite for audit correlation. Transport
@@ -102,9 +101,9 @@ failures, HTTP 429/5xx, and structured `profile_busy` responses use a durable,
 deterministic 2s/4s/8s/16s/20s launch retry schedule for at most ten minutes.
 Other errors, including `idempotency_conflict` and malformed success responses,
 fail immediately. The semantic job key is
-`github-issue-implement:v1:<repo>:<issue-number>`. `broker_url` must be the
-exact private endpoint
-`/v1/launch-profiles/codex-issue-implement/launch`. A 2xx response counts as
+`repository-task:v1:<route>:<repo>:issue:<issue-number>`. `broker_url` must be
+the fixed private broker origin; the dispatcher appends the exact reviewed
+`/v1/launch-profiles/<profile>/launch` path. A 2xx response counts as
 successful only when it contains a nonempty JSON `run_id`; fresh and
 idempotently replayed responses are validated the same way, and that run ID is
 stored immediately. The single worker then polls only scoped

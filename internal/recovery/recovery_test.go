@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/grubbyhacker/signal-plane/internal/eventbus"
@@ -19,7 +20,15 @@ import (
 const (
 	recoveryStream  = "RECOVERY_PROOF"
 	recoverySubject = "signals.github.recovery"
+	recoveryRepo    = "example/automation-target"
 )
+
+func recoveryRoutes() []config.RepositoryTaskRoute {
+	return []config.RepositoryTaskRoute{{
+		ID: "fixture", Repository: recoveryRepo, Event: "issues",
+		Action: "labeled", Label: "automation:requested", Profile: "repository-task",
+	}}
+}
 
 func TestDispatcherRecoveryProof(t *testing.T) {
 	t.Run("reset replay reconcile evidence and startup gate", proveRecovery)
@@ -45,7 +54,7 @@ func proveRecovery(t *testing.T) {
 	}
 	store := recoveryStoreWithLaunchedJob(t, now)
 	broker := &statusSequence{statuses: map[string]dispatcher.RunStatus{"restored-run": {RunID: "restored-run", Status: "completed"}}}
-	runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
+	runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Routes: recoveryRoutes(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
 	report, err := runner.Run(ctx, Options{RecoveryID: "restore-20260713", Durable: "recovery-proof", Subject: recoverySubject, ManifestSequence: 2, Execute: true})
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +94,7 @@ func proveRecoveryFailure(t *testing.T) {
 			store := recoveryStoreWithLaunchedJob(t, now)
 			bus := recoveryBus(t)
 			broker := &statusSequence{statuses: map[string]dispatcher.RunStatus{"restored-run": test.result}, err: test.err}
-			runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
+			runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Routes: recoveryRoutes(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
 			_, err := runner.Run(context.Background(), Options{RecoveryID: "failed-restore", Durable: "failed-recovery", Subject: recoverySubject, ManifestSequence: 2, Execute: true})
 			if err == nil {
 				t.Fatal("recovery unexpectedly succeeded")
@@ -126,7 +135,7 @@ func recoveryStoreWithLaunchedJob(t *testing.T, now time.Time) *dispatcher.Store
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	candidate := dispatcher.Candidate{Repository: dispatcher.Repository, IssueNumber: 42, DeliveryID: "restored-delivery"}
+	candidate := dispatcher.Candidate{Repository: recoveryRepo, IssueNumber: 42, DeliveryID: "restored-delivery", RouteID: "fixture", Profile: "repository-task"}
 	if err := store.Record(context.Background(), candidate.DeliveryID, "accepted", 2, &candidate, now); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +151,7 @@ func recoveryStoreWithLaunchedJob(t *testing.T, now time.Time) *dispatcher.Store
 
 func recoverySignal(delivery string, issue int64) envelope.Signal {
 	payload, _ := json.Marshal(map[string]any{
-		"action": "labeled", "repository": map[string]any{"full_name": dispatcher.Repository},
+		"action": "labeled", "repository": map[string]any{"full_name": recoveryRepo},
 		"issue": map[string]any{"number": issue, "state": "open"},
 		"label": map[string]any{"name": "automation:requested"}, "sender": map[string]any{"login": "proof"},
 	})

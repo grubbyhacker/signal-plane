@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/grubbyhacker/signal-plane/internal/buildinfo"
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus"
@@ -122,21 +123,21 @@ func (m *Metrics) Handler() http.Handler {
 	return mux
 }
 
-func Process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, delivery Delivery, now time.Time) bool {
-	err := process(ctx, logger, metrics, store, delivery, now, "", true)
+func Process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, routes []config.RepositoryTaskRoute, delivery Delivery, now time.Time) bool {
+	err := process(ctx, logger, metrics, store, routes, delivery, now, "", true)
 	return err == nil
 }
 
 // ProcessRecovery fails closed without terminating malformed stream data. Its
 // replay evidence is committed atomically with the normal dispatcher state.
-func ProcessRecovery(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, recoveryID string, delivery Delivery, now time.Time) error {
+func ProcessRecovery(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, routes []config.RepositoryTaskRoute, recoveryID string, delivery Delivery, now time.Time) error {
 	if recoveryID == "" {
 		return errors.New("recovery id is required")
 	}
-	return process(ctx, logger, metrics, store, delivery, now, recoveryID, false)
+	return process(ctx, logger, metrics, store, routes, delivery, now, recoveryID, false)
 }
 
-func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, delivery Delivery, now time.Time, recoveryID string, terminateMalformed bool) error {
+func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, routes []config.RepositoryTaskRoute, delivery Delivery, now time.Time, recoveryID string, terminateMalformed bool) error {
 	streamSequence, err := delivery.StreamSequence()
 	if err != nil || streamSequence == 0 {
 		metrics.deliveries.WithLabelValues("metadata_failed").Inc()
@@ -155,7 +156,7 @@ func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *
 		}
 		return fmt.Errorf("decode replayed signal: %w", err)
 	}
-	candidate, outcome := Select(signal)
+	candidate, outcome := Select(signal, routes)
 	var selected *Candidate
 	if outcome == "accepted" {
 		selected = &candidate

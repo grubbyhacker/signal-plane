@@ -18,9 +18,16 @@ dispatcher:
   # startup rejects it until `recover --execute` records matching evidence.
   # recovery_start_sequence: 1
   database_path: github-task-dispatcher.db
-  broker_url: http://127.0.0.1:8091/v1/launch-profiles/codex-issue-implement/launch
+  broker_url: http://127.0.0.1:8091
   broker_token_env: GITHUB_TASK_DISPATCHER_BROKER_TOKEN
   workers: 1
+  repository_task_routes:
+    - id: automation-target
+      repository: example/automation-target
+      event: issues
+      action: labeled
+      label: automation:requested
+      profile: repository-task
 
 # Compiled deterministic Resume Builder release route. It remains inert until
 # deployment-owned configuration and secrets explicitly enable it.

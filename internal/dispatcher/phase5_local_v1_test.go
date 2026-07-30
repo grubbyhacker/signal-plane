@@ -96,7 +96,7 @@ func phase5V1EndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fetch admitted message %d: %v", i+1, err)
 		}
-		if !Process(ctx, logger, metrics, store, NATSDelivery{Message: message}, started.Add(time.Duration(i)*time.Millisecond)) {
+		if !Process(ctx, logger, metrics, store, testRepositoryTaskRoutes(), NATSDelivery{Message: message}, started.Add(time.Duration(i)*time.Millisecond)) {
 			t.Fatalf("process admitted message %d", i+1)
 		}
 	}
@@ -107,15 +107,15 @@ func phase5V1EndToEnd(t *testing.T) {
 	}
 	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-original", "accepted")
 	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-relabel", "accepted")
-	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-wrong-label", "label_filtered")
-	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-missing-label", "label_filtered")
+	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-wrong-label", "route_filtered")
+	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-missing-label", "route_filtered")
 	var firstDelivery string
 	if err := store.db.QueryRow(`SELECT source_delivery_id FROM jobs WHERE issue_number=42`).Scan(&firstDelivery); err != nil || firstDelivery != "phase5-v1-original" {
 		t.Fatalf("semantic job audit delivery=%q err=%v", firstDelivery, err)
 	}
 
 	fakeBroker := newPhase5V1HTTPBroker(t, map[string][]string{"run-phase5-v1": {"running", "completed"}})
-	broker := &Broker{URL: fakeBroker.URL() + config.BrokerProfilePath, Token: "phase5-v1-token", Client: fakeBroker.Client()}
+	broker := &Broker{URL: fakeBroker.URL(), Token: "phase5-v1-token", Client: fakeBroker.Client()}
 	launchAt := started.Add(time.Minute)
 	worked, err := RunOne(ctx, logger, metrics, store, broker, launchAt)
 	if err != nil || !worked {
@@ -125,10 +125,10 @@ func phase5V1EndToEnd(t *testing.T) {
 	if len(launches) != 1 || len(statuses) != 0 {
 		t.Fatalf("broker calls after launch: launches=%d statuses=%v", len(launches), statuses)
 	}
-	wantKey := "github-task-dispatcher:v2:" + Repository + ":issue:42:" + Profile
-	wantFingerprint := brokerSourceID(Job{Repository: Repository, IssueNumber: 42, DeliveryID: "any-delivery"})
-	if wantFingerprint != brokerSourceID(Job{Repository: Repository, IssueNumber: 42, DeliveryID: "phase5-v1-original"}) ||
-		wantFingerprint != brokerSourceID(Job{Repository: Repository, IssueNumber: 42, DeliveryID: "phase5-v1-relabel"}) {
+	wantKey := "repository-task-dispatcher:v1:automation-target:" + Repository + ":issue:42:" + Profile
+	wantFingerprint := brokerSourceID(Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 42, DeliveryID: "any-delivery"})
+	if wantFingerprint != brokerSourceID(Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 42, DeliveryID: "phase5-v1-original"}) ||
+		wantFingerprint != brokerSourceID(Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 42, DeliveryID: "phase5-v1-relabel"}) {
 		t.Fatal("broker fingerprint changed across duplicate delivery or relabel")
 	}
 	if launches[0].idempotencyKey != wantKey || launches[0].issueNumber != 42 || launches[0].sourceDeliveryID != wantFingerprint {
@@ -220,7 +220,7 @@ func phase5V1RetryPolicy(t *testing.T) {
 			if server != nil {
 				baseURL = server.URL
 			}
-			broker := &Broker{URL: baseURL + config.BrokerProfilePath, Client: client}
+			broker := &Broker{URL: baseURL, Client: client}
 			if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now); err != nil || !worked {
 				t.Fatalf("first retryable attempt worked=%v err=%v", worked, err)
 			}
@@ -257,7 +257,7 @@ func phase5V1RetryPolicy(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			store := phase5V1StoreWithJobs(t, now, 61)
-			broker := &Broker{URL: server.URL + config.BrokerProfilePath, Client: server.Client()}
+			broker := &Broker{URL: server.URL, Client: server.Client()}
 			if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now); err != nil || !worked {
 				t.Fatalf("permanent attempt worked=%v err=%v", worked, err)
 			}
@@ -323,7 +323,7 @@ func (fake *phase5V1HTTPBroker) serveHTTP(w http.ResponseWriter, r *http.Request
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method == http.MethodPost && r.URL.Path == config.BrokerProfilePath {
+	if r.Method == http.MethodPost && r.URL.Path == ("/v1/launch-profiles/"+Profile+"/launch") {
 		var request struct {
 			Parameters struct {
 				IssueNumber      int64  `json:"issue_number"`
@@ -465,7 +465,10 @@ func phase5V1StoreWithJobs(t *testing.T, now time.Time, issues ...int64) *Store 
 	t.Cleanup(func() { _ = store.Close() })
 	for index, issue := range issues {
 		delivery := "phase5-v1-policy-" + strconv.FormatInt(issue, 10)
-		candidate := Candidate{Repository: Repository, IssueNumber: issue, DeliveryID: delivery}
+		candidate := Candidate{
+			Repository: Repository, IssueNumber: issue, DeliveryID: delivery,
+			RouteID: "automation-target", Profile: Profile,
+		}
 		if err := store.Record(context.Background(), delivery, "accepted", uint64(index+1), &candidate, now.Add(time.Duration(index)*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}

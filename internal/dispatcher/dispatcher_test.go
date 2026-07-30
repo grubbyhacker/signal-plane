@@ -54,12 +54,15 @@ func TestSelectPredicate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := validSignal("d", 7)
 			tt.mutate(&s)
-			c, outcome := Select(s)
+			c, outcome := Select(s, testRepositoryTaskRoutes())
 			if (outcome == "accepted") != tt.accepted {
 				t.Fatalf("outcome=%s", outcome)
 			}
-			if tt.accepted && c.SemanticKey() != "github-issue-implement:v1:example/automation-target:7" {
+			if tt.accepted && c.SemanticKey() != "repository-task:v1:automation-target:example/automation-target:issue:7" {
 				t.Fatal(c.SemanticKey())
+			}
+			if tt.accepted && (c.RouteID != "automation-target" || c.Profile != "repository-task") {
+				t.Fatalf("trusted route was not resolved: %+v", c)
 			}
 		})
 	}
@@ -73,8 +76,8 @@ func TestStoreDeliveryAndSemanticDedupeAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, _ := Select(validSignal("delivery-1", 42))
-	b, _ := Select(validSignal("delivery-2", 42))
+	a, _ := Select(validSignal("delivery-1", 42), testRepositoryTaskRoutes())
+	b, _ := Select(validSignal("delivery-2", 42), testRepositoryTaskRoutes())
 	if err := s.Record(ctx, a.DeliveryID, "accepted", 10, &a, now); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +102,8 @@ func TestStoreDeliveryAndSemanticDedupeAndRestart(t *testing.T) {
 		t.Fatalf("restart counts=%d,%d err=%v", deliveries, jobs, err)
 	}
 	work, ok, err := s.ClaimDue(ctx, now)
-	if err != nil || !ok || work.Job.DeliveryID != "delivery-1" {
+	if err != nil || !ok || work.Job.DeliveryID != "delivery-1" ||
+		work.Job.RouteID != "automation-target" || work.Job.Profile != "repository-task" {
 		t.Fatalf("work=%+v ok=%v err=%v", work, ok, err)
 	}
 	sequence, err := s.RecoverySequence(ctx)
@@ -125,8 +129,8 @@ func TestBrokerRequest(t *testing.T) {
 		_, _ = w.Write([]byte(`{"run_id":"run-123","status":"running"}`))
 	}))
 	defer server.Close()
-	b := Broker{URL: server.URL + "/v1/launch-profiles/codex-issue-implement/launch", Token: "token", Client: server.Client()}
-	job := Job{Repository: Repository, IssueNumber: 9, DeliveryID: "abc"}
+	b := Broker{URL: server.URL, Token: "token", Client: server.Client()}
+	job := Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 9, DeliveryID: "abc"}
 	for i, deliveryID := range []string{"first-label-delivery", "later-relabel-delivery"} {
 		job.DeliveryID = deliveryID
 		result, err := b.Launch(context.Background(), job)
@@ -134,10 +138,10 @@ func TestBrokerRequest(t *testing.T) {
 			t.Fatalf("launch %d result=%+v err=%v", i+1, result, err)
 		}
 	}
-	if calls != 2 || path != "/v1/launch-profiles/codex-issue-implement/launch" {
+	if calls != 2 || path != "/v1/launch-profiles/repository-task/launch" {
 		t.Fatalf("calls=%d path=%q", calls, path)
 	}
-	if header != "github-task-dispatcher:v2:example/automation-target:issue:9:codex-issue-implement" || auth != "Bearer token" {
+	if header != "repository-task-dispatcher:v1:automation-target:example/automation-target:issue:9:repository-task" || auth != "Bearer token" {
 		t.Fatalf("headers %q %q", header, auth)
 	}
 	want := map[string]any{"parameters": map[string]any{"issue_number": float64(9), "source_delivery_id": brokerSourceID(job)}}
@@ -153,7 +157,7 @@ func TestBrokerRejectsInvalidSuccessResponses(t *testing.T) {
 				_, _ = w.Write([]byte(body))
 			}))
 			defer server.Close()
-			_, err := (&Broker{URL: server.URL, Client: server.Client()}).Launch(context.Background(), Job{})
+			_, err := (&Broker{URL: server.URL, Client: server.Client()}).Launch(context.Background(), Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 1})
 			if err == nil {
 				t.Fatal("expected invalid response error")
 			}
@@ -191,8 +195,8 @@ func TestLaunchRetryNeverLeapfrogsOldestJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	first, _ := Select(validSignal("first-delivery", 1))
-	second, _ := Select(validSignal("second-delivery", 2))
+	first, _ := Select(validSignal("first-delivery", 1), testRepositoryTaskRoutes())
+	second, _ := Select(validSignal("second-delivery", 2), testRepositoryTaskRoutes())
 	if err := s.Record(ctx, first.DeliveryID, "accepted", 1, &first, started); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +255,7 @@ func TestRecoveryMetadataContractAndReplay(t *testing.T) {
 	if err != nil || schema != SchemaVersion || checkpoint != 0 || start != 1 {
 		t.Fatalf("empty metadata schema=%d checkpoint=%d start=%d err=%v", schema, checkpoint, start, err)
 	}
-	first, _ := Select(validSignal("original-delivery", 19))
+	first, _ := Select(validSignal("original-delivery", 19), testRepositoryTaskRoutes())
 	if err := s.Record(ctx, first.DeliveryID, "accepted", 40, &first, time.Unix(1, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +267,7 @@ func TestRecoveryMetadataContractAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	relabel, _ := Select(validSignal("relabel-after-restore", 19))
+	relabel, _ := Select(validSignal("relabel-after-restore", 19), testRepositoryTaskRoutes())
 	if err := s.Record(ctx, relabel.DeliveryID, "accepted", 44, &relabel, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +279,7 @@ func TestRecoveryMetadataContractAndReplay(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT source_delivery_id FROM jobs`).Scan(&storedDelivery); err != nil || storedDelivery != first.DeliveryID {
 		t.Fatalf("audit delivery=%q err=%v", storedDelivery, err)
 	}
-	if brokerSourceID(Job{Repository: Repository, IssueNumber: 19, DeliveryID: first.DeliveryID}) != brokerSourceID(Job{Repository: Repository, IssueNumber: 19, DeliveryID: relabel.DeliveryID}) {
+	if brokerSourceID(Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 19, DeliveryID: first.DeliveryID}) != brokerSourceID(Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 19, DeliveryID: relabel.DeliveryID}) {
 		t.Fatal("broker fingerprint field changed across restored replay")
 	}
 }
@@ -285,7 +289,7 @@ func TestLifecycleUpdatesRejectUnexpectedState(t *testing.T) {
 	now := time.Unix(30_000, 0)
 	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 	defer s.Close()
-	candidate, _ := Select(validSignal("lifecycle", 3))
+	candidate, _ := Select(validSignal("lifecycle", 3), testRepositoryTaskRoutes())
 	_ = s.Record(ctx, candidate.DeliveryID, "accepted", 1, &candidate, now)
 	work, ok, err := s.ClaimDue(ctx, now)
 	if err != nil || !ok {
@@ -337,7 +341,7 @@ func TestBrokerRetryClassification(t *testing.T) {
 				_, _ = w.Write([]byte(tt.body))
 			}))
 			defer server.Close()
-			_, err := (&Broker{URL: server.URL, Client: server.Client()}).Launch(context.Background(), Job{})
+			_, err := (&Broker{URL: server.URL, Client: server.Client()}).Launch(context.Background(), Job{RouteID: "automation-target", Profile: Profile, Repository: Repository, IssueNumber: 1})
 			if err == nil || IsRetryable(err) != tt.retryable {
 				t.Fatalf("error=%v retryable=%v", err, IsRetryable(err))
 			}
@@ -353,8 +357,8 @@ func TestStatusLifecycleSerializesLaunches(t *testing.T) {
 	now := time.Unix(3000, 0)
 	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 	defer s.Close()
-	first, _ := Select(validSignal("first", 1))
-	second, _ := Select(validSignal("second", 2))
+	first, _ := Select(validSignal("first", 1), testRepositoryTaskRoutes())
+	second, _ := Select(validSignal("second", 2), testRepositoryTaskRoutes())
 	_ = s.Record(ctx, "first", "accepted", 1, &first, now)
 	_ = s.Record(ctx, "second", "accepted", 2, &second, now)
 	broker := &launchSequence{statuses: []RunStatus{{RunID: "run-sequence", Status: "running"}, {RunID: "run-sequence", Status: "completed"}}}
@@ -388,7 +392,7 @@ func TestBrokerTerminalStatusMapping(t *testing.T) {
 			now := time.Unix(3500, 0)
 			s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 			defer s.Close()
-			candidate, _ := Select(validSignal("terminal", 3))
+			candidate, _ := Select(validSignal("terminal", 3), testRepositoryTaskRoutes())
 			_ = s.Record(ctx, "terminal", "accepted", 1, &candidate, now)
 			broker := &launchSequence{statuses: []RunStatus{{RunID: "run-sequence", Status: tt.broker}}}
 			metrics := NewMetrics()
@@ -408,7 +412,7 @@ func TestCrashBeforeLaunchResponseReplaysSameSemanticJob(t *testing.T) {
 	now := time.Unix(4000, 0)
 	path := filepath.Join(t.TempDir(), "db")
 	s, _ := OpenStore(path)
-	candidate, _ := Select(validSignal("audit-delivery", 8))
+	candidate, _ := Select(validSignal("audit-delivery", 8), testRepositoryTaskRoutes())
 	_ = s.Record(ctx, candidate.DeliveryID, "accepted", 7, &candidate, now)
 	if work, ok, err := s.ClaimDue(ctx, now); err != nil || !ok || work.Job.Attempts != 1 {
 		t.Fatalf("claim before crash=%+v ok=%v err=%v", work, ok, err)
@@ -435,7 +439,7 @@ func TestBrokerStatusUsesOnlyScopedRunEndpoint(t *testing.T) {
 		_, _ = w.Write([]byte(`{"run_id":"run/123","status":"running"}`))
 	}))
 	defer server.Close()
-	broker := &Broker{URL: server.URL + "/v1/launch-profiles/codex-issue-implement/launch", Token: "token", Client: server.Client()}
+	broker := &Broker{URL: server.URL, Token: "token", Client: server.Client()}
 	result, err := broker.Status(context.Background(), "run/123")
 	if err != nil || result.Status != "running" {
 		t.Fatalf("result=%+v err=%v", result, err)
@@ -487,7 +491,7 @@ func TestRetriesAndTerminalErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 			defer s.Close()
-			c, _ := Select(validSignal("d", 1))
+			c, _ := Select(validSignal("d", 1), testRepositoryTaskRoutes())
 			_ = s.Record(ctx, "d", "accepted", 1, &c, now)
 			launcher := &launchSequence{errors: []error{tt.launchErr}}
 			worked, err := RunOne(ctx, logger, metrics, s, launcher, now)
@@ -517,7 +521,7 @@ func TestSuccessfulLaunchRecordsBrokerRunID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	c, _ := Select(validSignal("success", 5))
+	c, _ := Select(validSignal("success", 5), testRepositoryTaskRoutes())
 	if err := s.Record(ctx, "success", "accepted", 1, &c, now); err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +543,7 @@ func TestTransientRetriesStopAtDurableWindow(t *testing.T) {
 	now := time.Unix(2000, 0)
 	s, _ := OpenStore(filepath.Join(t.TempDir(), "db"))
 	defer s.Close()
-	c, _ := Select(validSignal("bounded", 2))
+	c, _ := Select(validSignal("bounded", 2), testRepositoryTaskRoutes())
 	_ = s.Record(ctx, "bounded", "accepted", 1, &c, now)
 	launcher := &launchSequence{errors: []error{BrokerError{Transport: true, Message: "one"}}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -580,7 +584,7 @@ func TestIrrelevantValidDeliveryIsMinimallyRecordedAndAcked(t *testing.T) {
 	signal.Meta.SourceAction = "closed"
 	data, _ := json.Marshal(signal)
 	d := &fakeDelivery{data: data, sequence: 1}
-	if !Process(context.Background(), slog.Default(), NewMetrics(), s, d, time.Unix(1, 0)) || !d.acked {
+	if !Process(context.Background(), slog.Default(), NewMetrics(), s, testRepositoryTaskRoutes(), d, time.Unix(1, 0)) || !d.acked {
 		t.Fatal("not acknowledged")
 	}
 	deliveries, jobs, _ := s.Counts(context.Background())

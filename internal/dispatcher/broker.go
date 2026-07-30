@@ -55,13 +55,17 @@ func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 	if err != nil {
 		return LaunchResult{}, permanentMalformed("encode broker launch request", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.URL, bytes.NewReader(body))
+	endpoint, err := b.launchURL(job.Profile)
+	if err != nil {
+		return LaunchResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return LaunchResult{}, permanentMalformed("create broker launch request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// Repository + issue + the fixed profile form the semantic duplicate barrier.
-	req.Header.Set("Idempotency-Key", fmt.Sprintf("github-task-dispatcher:v2:%s:issue:%d:%s", job.Repository, job.IssueNumber, Profile))
+	req.Header.Set("Idempotency-Key", fmt.Sprintf("repository-task-dispatcher:v1:%s:%s:issue:%d:%s", job.RouteID, job.Repository, job.IssueNumber, job.Profile))
 	b.authorize(req)
 	var result LaunchResult
 	if err := b.doJSON(req, &result); err != nil {
@@ -78,8 +82,23 @@ func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 // Every field in the broker's idempotency fingerprint must remain identical
 // for relabels and restored-database replay of the same repository issue.
 func brokerSourceID(job Job) string {
-	stable := fmt.Sprintf("%s\x00%d\x00%s", job.Repository, job.IssueNumber, Profile)
-	return fmt.Sprintf("github-task-dispatcher-v2-%x", sha256.Sum256([]byte(stable)))
+	stable := fmt.Sprintf("%s\x00%s\x00%d\x00%s", job.RouteID, job.Repository, job.IssueNumber, job.Profile)
+	return fmt.Sprintf("repository-task-dispatcher-v1-%x", sha256.Sum256([]byte(stable)))
+}
+
+func (b *Broker) launchURL(profile string) (string, error) {
+	if strings.TrimSpace(profile) == "" {
+		return "", permanentMalformed("launch profile is required", nil)
+	}
+	base, err := url.Parse(b.URL)
+	if err != nil {
+		return "", permanentMalformed("parse broker URL", err)
+	}
+	base.Path = "/v1/launch-profiles/" + profile + "/launch"
+	base.RawPath = "/v1/launch-profiles/" + url.PathEscape(profile) + "/launch"
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base.String(), nil
 }
 
 func (b *Broker) Status(ctx context.Context, runID string) (RunStatus, error) {
