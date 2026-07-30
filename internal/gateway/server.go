@@ -247,8 +247,8 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 	var decoded struct {
 		Action     string `json:"action"`
 		Repository struct {
-			FullName string `json:"full_name"`
-			PushedAt int64  `json:"pushed_at"`
+			FullName string          `json:"full_name"`
+			PushedAt json.RawMessage `json:"pushed_at"`
 		} `json:"repository"`
 		Issue *struct {
 			Number    int64  `json:"number"`
@@ -279,6 +279,7 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_github_payload"}
 	}
+	var pushedAt *time.Time
 	if event == "push" {
 		if !config.ContainsAllowed(route.GitHub.PushRefs, decoded.Ref) {
 			return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "ref_not_allowed"}
@@ -286,10 +287,15 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 		if !validGitHubSHA(decoded.Before) || !validGitHubSHA(decoded.After) || !strings.HasPrefix(decoded.Ref, "refs/heads/") {
 			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_push_identity"}
 		}
+		var err error
+		pushedAt, err = parseGitHubRepositoryPushedAt(decoded.Repository.PushedAt)
+		if err != nil {
+			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_push_identity"}
+		}
 	}
 	if len(route.Admission.Tuples) > 0 {
 		result, err := admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
-		return enrichGitHubAdmission(result, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, decoded.Repository.PushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
+		return enrichGitHubAdmission(result, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
 	}
 	if !config.ContainsAllowed(route.Admission.Repositories, decoded.Repository.FullName) {
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
@@ -309,10 +315,10 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			ignoreReason: "action_filtered",
 		}, nil
 	}
-	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, decoded.Repository.PushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
+	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
 }
 
-func enrichGitHubAdmission(result admissionResult, route config.Route, event, repository, ref, before, after string, pushedAt int64, headCommit *struct {
+func enrichGitHubAdmission(result admissionResult, route config.Route, event, repository, ref, before, after string, pushedAt *time.Time, headCommit *struct {
 	Timestamp string `json:"timestamp"`
 }, issue *struct {
 	Number    int64  `json:"number"`
@@ -335,8 +341,8 @@ func enrichGitHubAdmission(result admissionResult, route config.Route, event, re
 	result.actorClass = strings.ToLower(actorType)
 	if event == "push" {
 		result.sourceRef, result.sourceBefore, result.sourceAfter, result.sourceRevision = ref, before, after, after
-		if pushedAt > 0 {
-			parsed := time.Unix(pushedAt, 0).UTC()
+		if pushedAt != nil {
+			parsed := pushedAt.UTC()
 			result.sourceTimestamp = &parsed
 		}
 		if headCommit != nil && headCommit.Timestamp != "" {
@@ -362,6 +368,34 @@ func enrichGitHubAdmission(result admissionResult, route config.Route, event, re
 		}
 	}
 	return result
+}
+
+func parseGitHubRepositoryPushedAt(raw json.RawMessage) (*time.Time, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, nil
+	}
+	if raw[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		if value == "" {
+			return nil, nil
+		}
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return nil, err
+		}
+		parsed = parsed.UTC()
+		return &parsed, nil
+	}
+	var unixSeconds int64
+	if err := json.Unmarshal(raw, &unixSeconds); err != nil {
+		return nil, err
+	}
+	parsed := time.Unix(unixSeconds, 0).UTC()
+	return &parsed, nil
 }
 
 func validGitHubSHA(value string) bool {
