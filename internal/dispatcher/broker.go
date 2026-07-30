@@ -16,8 +16,78 @@ import (
 const maxBrokerResponseBytes = 1 << 20
 
 type Broker struct {
-	URL, Token string
-	Client     *http.Client
+	URL, Token                 string
+	ReporterURL, ReporterToken string
+	Client                     *http.Client
+}
+
+type CommentResult struct {
+	ID  int64  `json:"id"`
+	URL string `json:"html_url"`
+}
+
+func (b *Broker) TerminalResult(ctx context.Context, runID string) (TerminalResult, error) {
+	endpoint, err := runEndpoint(b.URL, runID, "terminal-result")
+	if err != nil {
+		return TerminalResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return TerminalResult{}, permanentMalformed("create terminal result request", err)
+	}
+	b.authorize(req)
+	var out TerminalResult
+	if err = b.doJSON(req, &out); err != nil {
+		return TerminalResult{}, err
+	}
+	return out, nil
+}
+func (b *Broker) Comment(ctx context.Context, job Job, body, key string) (CommentResult, error) {
+	base := b.ReporterURL
+	if base == "" {
+		return CommentResult{}, permanentMalformed("reporter broker URL is required", nil)
+	}
+	parts := strings.Split(job.Repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return CommentResult{}, permanentMalformed("invalid repository", nil)
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return CommentResult{}, permanentMalformed("parse reporter broker URL", err)
+	}
+	u.Path = "/v1/repos/" + parts[0] + "/" + parts[1] + fmt.Sprintf("/issues/%d/comments", job.IssueNumber)
+	u.RawPath = "/v1/repos/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1]) + fmt.Sprintf("/issues/%d/comments", job.IssueNumber)
+	u.RawQuery = ""
+	u.Fragment = ""
+	payload, _ := json.Marshal(map[string]any{"body": body, "metadata": map[string]string{"Semantic-Job": fmt.Sprintf("%d", job.ID), "Broker-Run": job.BrokerRunID}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	if err != nil {
+		return CommentResult{}, permanentMalformed("create issue comment request", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	if b.ReporterToken != "" {
+		req.Header.Set("Authorization", "Bearer "+b.ReporterToken)
+	}
+	var out CommentResult
+	if err = b.doJSON(req, &out); err != nil {
+		return CommentResult{}, err
+	}
+	if out.ID < 1 {
+		return CommentResult{}, permanentMalformed("comment response missing id", nil)
+	}
+	return out, nil
+}
+func runEndpoint(raw, runID, suffix string) (string, error) {
+	base, err := url.Parse(raw)
+	if err != nil {
+		return "", permanentMalformed("parse broker URL", err)
+	}
+	base.Path = "/v1/runs/" + runID + "/" + suffix
+	base.RawPath = "/v1/runs/" + url.PathEscape(runID) + "/" + suffix
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base.String(), nil
 }
 
 type BrokerError struct {

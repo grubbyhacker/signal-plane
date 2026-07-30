@@ -52,6 +52,11 @@ func main() {
 		logger.Error("broker token is not set", "env", cfg.Dispatcher.BrokerTokenEnv)
 		os.Exit(1)
 	}
+	reporterToken := os.Getenv(cfg.Dispatcher.ReporterBrokerTokenEnv)
+	if cfg.Dispatcher.ReporterBrokerURL != "" && reporterToken == "" {
+		logger.Error("reporter broker token is not set", "env", cfg.Dispatcher.ReporterBrokerTokenEnv)
+		os.Exit(1)
+	}
 	store, err := dispatcher.OpenStore(cfg.Dispatcher.DatabasePath)
 	if err != nil {
 		logger.Error("open job store failed", "error", err)
@@ -79,7 +84,7 @@ func main() {
 		logger.Error("create dispatcher consumer failed", "error", err)
 		os.Exit(1)
 	}
-	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, Client: &http.Client{Timeout: 30 * time.Second}}
+	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, ReporterURL: cfg.Dispatcher.ReporterBrokerURL, ReporterToken: reporterToken, Client: &http.Client{Timeout: 30 * time.Second}}
 	ctx := context.Background()
 	metrics.SetReady(true)
 	go worker(ctx, logger, metrics, store, broker)
