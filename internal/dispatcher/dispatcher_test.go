@@ -386,6 +386,8 @@ func TestBrokerTerminalStatusMapping(t *testing.T) {
 		{"completed", StateCompleted},
 		{"failed", StateFailed},
 		{"timed_out", StateTimedOut},
+		{"stopped", StateStopped},
+		{"cancelled", StateCancelled},
 	} {
 		t.Run(tt.broker, func(t *testing.T) {
 			ctx := context.Background()

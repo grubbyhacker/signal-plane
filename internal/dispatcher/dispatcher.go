@@ -66,7 +66,7 @@ func NewMetrics() *Metrics {
 	for _, state := range lifecycleStates {
 		m.lifecycle.WithLabelValues(state).Set(0)
 	}
-	for _, outcome := range []string{StateCompleted, StateFailed, StateTimedOut} {
+	for _, outcome := range []string{StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled} {
 		m.terminals.WithLabelValues(outcome)
 	}
 	return m
@@ -307,7 +307,16 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 		if terminal, ok := reportingBroker(broker); ok {
 			projected, projectionErr := terminal.TerminalResult(ctx, job.BrokerRunID)
 			if projectionErr != nil {
-				return true, store.MarkStatus(ctx, job.ID, StateFailed, now, safeBrokerError(projectionErr), now)
+				if IsRetryable(projectionErr) {
+					return true, store.MarkStatus(ctx, job.ID, StateReportPending, now.Add(StatusPollInterval), safeBrokerError(projectionErr), now)
+				}
+				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(projectionErr), now)
+			}
+			if validationErr := ValidateTerminalResult(job, projected); validationErr != nil {
+				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(validationErr), now)
+			}
+			if _, renderErr := RenderTerminalComment(job, projected); renderErr != nil {
+				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(renderErr), now)
 			}
 			return true, store.QueueTerminalResult(ctx, job, projected, now)
 		}
@@ -341,10 +350,14 @@ func ReconciledStatus(status string) (string, error) {
 		return StateLaunched, nil
 	case "completed", "succeeded", "success":
 		return StateCompleted, nil
-	case "failed", "error", "cancelled", "canceled":
+	case "failed", "error":
 		return StateFailed, nil
 	case "timed_out", "timeout":
 		return StateTimedOut, nil
+	case "stopped":
+		return StateStopped, nil
+	case "cancelled", "canceled":
+		return StateCancelled, nil
 	default:
 		return "", BrokerError{Malformed: true, Message: "broker returned unknown run status"}
 	}
