@@ -589,6 +589,14 @@ func (s *Store) MarkStatus(ctx context.Context, id int64, status string, due tim
 	return expectOne(result, err, "mark status")
 }
 
+// DeferReportPending preserves a migrated terminal job until terminal
+// reporting is configured. The fixed delay prevents a disabled reporter from
+// turning the dispatcher loop into a broker polling loop.
+func (s *Store) DeferReportPending(ctx context.Context, id int64, due, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET due_at=?,last_error=?,updated_at=? WHERE id=? AND status=? AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)`, due.UnixMilli(), "terminal reporting deferred: reporter broker is not configured", now.UnixMilli(), id, StateReportPending)
+	return expectOne(result, err, "defer report pending")
+}
+
 func expectOne(result sql.Result, err error, operation string) error {
 	if err != nil {
 		return err
