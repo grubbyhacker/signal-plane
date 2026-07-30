@@ -21,11 +21,16 @@ const (
 	StateCompleted     = "completed"
 	StateFailed        = "failed"
 	StateTimedOut      = "timed_out"
+	StateReportPending = "report_pending"
+	StateReportRetry   = "report_retry"
+	StateReportBlocked = "report_blocked"
+	StateStopped       = "stopped"
+	StateCancelled     = "cancelled"
 	RecoveryIncomplete = "incomplete"
 	RecoveryCompleted  = "completed"
 )
 
-var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateCompleted, StateFailed, StateTimedOut}
+var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportRetry, StateReportBlocked, StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled}
 
 type Store struct{ db *sql.DB }
 
@@ -41,6 +46,28 @@ type Job struct {
 	Status         string
 	Attempts       int
 	FirstAttemptAt time.Time
+}
+
+// TerminalResult is the bounded, broker-projected work product. It is stored
+// verbatim enough for an operator to audit the exact immutable report input.
+type TerminalResult struct {
+	Version       string `json:"version"`
+	RunID         string `json:"run_id"`
+	Profile       string `json:"profile"`
+	Repo          string `json:"repo"`
+	Branch        string `json:"branch,omitempty"`
+	Status        string `json:"status"`
+	Outcome       string `json:"outcome"`
+	FinalSummary  string `json:"final_summary"`
+	FailureStage  string `json:"failure_stage,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
+}
+
+type Report struct {
+	ID, JobID                     int64
+	Job                           Job
+	Version, Body, IdempotencyKey string
+	Attempts                      int
 }
 
 type WorkKind int
@@ -101,6 +128,9 @@ func OpenStore(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS recovery_jobs (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, semantic_key TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, attempts INTEGER NOT NULL, first_launch_attempt_at INTEGER, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_reconciliations (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, broker_status TEXT NOT NULL, reconciled_status TEXT NOT NULL, reconciled_at INTEGER NOT NULL, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_replayed_messages (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), stream_sequence INTEGER NOT NULL, PRIMARY KEY(recovery_id,stream_sequence))`,
+		`CREATE TABLE IF NOT EXISTS terminal_results (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), version TEXT NOT NULL, run_id TEXT NOT NULL, profile TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, outcome TEXT NOT NULL, final_summary TEXT NOT NULL, failure_stage TEXT NOT NULL DEFAULT '', failure_reason TEXT NOT NULL DEFAULT '', recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS notification_outbox (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id), terminal_result_version TEXT NOT NULL, body TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('pending','retry','delivered','blocked')), attempts INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL, comment_id INTEGER, comment_url TEXT NOT NULL DEFAULT '', delivered_at INTEGER, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS notification_outbox_due ON notification_outbox(status,due_at,id)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -127,6 +157,7 @@ func OpenStore(path string) (*Store, error) {
 		`UPDATE jobs SET status='launch_retry' WHERE status IN ('retry','running')`,
 		`UPDATE jobs SET status='launched' WHERE status='succeeded' AND broker_run_id<>''`,
 		`UPDATE jobs SET status='failed' WHERE status IN ('succeeded','terminal')`,
+		`UPDATE jobs SET status='report_pending',due_at=updated_at WHERE broker_run_id<>'' AND status IN ('completed','failed','timed_out') AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)`,
 		`CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at)`,
 		`UPDATE dispatcher_metadata SET value=MAX(value,(SELECT COALESCE(MAX(stream_sequence),0) FROM deliveries)) WHERE key='last_persisted_jetstream_sequence'`,
 	} {
@@ -502,7 +533,7 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	var job Job
 	var first sql.NullInt64
 	var due int64
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched).
+	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?,?) AND (status<>? OR NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportPending).
 		Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Work{}, false, nil
@@ -516,7 +547,7 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	if due > now.UnixMilli() {
 		return Work{}, false, nil
 	}
-	if job.Status == StateLaunched {
+	if job.Status == StateLaunched || job.Status == StateReportPending {
 		return Work{Kind: WorkStatus, Job: job}, true, tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE jobs SET attempts=attempts+1,first_launch_attempt_at=COALESCE(first_launch_attempt_at,?),updated_at=? WHERE id=? AND status IN (?,?)`, now.UnixMilli(), now.UnixMilli(), job.ID, StatePendingLaunch, StateLaunchRetry)

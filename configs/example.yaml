@@ -20,6 +20,10 @@ dispatcher:
   database_path: github-task-dispatcher.db
   broker_url: http://127.0.0.1:8091
   broker_token_env: GITHUB_TASK_DISPATCHER_BROKER_TOKEN
+  # The main broker reporter has a distinct restricted client secret. Signal
+  # Plane never receives a GitHub credential.
+  reporter_broker_url: http://127.0.0.1:8080
+  reporter_broker_token_env: GITHUB_TASK_DISPATCHER_REPORTER_BROKER_TOKEN
   workers: 1
   repository_task_routes:
     - id: automation-target

@@ -189,6 +189,10 @@ type BrokerClient interface {
 	Launch(context.Context, Job) (LaunchResult, error)
 	Status(context.Context, string) (RunStatus, error)
 }
+type TerminalBroker interface {
+	TerminalResult(context.Context, string) (TerminalResult, error)
+	Comment(context.Context, Job, string, string) (CommentResult, error)
+}
 
 const (
 	LaunchRetryWindow  = 10 * time.Minute
@@ -207,6 +211,18 @@ func LaunchRetryDelay(attempt int) time.Duration {
 }
 
 func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, now time.Time) (bool, error) {
+	if terminal, ok := reportingBroker(broker); ok {
+		if report, due, err := store.ClaimReportDue(ctx, now); err != nil || due {
+			if err != nil {
+				return due, err
+			}
+			result, err := terminal.Comment(ctx, report.Job, report.Body, report.IdempotencyKey)
+			if err == nil {
+				return true, store.MarkReportDelivered(ctx, report, result.ID, result.URL, now)
+			}
+			return true, store.MarkReportFailure(ctx, report, IsRetryable(err), safeBrokerError(err), now)
+		}
+	}
 	work, ok, err := store.ClaimDue(ctx, now)
 	if err != nil || !ok {
 		return ok, err
@@ -279,9 +295,34 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 	if err != nil {
 		message = err.Error()
 	}
+	if state != StateLaunched {
+		if terminal, ok := reportingBroker(broker); ok {
+			projected, projectionErr := terminal.TerminalResult(ctx, job.BrokerRunID)
+			if projectionErr != nil {
+				return true, store.MarkStatus(ctx, job.ID, StateFailed, now, safeBrokerError(projectionErr), now)
+			}
+			return true, store.QueueTerminalResult(ctx, job, projected, now)
+		}
+	}
 	storeErr := store.MarkStatus(ctx, job.ID, state, due, message, now)
 	_ = metrics.Refresh(ctx, store, now)
 	return true, storeErr
+}
+
+func safeBrokerError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if len(text) > 512 {
+		text = text[:512]
+	}
+	return text
+}
+
+func reportingBroker(b BrokerClient) (TerminalBroker, bool) {
+	terminal, ok := b.(*Broker)
+	return terminal, ok && terminal.ReporterURL != ""
 }
 
 // ReconciledStatus validates the broker's bounded lifecycle vocabulary. The

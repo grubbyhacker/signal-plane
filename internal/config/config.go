@@ -83,16 +83,18 @@ type WorkRouterConfig struct {
 }
 
 type DispatcherConfig struct {
-	Enabled               bool                  `yaml:"enabled"`
-	Addr                  string                `yaml:"addr"`
-	Subject               string                `yaml:"subject"`
-	Durable               string                `yaml:"durable"`
-	DatabasePath          string                `yaml:"database_path"`
-	BrokerURL             string                `yaml:"broker_url"`
-	BrokerTokenEnv        string                `yaml:"broker_token_env"`
-	Workers               int                   `yaml:"workers"`
-	RecoveryStartSequence uint64                `yaml:"recovery_start_sequence"`
-	RepositoryTaskRoutes  []RepositoryTaskRoute `yaml:"repository_task_routes"`
+	Enabled                bool                  `yaml:"enabled"`
+	Addr                   string                `yaml:"addr"`
+	Subject                string                `yaml:"subject"`
+	Durable                string                `yaml:"durable"`
+	DatabasePath           string                `yaml:"database_path"`
+	BrokerURL              string                `yaml:"broker_url"`
+	BrokerTokenEnv         string                `yaml:"broker_token_env"`
+	ReporterBrokerURL      string                `yaml:"reporter_broker_url"`
+	ReporterBrokerTokenEnv string                `yaml:"reporter_broker_token_env"`
+	Workers                int                   `yaml:"workers"`
+	RecoveryStartSequence  uint64                `yaml:"recovery_start_sequence"`
+	RepositoryTaskRoutes   []RepositoryTaskRoute `yaml:"repository_task_routes"`
 }
 
 type RepositoryTaskRoute struct {
@@ -292,6 +294,15 @@ func (cfg Config) Validate() error {
 		}
 		if err := validateRepositoryTaskRoutes(cfg.Dispatcher.RepositoryTaskRoutes); err != nil {
 			return err
+		}
+		if (cfg.Dispatcher.ReporterBrokerURL == "") != (cfg.Dispatcher.ReporterBrokerTokenEnv == "") {
+			return errors.New("reporter_broker_url and reporter_broker_token_env must be configured together")
+		}
+		if cfg.Dispatcher.ReporterBrokerURL != "" {
+			reporterURL, err := url.Parse(cfg.Dispatcher.ReporterBrokerURL)
+			if err != nil || (reporterURL.Scheme != "http" && reporterURL.Scheme != "https") || reporterURL.Host == "" || reporterURL.User != nil || (reporterURL.EscapedPath() != "" && reporterURL.EscapedPath() != "/") || reporterURL.RawQuery != "" || reporterURL.Fragment != "" {
+				return errors.New("enabled dispatcher reporter_broker_url must be a fixed broker origin without path, query, credentials, or fragment")
+			}
 		}
 	}
 	if cfg.WorkRouter.Enabled {
