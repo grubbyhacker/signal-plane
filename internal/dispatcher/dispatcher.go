@@ -299,7 +299,10 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 		if terminal, ok := reportingBroker(broker); ok {
 			projected, projectionErr := terminal.TerminalResult(ctx, job.BrokerRunID)
 			if projectionErr != nil {
-				return true, store.MarkStatus(ctx, job.ID, StateFailed, now, safeBrokerError(projectionErr), now)
+				if IsRetryable(projectionErr) {
+					return true, store.MarkStatus(ctx, job.ID, StateLaunched, now.Add(StatusPollInterval), safeBrokerError(projectionErr), now)
+				}
+				return true, store.QueueTerminalResult(ctx, job, HarnessTerminalResult(job, state, safeBrokerError(projectionErr)), now)
 			}
 			return true, store.QueueTerminalResult(ctx, job, projected, now)
 		}
@@ -313,16 +316,27 @@ func safeBrokerError(err error) string {
 	if err == nil {
 		return ""
 	}
-	text := err.Error()
-	if len(text) > 512 {
-		text = text[:512]
+	var brokerErr BrokerError
+	if errors.As(err, &brokerErr) {
+		if brokerErr.Transport {
+			return "broker transport failure"
+		}
+		if brokerErr.Status != 0 {
+			return fmt.Sprintf("broker returned HTTP %d", brokerErr.Status)
+		}
+		if brokerErr.Malformed {
+			return "broker returned malformed terminal output"
+		}
 	}
-	return text
+	return "broker request failed"
 }
 
 func reportingBroker(b BrokerClient) (TerminalBroker, bool) {
-	terminal, ok := b.(*Broker)
-	return terminal, ok && terminal.ReporterURL != ""
+	if concrete, ok := b.(*Broker); ok {
+		return concrete, concrete.ReporterURL != ""
+	}
+	terminal, ok := b.(TerminalBroker)
+	return terminal, ok
 }
 
 // ReconciledStatus validates the broker's bounded lifecycle vocabulary. The
@@ -333,8 +347,12 @@ func ReconciledStatus(status string) (string, error) {
 		return StateLaunched, nil
 	case "completed", "succeeded", "success":
 		return StateCompleted, nil
-	case "failed", "error", "cancelled", "canceled":
+	case "failed", "error":
 		return StateFailed, nil
+	case "stopped":
+		return StateStopped, nil
+	case "cancelled", "canceled":
+		return StateCancelled, nil
 	case "timed_out", "timeout":
 		return StateTimedOut, nil
 	default:
