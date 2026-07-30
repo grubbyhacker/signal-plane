@@ -32,6 +32,8 @@ type Store struct{ db *sql.DB }
 type Job struct {
 	ID             int64
 	SemanticKey    string
+	RouteID        string
+	Profile        string
 	Repository     string
 	IssueNumber    int64
 	DeliveryID     string
@@ -92,11 +94,11 @@ func OpenStore(path string) (*Store, error) {
 	statements := []string{
 		`PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`, `PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS deliveries (delivery_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, semantic_key TEXT, stream_sequence INTEGER NOT NULL DEFAULT 0, recorded_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS dispatcher_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 		`INSERT INTO dispatcher_metadata(key,value) VALUES('last_persisted_jetstream_sequence',0) ON CONFLICT(key) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS recovery_runs (recovery_id TEXT PRIMARY KEY, durable TEXT NOT NULL, manifest_sequence INTEGER NOT NULL, start_sequence INTEGER NOT NULL, restored_job_count INTEGER NOT NULL DEFAULT -1, replay_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, completed_at INTEGER)`,
-		`CREATE TABLE IF NOT EXISTS recovery_jobs (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, semantic_key TEXT NOT NULL, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, attempts INTEGER NOT NULL, first_launch_attempt_at INTEGER, PRIMARY KEY(recovery_id,job_id))`,
+		`CREATE TABLE IF NOT EXISTS recovery_jobs (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, semantic_key TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, attempts INTEGER NOT NULL, first_launch_attempt_at INTEGER, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_reconciliations (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, broker_status TEXT NOT NULL, reconciled_status TEXT NOT NULL, reconciled_at INTEGER NOT NULL, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_replayed_messages (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), stream_sequence INTEGER NOT NULL, PRIMARY KEY(recovery_id,stream_sequence))`,
 	}
@@ -110,6 +112,10 @@ func OpenStore(path string) (*Store, error) {
 		{"jobs", "broker_run_id", `broker_run_id TEXT NOT NULL DEFAULT ''`},
 		{"jobs", "first_launch_attempt_at", `first_launch_attempt_at INTEGER`},
 		{"deliveries", "stream_sequence", `stream_sequence INTEGER NOT NULL DEFAULT 0`},
+		{"jobs", "route_id", `route_id TEXT NOT NULL DEFAULT ''`},
+		{"jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
+		{"recovery_jobs", "route_id", `route_id TEXT NOT NULL DEFAULT ''`},
+		{"recovery_jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := ensureColumn(db, migration.table, migration.column, migration.definition); err != nil {
 			db.Close()
@@ -234,7 +240,7 @@ func (s *Store) record(ctx context.Context, recoveryID, deliveryID, outcome stri
 		}
 	}
 	if candidate != nil {
-		_, err = tx.ExecContext(ctx, `INSERT INTO jobs(semantic_key,repository,issue_number,source_delivery_id,status,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(semantic_key) DO NOTHING`, semantic, candidate.Repository, candidate.IssueNumber, candidate.DeliveryID, StatePendingLaunch, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
+		_, err = tx.ExecContext(ctx, `INSERT INTO jobs(semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,status,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(semantic_key) DO NOTHING`, semantic, candidate.RouteID, candidate.Profile, candidate.Repository, candidate.IssueNumber, candidate.DeliveryID, StatePendingLaunch, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
 		if err != nil {
 			return err
 		}
@@ -307,7 +313,7 @@ func (s *Store) FailRecovery(ctx context.Context, id string, failure error) erro
 }
 
 func (s *Store) RecoveryJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?) ORDER BY id`, StatePendingLaunch, StateLaunchRetry, StateLaunched)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?) ORDER BY id`, StatePendingLaunch, StateLaunchRetry, StateLaunched)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +322,7 @@ func (s *Store) RecoveryJobs(ctx context.Context) ([]Job, error) {
 	for rows.Next() {
 		var job Job
 		var first sql.NullInt64
-		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
+		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
 			return nil, err
 		}
 		if first.Valid {
@@ -340,7 +346,7 @@ func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]J
 		return nil, err
 	}
 	if expected < 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_jobs(recovery_id,job_id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at) SELECT ?,id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?)`, recoveryID, StatePendingLaunch, StateLaunchRetry, StateLaunched); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_jobs(recovery_id,job_id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at) SELECT ?,id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?)`, recoveryID, StatePendingLaunch, StateLaunchRetry, StateLaunched); err != nil {
 			return nil, err
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recovery_jobs WHERE recovery_id=?`, recoveryID).Scan(&expected); err != nil {
@@ -353,7 +359,7 @@ func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]J
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at FROM recovery_jobs WHERE recovery_id=? ORDER BY job_id`, recoveryID)
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at FROM recovery_jobs WHERE recovery_id=? ORDER BY job_id`, recoveryID)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +368,7 @@ func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]J
 	for rows.Next() {
 		var job Job
 		var first sql.NullInt64
-		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
+		if err := rows.Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first); err != nil {
 			return nil, err
 		}
 		if first.Valid {
@@ -496,8 +502,8 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	var job Job
 	var first sql.NullInt64
 	var due int64
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched).
-		Scan(&job.ID, &job.SemanticKey, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
+	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched).
+		Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Work{}, false, nil
 	}

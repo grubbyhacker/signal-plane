@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 	"github.com/grubbyhacker/signal-plane/internal/eventbus"
 )
@@ -52,6 +53,7 @@ type Runner struct {
 	Logger  *slog.Logger
 	Now     func() time.Time
 	Timeout time.Duration
+	Routes  []config.RepositoryTaskRoute
 }
 
 func (r Runner) Run(ctx context.Context, opts Options) (report Report, err error) {
@@ -119,7 +121,7 @@ func (r Runner) Run(ctx context.Context, opts Options) (report Report, err error
 		if fetchErr != nil {
 			return report, fmt.Errorf("fetch replay message %d of %d: %w", i+1, pending, fetchErr)
 		}
-		if processErr := dispatcher.ProcessRecovery(ctx, logger, metrics, r.Store, opts.RecoveryID, delivery, now()); processErr != nil {
+		if processErr := dispatcher.ProcessRecovery(ctx, logger, metrics, r.Store, r.Routes, opts.RecoveryID, delivery, now()); processErr != nil {
 			return report, fmt.Errorf("replay message %d of %d: %w", i+1, pending, processErr)
 		}
 	}

@@ -99,7 +99,7 @@ func main() {
 			continue
 		}
 		metrics.SetReady(true)
-		dispatcher.Process(ctx, logger, metrics, store, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
+		dispatcher.Process(ctx, logger, metrics, store, cfg.Dispatcher.RepositoryTaskRoutes, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
 }
 
@@ -162,7 +162,7 @@ func runRecovery(args []string, output io.Writer) error {
 		return fmt.Errorf("open restored dispatcher database: %w", err)
 	}
 	defer store.Close()
-	runner := recovery.Runner{Store: store, Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
+	runner := recovery.Runner{Store: store, Routes: cfg.Dispatcher.RepositoryTaskRoutes, Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
 	if *execute {
 		token := os.Getenv(cfg.Dispatcher.BrokerTokenEnv)
 		if token == "" {

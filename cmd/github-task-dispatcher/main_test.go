@@ -117,7 +117,8 @@ func TestRecoveryCommandDefaultsToReadOnlyPlan(t *testing.T) {
 	configPath := filepath.Join(directory, "dispatcher.yaml")
 	config := "nats:\n  url: nats://invalid.example:4222\n  stream: SIGNALS\n  subjects: [signals.>]\n" +
 		"dispatcher:\n  enabled: true\n  subject: signals.github.>\n  durable: restored-v1\n  recovery_start_sequence: 1\n  database_path: " + database + "\n" +
-		"  broker_url: http://broker.invalid/v1/launch-profiles/codex-issue-implement/launch\n  broker_token_env: TEST_RECOVERY_TOKEN\n  workers: 1\n" +
+		"  broker_url: http://broker.invalid\n  broker_token_env: TEST_RECOVERY_TOKEN\n  workers: 1\n" +
+		"  repository_task_routes:\n  - id: fixture\n    repository: example/automation-target\n    event: issues\n    action: labeled\n    label: automation:requested\n    profile: repository-task\n" +
 		"routes:\n  - id: local\n    path: /local\n    source: manual\n    publish_subject: signals.local\n"
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)

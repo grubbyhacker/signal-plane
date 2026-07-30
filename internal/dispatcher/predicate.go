@@ -4,30 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
-)
-
-const (
-	// Repository is a synthetic target retained only so the disabled dispatcher
-	// proof and its persistence/recovery tests remain deterministic. Production
-	// admission does not route events for this repository.
-	Repository = "example/automation-target"
-	Profile    = "codex-issue-implement"
 )
 
 type Candidate struct {
 	Repository  string
 	IssueNumber int64
 	DeliveryID  string
+	RouteID     string
+	Profile     string
 }
 
 func (c Candidate) SemanticKey() string {
-	return fmt.Sprintf("github-issue-implement:v1:%s:%d", c.Repository, c.IssueNumber)
+	return fmt.Sprintf("repository-task:v1:%s:%s:issue:%d", c.RouteID, c.Repository, c.IssueNumber)
 }
 
 // Select decodes only the fields required for dispatch. The original provider
 // payload is never returned to or stored by the dispatcher.
-func Select(signal envelope.Signal) (Candidate, string) {
+func Select(signal envelope.Signal, routes []config.RepositoryTaskRoute) (Candidate, string) {
 	if signal.Meta.Source != "github" || signal.Meta.SourceEvent != "issues" || signal.Meta.SourceAction != "labeled" {
 		return Candidate{}, "event_filtered"
 	}
@@ -54,14 +49,25 @@ func Select(signal envelope.Signal) (Candidate, string) {
 	if json.Unmarshal(signal.Payload, &event) != nil {
 		return Candidate{}, "invalid_payload"
 	}
-	if event.Action != "labeled" || event.Repository.FullName != Repository {
-		return Candidate{}, "repository_filtered"
-	}
-	if event.Label.Name != "automation:requested" {
-		return Candidate{}, "label_filtered"
-	}
 	if event.Issue.Number <= 0 || event.Issue.State != "open" || len(event.Issue.PullRequest) != 0 || event.Sender.Login == "" {
 		return Candidate{}, "issue_filtered"
 	}
-	return Candidate{Repository: Repository, IssueNumber: event.Issue.Number, DeliveryID: signal.Meta.SourceDeliveryID}, "accepted"
+	var matched *config.RepositoryTaskRoute
+	for i := range routes {
+		route := &routes[i]
+		if event.Repository.FullName == route.Repository && signal.Meta.SourceEvent == route.Event &&
+			event.Action == route.Action && event.Label.Name == route.Label {
+			if matched != nil {
+				return Candidate{}, "ambiguous_route"
+			}
+			matched = route
+		}
+	}
+	if matched == nil {
+		return Candidate{}, "route_filtered"
+	}
+	return Candidate{
+		Repository: event.Repository.FullName, IssueNumber: event.Issue.Number,
+		DeliveryID: signal.Meta.SourceDeliveryID, RouteID: matched.ID, Profile: matched.Profile,
+	}, "accepted"
 }
