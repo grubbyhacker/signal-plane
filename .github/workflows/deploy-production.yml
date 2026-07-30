@@ -19,6 +19,11 @@ on:
       image_sha:
         description: Optional Git SHA to deploy; defaults to the workflow dispatch ref SHA.
         required: false
+      force_recreate_stateful_services:
+        description: Recreate the dispatcher and Resume work-router under the managed backup lock.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -115,6 +120,7 @@ jobs:
         run: |
           scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-signal-plane.yml \
             -e "signal_plane_image=${{ steps.deploy_image.outputs.image }}" \
+            -e "signal_plane_force_recreate_stateful_services=${{ inputs.force_recreate_stateful_services || false }}" \
             -e "ansible_host=${DEPLOY_HOST}" \
             -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
