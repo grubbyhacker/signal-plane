@@ -197,6 +197,9 @@ type TerminalBroker interface {
 const (
 	LaunchRetryWindow  = 10 * time.Minute
 	StatusPollInterval = 2 * time.Second
+	// ReporterUnavailableDelay bounds disabled reporting checks without
+	// treating a deliberately absent reporter as a terminal broker failure.
+	ReporterUnavailableDelay = time.Minute
 )
 
 func LaunchRetryDelay(attempt int) time.Duration {
@@ -229,6 +232,11 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 	}
 	job := work.Job
 	if work.Kind == WorkStatus {
+		if job.Status == StateReportPending {
+			if _, ok := reportingBroker(broker); !ok {
+				return true, store.DeferReportPending(ctx, job.ID, now.Add(ReporterUnavailableDelay), now)
+			}
+		}
 		return runStatus(ctx, logger, metrics, store, broker, job, now)
 	}
 	if !job.FirstAttemptAt.IsZero() && !now.Before(job.FirstAttemptAt.Add(LaunchRetryWindow)) {
