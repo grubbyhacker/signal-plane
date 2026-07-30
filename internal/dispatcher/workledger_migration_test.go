@@ -97,7 +97,7 @@ func TestMigratedReportPendingDefersWithoutReporterThenReconciles(t *testing.T) 
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-5":
 			_, _ = w.Write([]byte(`{"run_id":"run-5","status":"completed"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-5/terminal-result":
-			_, _ = w.Write([]byte(`{"version":"repository-task-terminal-result/v1","run_id":"run-5","profile":"","repo":"example/automation-target","status":"completed","outcome":"ready_for_review","final_summary":"done"}`))
+			_, _ = w.Write([]byte(`{"version":"repository-task-terminal-result/v1","run_id":"run-5","profile":"","repo":"example/automation-target","branch":"agent/run-5","status":"completed","outcome":"ready_for_review","finalize_reason":"worker_exit","terminal_source":"exited","idempotency_key_digest":"idem-digest","request_fingerprint":"request-fingerprint","launch_config_version":"config-version","result":{"version":"repository-task-worker-result/v1","outcome":"ready_for_review","detail":"pull request created","stage":"completed","run_id":"run-5","repository":"example/automation-target","base_branch":"main","branch":"agent/run-5","verification":{"status":"passed"},"verify_task":"verify","pull_request":{"number":42,"html_url":"https://example.test/pull/42","url":"https://api.example.test/pulls/42"}},"final_summary":"done"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/repos/example/automation-target/issues/5/comments":
 			_, _ = w.Write([]byte(`{"id":55,"html_url":"https://example.test/comments/55"}`))
 		default:
@@ -153,5 +153,51 @@ func TestMigratedReportPendingDefersWithoutReporterThenReconciles(t *testing.T) 
 	}
 	if serverCalls != 3 {
 		t.Fatalf("broker calls=%d want status, terminal result, and comment", serverCalls)
+	}
+}
+
+func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo18(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dispatcher.db")
+	deployed, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE terminal_results (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), version TEXT NOT NULL, run_id TEXT NOT NULL, profile TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, outcome TEXT NOT NULL, final_summary TEXT NOT NULL, failure_stage TEXT NOT NULL DEFAULT '', failure_reason TEXT NOT NULL DEFAULT '', recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE notification_outbox (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id), terminal_result_version TEXT NOT NULL, body TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('pending','retry','delivered','blocked')), attempts INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL, comment_id INTEGER, comment_url TEXT NOT NULL DEFAULT '', delivered_at INTEGER, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`INSERT INTO jobs(id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,due_at,created_at,updated_at) VALUES(5,'semantic-5','route','repository-task','owner/repo',25,'delivery-5','run-5','report_pending',1,1,1)`,
+		`INSERT INTO terminal_results(job_id,version,run_id,profile,repository,branch,status,outcome,final_summary,recorded_at) VALUES(5,'repository-task-terminal-result/v1','run-5','repository-task','owner/repo','agent/run-5','completed','no_change_required','complete output',1)`,
+		`INSERT INTO notification_outbox(job_id,terminal_result_version,body,idempotency_key,status,due_at,created_at,updated_at) VALUES(5,'repository-task-terminal-result/v1','body','key','pending',1,1,1)`,
+		`PRAGMA user_version=17`,
+	} {
+		if _, err := deployed.Exec(statement); err != nil {
+			deployed.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := deployed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version int
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 18 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	var finalizeReason, terminalSource, idempotencyDigest, fingerprint, launchConfig, resultJSON, summary string
+	if err := store.db.QueryRow(`SELECT finalize_reason,terminal_source,idempotency_key_digest,request_fingerprint,launch_config_version,result_json,final_summary FROM terminal_results WHERE job_id=5`).
+		Scan(&finalizeReason, &terminalSource, &idempotencyDigest, &fingerprint, &launchConfig, &resultJSON, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if finalizeReason != "" || terminalSource != "" || idempotencyDigest != "" || fingerprint != "" || launchConfig != "" || resultJSON != "" || summary != "complete output" {
+		t.Fatalf("migration changed deployed row: %q %q %q %q %q %q %q", finalizeReason, terminalSource, idempotencyDigest, fingerprint, launchConfig, resultJSON, summary)
+	}
+	var outboxStatus string
+	if err := store.db.QueryRow(`SELECT status FROM notification_outbox WHERE job_id=5`).Scan(&outboxStatus); err != nil || outboxStatus != "pending" {
+		t.Fatalf("outbox status=%q err=%v", outboxStatus, err)
 	}
 }

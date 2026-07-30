@@ -51,16 +51,22 @@ type Job struct {
 // TerminalResult is the bounded, broker-projected work product. It is stored
 // verbatim enough for an operator to audit the exact immutable report input.
 type TerminalResult struct {
-	Version       string `json:"version"`
-	RunID         string `json:"run_id"`
-	Profile       string `json:"profile"`
-	Repo          string `json:"repo"`
-	Branch        string `json:"branch,omitempty"`
-	Status        string `json:"status"`
-	Outcome       string `json:"outcome"`
-	FinalSummary  string `json:"final_summary"`
-	FailureStage  string `json:"failure_stage,omitempty"`
-	FailureReason string `json:"failure_reason,omitempty"`
+	Version              string         `json:"version"`
+	RunID                string         `json:"run_id"`
+	Profile              string         `json:"profile"`
+	Repo                 string         `json:"repo"`
+	Branch               string         `json:"branch,omitempty"`
+	Status               string         `json:"status"`
+	Outcome              string         `json:"outcome"`
+	FinalizeReason       string         `json:"finalize_reason,omitempty"`
+	TerminalSource       string         `json:"terminal_source,omitempty"`
+	IdempotencyKeyDigest string         `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint   string         `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion  string         `json:"launch_config_version,omitempty"`
+	Result               map[string]any `json:"result,omitempty"`
+	FinalSummary         string         `json:"final_summary"`
+	FailureStage         string         `json:"failure_stage,omitempty"`
+	FailureReason        string         `json:"failure_reason,omitempty"`
 }
 
 type Report struct {
@@ -128,7 +134,7 @@ func OpenStore(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS recovery_jobs (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, semantic_key TEXT NOT NULL, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, attempts INTEGER NOT NULL, first_launch_attempt_at INTEGER, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_reconciliations (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), job_id INTEGER NOT NULL, broker_run_id TEXT NOT NULL, prior_status TEXT NOT NULL, broker_status TEXT NOT NULL, reconciled_status TEXT NOT NULL, reconciled_at INTEGER NOT NULL, PRIMARY KEY(recovery_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS recovery_replayed_messages (recovery_id TEXT NOT NULL REFERENCES recovery_runs(recovery_id), stream_sequence INTEGER NOT NULL, PRIMARY KEY(recovery_id,stream_sequence))`,
-		`CREATE TABLE IF NOT EXISTS terminal_results (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), version TEXT NOT NULL, run_id TEXT NOT NULL, profile TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, outcome TEXT NOT NULL, final_summary TEXT NOT NULL, failure_stage TEXT NOT NULL DEFAULT '', failure_reason TEXT NOT NULL DEFAULT '', recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS terminal_results (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), version TEXT NOT NULL, run_id TEXT NOT NULL, profile TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, outcome TEXT NOT NULL, finalize_reason TEXT NOT NULL DEFAULT '', terminal_source TEXT NOT NULL DEFAULT '', idempotency_key_digest TEXT NOT NULL DEFAULT '', request_fingerprint TEXT NOT NULL DEFAULT '', launch_config_version TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '', final_summary TEXT NOT NULL, failure_stage TEXT NOT NULL DEFAULT '', failure_reason TEXT NOT NULL DEFAULT '', recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS notification_outbox (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id), terminal_result_version TEXT NOT NULL, body TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('pending','retry','delivered','blocked')), attempts INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL, comment_id INTEGER, comment_url TEXT NOT NULL DEFAULT '', delivered_at INTEGER, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS notification_outbox_due ON notification_outbox(status,due_at,id)`,
 	}
@@ -146,6 +152,12 @@ func OpenStore(path string) (*Store, error) {
 		{"jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
 		{"recovery_jobs", "route_id", `route_id TEXT NOT NULL DEFAULT ''`},
 		{"recovery_jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "finalize_reason", `finalize_reason TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "terminal_source", `terminal_source TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "idempotency_key_digest", `idempotency_key_digest TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "request_fingerprint", `request_fingerprint TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "launch_config_version", `launch_config_version TEXT NOT NULL DEFAULT ''`},
+		{"terminal_results", "result_json", `result_json TEXT NOT NULL DEFAULT ''`},
 	} {
 		if err := ensureColumn(db, migration.table, migration.column, migration.definition); err != nil {
 			db.Close()
@@ -585,7 +597,7 @@ func (s *Store) MarkLaunchFailure(ctx context.Context, id int64, retry bool, due
 }
 
 func (s *Store) MarkStatus(ctx context.Context, id int64, status string, due time.Time, message string, now time.Time) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=? AND status=?`, status, due.UnixMilli(), message, now.UnixMilli(), id, StateLaunched)
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=? AND status IN (?,?)`, status, due.UnixMilli(), message, now.UnixMilli(), id, StateLaunched, StateReportPending)
 	return expectOne(result, err, "mark status")
 }
 

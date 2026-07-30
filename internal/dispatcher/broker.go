@@ -76,6 +76,9 @@ func (b *Broker) Comment(ctx context.Context, job Job, body, key string) (Commen
 	if out.ID < 1 {
 		return CommentResult{}, permanentMalformed("comment response missing id", nil)
 	}
+	if !validHTTPSURL(out.URL) {
+		return CommentResult{}, permanentMalformed("comment response missing valid html_url", nil)
+	}
 	return out, nil
 }
 func runEndpoint(raw, runID, suffix string) (string, error) {
