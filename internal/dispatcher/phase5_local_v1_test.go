@@ -107,8 +107,8 @@ func phase5V1EndToEnd(t *testing.T) {
 	}
 	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-original", "accepted")
 	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-relabel", "accepted")
-	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-wrong-label", "label_filtered")
-	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-missing-label", "label_filtered")
+	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-wrong-label", "route_filtered")
+	phase5V1AssertDeliveryOutcome(t, store, "phase5-v1-missing-label", "route_filtered")
 	var firstDelivery string
 	if err := store.db.QueryRow(`SELECT source_delivery_id FROM jobs WHERE issue_number=42`).Scan(&firstDelivery); err != nil || firstDelivery != "phase5-v1-original" {
 		t.Fatalf("semantic job audit delivery=%q err=%v", firstDelivery, err)
@@ -465,7 +465,10 @@ func phase5V1StoreWithJobs(t *testing.T, now time.Time, issues ...int64) *Store 
 	t.Cleanup(func() { _ = store.Close() })
 	for index, issue := range issues {
 		delivery := "phase5-v1-policy-" + strconv.FormatInt(issue, 10)
-		candidate := Candidate{Repository: Repository, IssueNumber: issue, DeliveryID: delivery}
+		candidate := Candidate{
+			Repository: Repository, IssueNumber: issue, DeliveryID: delivery,
+			RouteID: "automation-target", Profile: Profile,
+		}
 		if err := store.Record(context.Background(), delivery, "accepted", uint64(index+1), &candidate, now.Add(time.Duration(index)*time.Millisecond)); err != nil {
 			t.Fatal(err)
 		}
