@@ -565,7 +565,7 @@ func (s *Store) MarkReportFailure(ctx context.Context, r Report, retry bool, saf
 	if retry {
 		status = "retry"
 		jobState = StateReportRetry
-		due = now.Add(LaunchRetryDelay(r.Attempts + 1))
+		due = now.Add(ReportRetryDelay(r.Attempts + 1))
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

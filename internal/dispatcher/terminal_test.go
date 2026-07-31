@@ -314,6 +314,58 @@ func TestTemporaryReporterFailureRetriesDurably(t *testing.T) {
 	}
 }
 
+func TestTemporaryReporterFailureBecomesBlockedAtRetryLimit(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(123_000, 0)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	job := terminalTestJob(t, store, now)
+	if err := store.QueueTerminalResult(ctx, job, terminalTestResult("no_change_required"), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE notification_outbox SET attempts=? WHERE job_id=?`,
+		ReportRetryMaxAttempts-1, job.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"code":"temporary"}`, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	broker := &Broker{ReporterURL: server.URL, Client: server.Client()}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now); err != nil || !worked {
+		t.Fatalf("exhaustion worked=%v err=%v", worked, err)
+	}
+	var outboxStatus, jobStatus, outboxError, jobError string
+	var attempts int
+	if err := store.db.QueryRow(
+		`SELECT status,attempts,last_error FROM notification_outbox WHERE job_id=?`, job.ID,
+	).Scan(&outboxStatus, &attempts, &outboxError); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status,last_error FROM jobs WHERE id=?`, job.ID).Scan(&jobStatus, &jobError); err != nil {
+		t.Fatal(err)
+	}
+	if outboxStatus != "blocked" || jobStatus != StateReportBlocked || attempts != ReportRetryMaxAttempts {
+		t.Fatalf("outbox=%s job=%s attempts=%d", outboxStatus, jobStatus, attempts)
+	}
+	if !strings.HasPrefix(outboxError, "terminal issue comment delivery retry limit exhausted: ") || jobError != outboxError {
+		t.Fatalf("outbox error=%q job error=%q", outboxError, jobError)
+	}
+	var outboxRows int
+	if err := store.db.QueryRow(`SELECT count(*) FROM notification_outbox WHERE job_id=?`, job.ID).Scan(&outboxRows); err != nil || outboxRows != 1 {
+		t.Fatalf("outbox rows=%d err=%v", outboxRows, err)
+	}
+	if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now.Add(48*time.Hour)); err != nil || worked {
+		t.Fatalf("exhausted report was retried: worked=%v err=%v", worked, err)
+	}
+}
+
 func TestPermanentReporterFailureIsDurablyBlocked(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(125_000, 0)
