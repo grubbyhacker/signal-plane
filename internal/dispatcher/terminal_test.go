@@ -169,6 +169,15 @@ func TestOutboxSurvivesInsertionRestartAndAcceptedCommentReplay(t *testing.T) {
 	postCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		postCalls++
+		if request.Header.Get("X-Agent-ID") != terminalReporterAgentID {
+			t.Errorf("X-Agent-ID = %q", request.Header.Get("X-Agent-ID"))
+		}
+		if request.Header.Get("X-Agent-Secret") != "reporter-secret" {
+			t.Errorf("X-Agent-Secret was not the reporter credential")
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Errorf("Authorization header must not carry the reporter credential")
+		}
 		key := request.Header.Get("Idempotency-Key")
 		comment, exists := semanticComments[key]
 		if !exists {
@@ -178,7 +187,7 @@ func TestOutboxSurvivesInsertionRestartAndAcceptedCommentReplay(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":9001,"html_url":"https://github.example/owner/repo/issues/25#issuecomment-9001"}`))
 	}))
 	defer server.Close()
-	broker := &Broker{ReporterURL: server.URL, Client: server.Client()}
+	broker := &Broker{ReporterURL: server.URL, ReporterToken: "reporter-secret", Client: server.Client()}
 	accepted, err := broker.Comment(ctx, report.Job, report.Body, report.IdempotencyKey)
 	if err != nil || accepted.ID != 9001 {
 		t.Fatalf("first accepted comment=%+v err=%v", accepted, err)
