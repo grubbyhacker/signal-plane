@@ -21,12 +21,15 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "recovery-metadata" || os.Args[1] == "recover") {
+	if len(os.Args) > 1 && (os.Args[1] == "recovery-metadata" || os.Args[1] == "recover" || os.Args[1] == "reconcile-report") {
 		var err error
-		if os.Args[1] == "recovery-metadata" {
+		switch os.Args[1] {
+		case "recovery-metadata":
 			err = runRecoveryMetadata(os.Args[2:], os.Stdout)
-		} else {
+		case "recover":
 			err = runRecovery(os.Args[2:], os.Stdout)
+		default:
+			err = runReportReconciliation(os.Args[2:], os.Stdout, time.Now().UTC())
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -106,6 +109,48 @@ func main() {
 		metrics.SetReady(true)
 		dispatcher.Process(ctx, logger, metrics, store, cfg.Dispatcher.RepositoryTaskRoutes, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
+}
+
+func runReportReconciliation(args []string, output io.Writer, now time.Time) error {
+	flags := flag.NewFlagSet("reconcile-report", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "dispatcher configuration path")
+	jobID := flags.Int64("job-id", 0, "durable semantic job id")
+	brokerRunID := flags.String("broker-run-id", "", "expected broker run id")
+	idempotencyKey := flags.String("idempotency-key", "", "expected notification outbox idempotency key")
+	execute := flags.Bool("execute", false, "requeue the validated blocked report")
+	if err := flags.Parse(args); err != nil {
+		return fmt.Errorf("usage: github-task-dispatcher reconcile-report --config PATH --job-id ID --broker-run-id RUN --idempotency-key KEY [--execute]: %w", err)
+	}
+	if *configPath == "" || *jobID < 1 || *brokerRunID == "" || *idempotencyKey == "" || flags.NArg() != 0 {
+		return errors.New("usage: github-task-dispatcher reconcile-report --config PATH --job-id ID --broker-run-id RUN --idempotency-key KEY [--execute]")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("load dispatcher config: %w", err)
+	}
+	info, err := os.Stat(cfg.Dispatcher.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("stat dispatcher database: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("dispatcher database must be a regular file")
+	}
+	var store *dispatcher.Store
+	if *execute {
+		store, err = dispatcher.OpenStore(cfg.Dispatcher.DatabasePath)
+	} else {
+		store, err = dispatcher.OpenStoreReadOnly(cfg.Dispatcher.DatabasePath)
+	}
+	if err != nil {
+		return fmt.Errorf("open dispatcher database: %w", err)
+	}
+	defer store.Close()
+	report, err := store.ReconcileBlockedReport(context.Background(), *jobID, *brokerRunID, *idempotencyKey, *execute, now)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(report)
 }
 
 // runDisabledStandby prepares the durable store before exposing standby health.

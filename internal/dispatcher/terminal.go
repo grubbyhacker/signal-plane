@@ -40,6 +40,31 @@ type workerTerminalResult struct {
 	} `json:"pull_request,omitempty"`
 }
 
+type ReportReconciliation struct {
+	Mode                  string `json:"mode"`
+	Status                string `json:"status"`
+	JobID                 int64  `json:"job_id"`
+	SemanticKey           string `json:"semantic_key"`
+	BrokerRunID           string `json:"broker_run_id"`
+	TerminalResultVersion string `json:"terminal_result_version"`
+	OutboxID              int64  `json:"outbox_id"`
+	IdempotencyKey        string `json:"idempotency_key"`
+	PriorAttempts         int    `json:"prior_attempts"`
+	PriorError            string `json:"prior_error"`
+}
+
+type blockedReportState struct {
+	jobID, outboxID                     int64
+	semanticKey, brokerRunID, jobStatus string
+	jobError, version, idempotencyKey   string
+	outboxStatus                        string
+	attempts                            int
+	outboxError                         string
+	commentID, deliveredAt              sql.NullInt64
+	commentURL, terminalVersion         string
+	terminalRunID                       string
+}
+
 // ValidateTerminalResult binds a broker projection to its durable job.  This
 // deliberately rejects unknown outcome/output instead of inventing a report.
 func ValidateTerminalResult(job Job, r TerminalResult) error {
@@ -303,7 +328,7 @@ func (s *Store) MarkReportDelivered(ctx context.Context, r Report, id int64, url
 	case "cancelled":
 		terminal = StateCancelled
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,updated_at=? WHERE id=? AND status IN (?,?)`, terminal, now.UnixMilli(), r.JobID, StateReportPending, StateReportRetry)
+	result, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,last_error='',updated_at=? WHERE id=? AND status IN (?,?)`, terminal, now.UnixMilli(), r.JobID, StateReportPending, StateReportRetry)
 	if err != nil {
 		return err
 	}
@@ -312,6 +337,89 @@ func (s *Store) MarkReportDelivered(ctx context.Context, r Report, id int64, url
 	}
 	return tx.Commit()
 }
+
+func (s *Store) ReconcileBlockedReport(ctx context.Context, jobID int64, brokerRunID, idempotencyKey string, execute bool, now time.Time) (ReportReconciliation, error) {
+	if jobID < 1 || brokerRunID == "" || idempotencyKey == "" {
+		return ReportReconciliation{}, errors.New("job id, broker run id, and idempotency key are required")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !execute})
+	if err != nil {
+		return ReportReconciliation{}, err
+	}
+	defer tx.Rollback()
+	var state blockedReportState
+	err = tx.QueryRowContext(ctx, `
+		SELECT j.id,j.semantic_key,j.broker_run_id,j.status,j.last_error,
+		       o.id,o.terminal_result_version,o.idempotency_key,o.status,o.attempts,o.last_error,
+		       o.comment_id,o.comment_url,o.delivered_at,t.version,t.run_id
+		FROM jobs j
+		JOIN terminal_results t ON t.job_id=j.id
+		JOIN notification_outbox o ON o.job_id=j.id
+		WHERE j.id=?`, jobID).
+		Scan(&state.jobID, &state.semanticKey, &state.brokerRunID, &state.jobStatus, &state.jobError,
+			&state.outboxID, &state.version, &state.idempotencyKey, &state.outboxStatus, &state.attempts, &state.outboxError,
+			&state.commentID, &state.commentURL, &state.deliveredAt, &state.terminalVersion, &state.terminalRunID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ReportReconciliation{}, errors.New("blocked report does not exist")
+		}
+		return ReportReconciliation{}, err
+	}
+	if state.brokerRunID != brokerRunID || state.terminalRunID != brokerRunID {
+		return ReportReconciliation{}, errors.New("broker run correlation does not match")
+	}
+	if state.idempotencyKey != idempotencyKey {
+		return ReportReconciliation{}, errors.New("outbox idempotency key does not match")
+	}
+	if state.version != state.terminalVersion {
+		return ReportReconciliation{}, errors.New("terminal result version does not match outbox")
+	}
+	if state.jobStatus != StateReportBlocked || state.outboxStatus != "blocked" {
+		return ReportReconciliation{}, errors.New("report is not durably blocked")
+	}
+	if state.commentID.Valid || state.commentURL != "" || state.deliveredAt.Valid {
+		return ReportReconciliation{}, errors.New("blocked report already has delivery identity")
+	}
+	if state.jobError == "" || state.outboxError == "" || state.jobError != state.outboxError {
+		return ReportReconciliation{}, errors.New("blocked report failure evidence is incomplete")
+	}
+	report := ReportReconciliation{
+		Mode:                  "plan",
+		Status:                "validated",
+		JobID:                 state.jobID,
+		SemanticKey:           state.semanticKey,
+		BrokerRunID:           state.brokerRunID,
+		TerminalResultVersion: state.version,
+		OutboxID:              state.outboxID,
+		IdempotencyKey:        state.idempotencyKey,
+		PriorAttempts:         state.attempts,
+		PriorError:            state.outboxError,
+	}
+	if !execute {
+		return report, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE notification_outbox SET status='retry',due_at=?,updated_at=? WHERE id=? AND status='blocked' AND comment_id IS NULL AND comment_url='' AND delivered_at IS NULL`, now.UnixMilli(), now.UnixMilli(), state.outboxID)
+	if err != nil {
+		return ReportReconciliation{}, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated != 1 {
+		return ReportReconciliation{}, errors.New("blocked outbox changed concurrently")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=? AND status=?`, StateReportRetry, now.UnixMilli(), now.UnixMilli(), state.jobID, StateReportBlocked)
+	if err != nil {
+		return ReportReconciliation{}, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated != 1 {
+		return ReportReconciliation{}, errors.New("blocked job changed concurrently")
+	}
+	if err := tx.Commit(); err != nil {
+		return ReportReconciliation{}, err
+	}
+	report.Mode = "execute"
+	report.Status = "requeued"
+	return report, nil
+}
+
 func (s *Store) MarkReportFailure(ctx context.Context, r Report, retry bool, safe string, now time.Time) error {
 	status := "blocked"
 	jobState := StateReportBlocked
