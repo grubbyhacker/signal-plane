@@ -128,9 +128,16 @@ SQLite evidence. The command is read-only unless `--execute` is supplied and
 never calls the broker launch endpoint. An incomplete recovery marker blocks
 normal dispatcher startup and therefore blocks new launches.
 
-Permanent terminal-comment failures remain durably blocked until an operator
-validates and explicitly requeues the exact semantic job, broker run, and
-notification idempotency key. The dry-run-first
+Temporary terminal-comment failures retry the same outbox row and stable
+idempotency key with a bounded 30-second-to-one-hour backoff. After 24 failed
+delivery attempts (roughly 17 hours), the outbox and semantic job become
+explicitly `report_blocked`; retries do not create attempt rows or additional
+comment bodies. Permanent failures block immediately. A blocked report remains
+durable until an operator validates and explicitly requeues the exact semantic
+job, broker run, and notification idempotency key. Because GitHub or the
+least-privilege reporter may itself be unavailable, Signal Plane cannot
+reliably post a second comment describing a reporting failure; the explicit
+blocked ledger state is the operational failure signal. The dry-run-first
 `github-task-dispatcher reconcile-report` procedure is documented in
 [Blocked report reconciliation](docs/blocked-report-reconciliation.md). It
 does not fetch a terminal result, launch a worker, render a new comment, or post

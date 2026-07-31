@@ -195,8 +195,9 @@ type TerminalBroker interface {
 }
 
 const (
-	LaunchRetryWindow  = 10 * time.Minute
-	StatusPollInterval = 2 * time.Second
+	LaunchRetryWindow      = 10 * time.Minute
+	ReportRetryMaxAttempts = 24
+	StatusPollInterval     = 2 * time.Second
 	// ReporterUnavailableDelay bounds disabled reporting checks without
 	// treating a deliberately absent reporter as a terminal broker failure.
 	ReporterUnavailableDelay = time.Minute
@@ -213,6 +214,20 @@ func LaunchRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
+// ReportRetryDelay keeps a temporary reporter outage durable without generating
+// a high-frequency write loop. Combined with ReportRetryMaxAttempts, a report
+// is attempted for roughly 17 hours before it becomes explicitly blocked.
+func ReportRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 30 * time.Second * time.Duration(1<<min(attempt-1, 7))
+	if delay > time.Hour {
+		return time.Hour
+	}
+	return delay
+}
+
 func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, now time.Time) (bool, error) {
 	if terminal, ok := reportingBroker(broker); ok {
 		if report, due, err := store.ClaimReportDue(ctx, now); err != nil || due {
@@ -223,7 +238,13 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 			if err == nil {
 				return true, store.MarkReportDelivered(ctx, report, result.ID, result.URL, now)
 			}
-			return true, store.MarkReportFailure(ctx, report, IsRetryable(err), safeBrokerError(err), now)
+			retry := IsRetryable(err)
+			safe := safeBrokerError(err)
+			if retry && report.Attempts+1 >= ReportRetryMaxAttempts {
+				retry = false
+				safe = "terminal issue comment delivery retry limit exhausted: " + safe
+			}
+			return true, store.MarkReportFailure(ctx, report, retry, safe, now)
 		}
 	}
 	work, ok, err := store.ClaimDue(ctx, now)
