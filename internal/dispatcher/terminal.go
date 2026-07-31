@@ -71,6 +71,11 @@ func ValidateTerminalResult(job Job, r TerminalResult) error {
 	if r.Version != terminalResultVersion || r.RunID != job.BrokerRunID || r.Profile != job.Profile || r.Repo != job.Repository {
 		return errors.New("invalid terminal result correlation")
 	}
+	prelaunchFailure := r.RunID == "" && r.TerminalSource == "signal_plane" &&
+		r.Status == StateFailed && r.Outcome == StateFailed && r.FailureStage == "broker_launch"
+	if r.RunID == "" && !prelaunchFailure {
+		return errors.New("terminal result is missing broker run correlation")
+	}
 	for _, value := range []string{r.Branch, r.Status, r.Outcome, r.FinalizeReason, r.TerminalSource, r.IdempotencyKeyDigest, r.RequestFingerprint, r.LaunchConfigVersion, r.FinalSummary, r.FailureStage, r.FailureReason} {
 		if !utf8.ValidString(value) || len(value) > maxTerminalTextBytes {
 			return errors.New("invalid terminal result text")
@@ -163,7 +168,7 @@ func RenderTerminalComment(job Job, r TerminalResult) (string, error) {
 		"- Outcome: `" + r.Outcome + "`",
 		fmt.Sprintf("- Semantic job: `%d`", job.ID),
 		"- Semantic key: `" + job.SemanticKey + "`",
-		"- Broker run: `" + r.RunID + "`",
+		"- Broker run: `" + displayBrokerRun(r.RunID) + "`",
 		"- Result version: `" + r.Version + "`",
 		"- Launch config: `" + r.LaunchConfigVersion + "`",
 		"- Launch idempotency digest: `" + r.IdempotencyKeyDigest + "`",
@@ -214,6 +219,13 @@ func RenderTerminalComment(job Job, r TerminalResult) (string, error) {
 		return "", errors.New("terminal comment exceeds GitHub comment limit")
 	}
 	return body, nil
+}
+
+func displayBrokerRun(runID string) string {
+	if runID == "" {
+		return "not acknowledged"
+	}
+	return runID
 }
 
 func reportKey(job Job, version string) string {
@@ -268,7 +280,7 @@ func (s *Store) QueueTerminalResult(ctx context.Context, job Job, r TerminalResu
 	if storedVersion != r.Version || storedBody != body || storedKey != key {
 		return errors.New("notification outbox conflicts with durable terminal result")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?,?,?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry, StateFailed, StatePendingLaunch, StateLaunchRetry)
 	if err != nil {
 		return err
 	}
@@ -277,6 +289,75 @@ func (s *Store) QueueTerminalResult(ctx context.Context, job Job, r TerminalResu
 		return errors.New("terminal result job state changed concurrently")
 	}
 	return tx.Commit()
+}
+
+func (s *Store) QueueLaunchFailure(ctx context.Context, job Job, reason string, now time.Time) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "broker launch failed before a run was acknowledged"
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	result := TerminalResult{
+		Version:              terminalResultVersion,
+		RunID:                "",
+		Profile:              job.Profile,
+		Repo:                 job.Repository,
+		Status:               StateFailed,
+		Outcome:              StateFailed,
+		FinalizeReason:       "broker_launch_failed",
+		TerminalSource:       "signal_plane",
+		IdempotencyKeyDigest: "unavailable-before-broker-acknowledgement",
+		RequestFingerprint:   brokerSourceID(job),
+		LaunchConfigVersion:  "unavailable-before-broker-acknowledgement",
+		FailureStage:         "broker_launch",
+		FailureReason:        reason,
+	}
+	return s.QueueTerminalResult(ctx, job, result, now)
+}
+
+func (s *Store) QueueUnreportedLaunchFailures(ctx context.Context, now time.Time) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,
+		       source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,last_error
+		FROM jobs
+		WHERE status=? AND broker_run_id=''
+		  AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)
+		ORDER BY id`, StateFailed)
+	if err != nil {
+		return err
+	}
+	type failedLaunch struct {
+		job    Job
+		reason string
+	}
+	var failures []failedLaunch
+	for rows.Next() {
+		var item failedLaunch
+		var first sql.NullInt64
+		if err := rows.Scan(
+			&item.job.ID, &item.job.SemanticKey, &item.job.RouteID, &item.job.Profile,
+			&item.job.Repository, &item.job.IssueNumber, &item.job.DeliveryID,
+			&item.job.BrokerRunID, &item.job.Status, &item.job.Attempts, &first, &item.reason,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		if first.Valid {
+			item.job.FirstAttemptAt = time.UnixMilli(first.Int64)
+		}
+		failures = append(failures, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range failures {
+		if err := s.QueueLaunchFailure(ctx, item.job, item.reason, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func sameStoredTerminalResult(a, b TerminalResult) bool {

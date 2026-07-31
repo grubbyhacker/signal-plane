@@ -100,7 +100,12 @@ SQLite for audit correlation. Transport
 failures, HTTP 429/5xx, and structured `profile_busy` responses use a durable,
 deterministic 2s/4s/8s/16s/20s launch retry schedule for at most ten minutes.
 Other errors, including `idempotency_conflict` and malformed success responses,
-fail immediately. The semantic job key is
+fail immediately. Exhausted and permanent pre-acknowledgement launch failures
+transactionally create one bounded Signal Plane fallback result and terminal
+comment outbox entry; startup backfills legacy failed launch rows that lack
+that report. The fallback explicitly records that no broker run was
+acknowledged and never treats reporting as successful before GitHub accepts
+the idempotent comment. The semantic job key is
 `repository-task:v1:<route>:<repo>:issue:<issue-number>`. `broker_url` must be
 the fixed private broker origin; the dispatcher appends the exact reviewed
 `/v1/launch-profiles/<profile>/launch` path. A 2xx response counts as

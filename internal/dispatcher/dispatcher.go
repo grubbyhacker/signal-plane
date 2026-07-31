@@ -242,7 +242,7 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 	if !job.FirstAttemptAt.IsZero() && !now.Before(job.FirstAttemptAt.Add(LaunchRetryWindow)) {
 		metrics.retries.Inc()
 		metrics.terminals.WithLabelValues(StateFailed).Inc()
-		err := store.MarkLaunchFailure(ctx, job.ID, false, now, "launch retry window exhausted", now)
+		err := store.QueueLaunchFailure(ctx, job, "launch retry window exhausted", now)
 		_ = metrics.Refresh(ctx, store, now)
 		return true, err
 	}
@@ -268,9 +268,33 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 		metrics.terminals.WithLabelValues(StateFailed).Inc()
 	}
 	logger.Warn("broker launch failed", "job_id", job.ID, "retry", retry, "attempt", job.Attempts, "error", err)
-	storeErr := store.MarkLaunchFailure(ctx, job.ID, retry, due, err.Error(), now)
+	var storeErr error
+	if retry {
+		storeErr = store.MarkLaunchFailure(ctx, job.ID, true, due, safeBrokerError(err), now)
+	} else {
+		storeErr = store.QueueLaunchFailure(ctx, job, safeLaunchFailureReason(err), now)
+	}
 	_ = metrics.Refresh(ctx, store, now)
 	return true, storeErr
+}
+
+func safeLaunchFailureReason(err error) string {
+	var brokerErr BrokerError
+	if !errors.As(err, &brokerErr) {
+		return "sandbox broker launch failed before acknowledging a run"
+	}
+	switch {
+	case brokerErr.Transport:
+		return "sandbox broker transport failed before acknowledging a run"
+	case brokerErr.Status != 0 && brokerErr.Code != "":
+		return fmt.Sprintf("sandbox broker rejected the launch with HTTP %d (%s)", brokerErr.Status, brokerErr.Code)
+	case brokerErr.Status != 0:
+		return fmt.Sprintf("sandbox broker rejected the launch with HTTP %d", brokerErr.Status)
+	case brokerErr.Malformed:
+		return "sandbox broker returned an invalid launch response"
+	default:
+		return "sandbox broker launch failed before acknowledging a run"
+	}
 }
 
 func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, job Job, now time.Time) (bool, error) {

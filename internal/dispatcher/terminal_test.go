@@ -462,3 +462,58 @@ func TestTemporaryTerminalProjectionFailureRetriesWithoutFalseCompletion(t *test
 		t.Fatalf("queued status=%s err=%v", status, err)
 	}
 }
+
+func TestOpenStoreBackfillsUnreportedPrelaunchFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dispatcher.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_900_000_000, 0).UTC()
+	_, err = store.db.Exec(`
+		INSERT INTO jobs(
+			id,semantic_key,route_id,launch_profile,repository,issue_number,
+			source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,
+			due_at,last_error,created_at,updated_at
+		) VALUES(6,'repository-task:v1:route:owner/repo:issue:26','route','profile',
+			'owner/repo',26,'delivery','',?,34,?,?,?,?,?)`,
+		StateFailed, now.UnixMilli(), now.UnixMilli(), "launch retry window exhausted",
+		now.UnixMilli(), now.UnixMilli(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var state, body, outboxState, runID, source, stage, reason string
+	if err := reopened.db.QueryRow(`SELECT status FROM jobs WHERE id=6`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRow(`
+		SELECT o.body,o.status,t.run_id,t.terminal_source,t.failure_stage,t.failure_reason
+		FROM notification_outbox o JOIN terminal_results t ON t.job_id=o.job_id
+		WHERE o.job_id=6`).Scan(&body, &outboxState, &runID, &source, &stage, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if state != StateReportPending || outboxState != "pending" || runID != "" ||
+		source != "signal_plane" || stage != "broker_launch" ||
+		reason != "launch retry window exhausted" {
+		t.Fatalf("state=%q outbox=%q run=%q source=%q stage=%q reason=%q", state, outboxState, runID, source, stage, reason)
+	}
+	for _, want := range []string{
+		"Broker run: `not acknowledged`",
+		"Failure stage: `broker_launch`",
+		"Diagnostic: launch retry window exhausted",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("comment missing %q:\n%s", want, body)
+		}
+	}
+}
