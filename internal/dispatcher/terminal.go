@@ -53,6 +53,18 @@ type ReportReconciliation struct {
 	PriorError            string `json:"prior_error"`
 }
 
+type LaunchFailureReconciliation struct {
+	Mode                  string `json:"mode"`
+	Status                string `json:"status"`
+	JobID                 int64  `json:"job_id"`
+	SemanticKey           string `json:"semantic_key"`
+	BrokerRunID           string `json:"broker_run_id"`
+	TerminalResultVersion string `json:"terminal_result_version"`
+	PriorStatus           string `json:"prior_status"`
+	PriorAttempts         int    `json:"prior_attempts"`
+	PriorError            string `json:"prior_error"`
+}
+
 type blockedReportState struct {
 	jobID, outboxID                     int64
 	semanticKey, brokerRunID, jobStatus string
@@ -70,6 +82,11 @@ type blockedReportState struct {
 func ValidateTerminalResult(job Job, r TerminalResult) error {
 	if r.Version != terminalResultVersion || r.RunID != job.BrokerRunID || r.Profile != job.Profile || r.Repo != job.Repository {
 		return errors.New("invalid terminal result correlation")
+	}
+	prelaunchFailure := r.RunID == "" && r.TerminalSource == "signal_plane" &&
+		r.Status == StateFailed && r.Outcome == StateFailed && r.FailureStage == "broker_launch"
+	if r.RunID == "" && !prelaunchFailure {
+		return errors.New("terminal result is missing broker run correlation")
 	}
 	for _, value := range []string{r.Branch, r.Status, r.Outcome, r.FinalizeReason, r.TerminalSource, r.IdempotencyKeyDigest, r.RequestFingerprint, r.LaunchConfigVersion, r.FinalSummary, r.FailureStage, r.FailureReason} {
 		if !utf8.ValidString(value) || len(value) > maxTerminalTextBytes {
@@ -163,7 +180,7 @@ func RenderTerminalComment(job Job, r TerminalResult) (string, error) {
 		"- Outcome: `" + r.Outcome + "`",
 		fmt.Sprintf("- Semantic job: `%d`", job.ID),
 		"- Semantic key: `" + job.SemanticKey + "`",
-		"- Broker run: `" + r.RunID + "`",
+		"- Broker run: `" + displayBrokerRun(r.RunID) + "`",
 		"- Result version: `" + r.Version + "`",
 		"- Launch config: `" + r.LaunchConfigVersion + "`",
 		"- Launch idempotency digest: `" + r.IdempotencyKeyDigest + "`",
@@ -214,6 +231,13 @@ func RenderTerminalComment(job Job, r TerminalResult) (string, error) {
 		return "", errors.New("terminal comment exceeds GitHub comment limit")
 	}
 	return body, nil
+}
+
+func displayBrokerRun(runID string) string {
+	if runID == "" {
+		return "not acknowledged"
+	}
+	return runID
 }
 
 func reportKey(job Job, version string) string {
@@ -268,7 +292,7 @@ func (s *Store) QueueTerminalResult(ctx context.Context, job Job, r TerminalResu
 	if storedVersion != r.Version || storedBody != body || storedKey != key {
 		return errors.New("notification outbox conflicts with durable terminal result")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?,?,?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry, StateFailed, StatePendingLaunch, StateLaunchRetry)
 	if err != nil {
 		return err
 	}
@@ -279,6 +303,32 @@ func (s *Store) QueueTerminalResult(ctx context.Context, job Job, r TerminalResu
 	return tx.Commit()
 }
 
+func (s *Store) QueueLaunchFailure(ctx context.Context, job Job, reason string, now time.Time) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "broker launch failed before a run was acknowledged"
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	result := TerminalResult{
+		Version:              terminalResultVersion,
+		RunID:                "",
+		Profile:              job.Profile,
+		Repo:                 job.Repository,
+		Status:               StateFailed,
+		Outcome:              StateFailed,
+		FinalizeReason:       "broker_launch_failed",
+		TerminalSource:       "signal_plane",
+		IdempotencyKeyDigest: "unavailable-before-broker-acknowledgement",
+		RequestFingerprint:   brokerSourceID(job),
+		LaunchConfigVersion:  "unavailable-before-broker-acknowledgement",
+		FailureStage:         "broker_launch",
+		FailureReason:        reason,
+	}
+	return s.QueueTerminalResult(ctx, job, result, now)
+}
+
 func sameStoredTerminalResult(a, b TerminalResult) bool {
 	return a.Version == b.Version && a.RunID == b.RunID && a.Profile == b.Profile && a.Repo == b.Repo &&
 		a.Branch == b.Branch && a.Status == b.Status && a.Outcome == b.Outcome &&
@@ -286,6 +336,94 @@ func sameStoredTerminalResult(a, b TerminalResult) bool {
 		a.IdempotencyKeyDigest == b.IdempotencyKeyDigest && a.RequestFingerprint == b.RequestFingerprint &&
 		a.LaunchConfigVersion == b.LaunchConfigVersion && a.FinalSummary == b.FinalSummary &&
 		a.FailureStage == b.FailureStage && a.FailureReason == b.FailureReason
+}
+
+func (s *Store) ReconcileFailedLaunch(
+	ctx context.Context,
+	jobID int64,
+	brokerRunID string,
+	terminal TerminalResult,
+	execute bool,
+	now time.Time,
+) (LaunchFailureReconciliation, error) {
+	if jobID < 1 || brokerRunID == "" {
+		return LaunchFailureReconciliation{}, errors.New("job id and broker run id are required")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !execute})
+	if err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	defer tx.Rollback()
+	var job Job
+	var first sql.NullInt64
+	var lastError string
+	err = tx.QueryRowContext(ctx, `
+		SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,
+		       source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,last_error
+		FROM jobs WHERE id=?`, jobID).
+		Scan(
+			&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository,
+			&job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status,
+			&job.Attempts, &first, &lastError,
+		)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return LaunchFailureReconciliation{}, errors.New("failed launch job does not exist")
+		}
+		return LaunchFailureReconciliation{}, err
+	}
+	if job.Status != StateFailed || job.BrokerRunID != "" {
+		return LaunchFailureReconciliation{}, errors.New("job is not an unreported failed launch")
+	}
+	var terminalRows, outboxRows int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM terminal_results WHERE job_id=?`, jobID).Scan(&terminalRows); err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM notification_outbox WHERE job_id=?`, jobID).Scan(&outboxRows); err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	if terminalRows != 0 || outboxRows != 0 {
+		return LaunchFailureReconciliation{}, errors.New("failed launch already has terminal reporting state")
+	}
+	job.BrokerRunID = brokerRunID
+	if err := ValidateTerminalResult(job, terminal); err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	if _, err := RenderTerminalComment(job, terminal); err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	report := LaunchFailureReconciliation{
+		Mode:                  "plan",
+		Status:                "validated",
+		JobID:                 job.ID,
+		SemanticKey:           job.SemanticKey,
+		BrokerRunID:           brokerRunID,
+		TerminalResultVersion: terminal.Version,
+		PriorStatus:           StateFailed,
+		PriorAttempts:         job.Attempts,
+		PriorError:            lastError,
+	}
+	if !execute {
+		return report, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE jobs
+		SET broker_run_id=?,status=?,due_at=?,updated_at=?
+		WHERE id=? AND status=? AND broker_run_id=''`,
+		brokerRunID, StateLaunched, now.UnixMilli(), now.UnixMilli(), jobID, StateFailed,
+	)
+	if err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	if updated, err := result.RowsAffected(); err != nil || updated != 1 {
+		return LaunchFailureReconciliation{}, errors.New("failed launch job changed concurrently")
+	}
+	if err := tx.Commit(); err != nil {
+		return LaunchFailureReconciliation{}, err
+	}
+	report.Mode = "execute"
+	report.Status = "requeued"
+	return report, nil
 }
 
 func (s *Store) ClaimReportDue(ctx context.Context, now time.Time) (Report, bool, error) {

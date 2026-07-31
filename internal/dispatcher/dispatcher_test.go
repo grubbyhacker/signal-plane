@@ -222,7 +222,7 @@ func TestLaunchRetryNeverLeapfrogsOldestJob(t *testing.T) {
 		if err := s.db.QueryRow(`SELECT status,due_at FROM jobs WHERE issue_number=1`).Scan(&state, &dueMillis); err != nil {
 			t.Fatal(err)
 		}
-		if state == StateFailed {
+		if state == StateReportPending {
 			break
 		}
 		at := time.UnixMilli(dueMillis)
@@ -506,7 +506,7 @@ func TestRetriesAndTerminalErrors(t *testing.T) {
 			}
 			want := StateLaunchRetry
 			if tt.terminal {
-				want = StateFailed
+				want = StateReportPending
 			}
 			if status != want {
 				t.Fatalf("status=%s", status)
@@ -563,8 +563,18 @@ func TestTransientRetriesStopAtDurableWindow(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT status FROM jobs`).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != StateFailed || launcher.calls != 1 {
+	if status != StateReportPending || launcher.calls != 1 {
 		t.Fatalf("status=%s calls=%d", status, launcher.calls)
+	}
+	var resultCount, outboxCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM terminal_results`).Scan(&resultCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM notification_outbox`).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if resultCount != 1 || outboxCount != 1 {
+		t.Fatalf("terminal results=%d outbox=%d", resultCount, outboxCount)
 	}
 }
 

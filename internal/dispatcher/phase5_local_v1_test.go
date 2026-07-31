@@ -261,7 +261,7 @@ func phase5V1RetryPolicy(t *testing.T) {
 			if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now); err != nil || !worked {
 				t.Fatalf("permanent attempt worked=%v err=%v", worked, err)
 			}
-			phase5V1AssertJobTiming(t, store, 61, StateFailed, 1, now.Add(LaunchRetryDelay(1)))
+			phase5V1AssertJobTiming(t, store, 61, StateReportPending, 1, now)
 			if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now.Add(time.Hour)); err != nil || worked || calls != 1 {
 				t.Fatalf("permanent error retried: worked=%v calls=%d err=%v", worked, calls, err)
 			}

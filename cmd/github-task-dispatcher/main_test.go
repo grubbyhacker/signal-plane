@@ -176,6 +176,103 @@ func TestReportReconciliationCommandPlansThenRequeuesExactBlockedReport(t *testi
 	}
 }
 
+func TestFailedLaunchReconciliationCommandPlansThenBindsExactBrokerRun(t *testing.T) {
+	directory := t.TempDir()
+	database := filepath.Join(directory, "dispatcher.db")
+	store, err := dispatcher.OpenStore(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`
+		INSERT INTO jobs(
+			id,semantic_key,route_id,launch_profile,repository,issue_number,
+			source_delivery_id,broker_run_id,status,attempts,due_at,last_error,
+			created_at,updated_at
+		) VALUES(6,'repository-task:v1:route:owner/repo:issue:26','route',
+			'repository-task','owner/repo',26,'delivery-6','',?,34,1,
+			'launch retry window exhausted',1,1)`, dispatcher.StateFailed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runs/run-6/terminal-result" ||
+			r.Header.Get("Authorization") != "Bearer broker-token" {
+			t.Fatalf("request path=%q authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, `{
+			"version":"repository-task-terminal-result/v1",
+			"run_id":"run-6",
+			"profile":"repository-task",
+			"repo":"owner/repo",
+			"branch":"agent/run-6",
+			"status":"failed",
+			"outcome":"failed",
+			"finalize_reason":"launch_create_failed",
+			"terminal_source":"startup_failure",
+			"idempotency_key_digest":"digest",
+			"request_fingerprint":"fingerprint",
+			"launch_config_version":"config",
+			"failure_stage":"sandbox_startup",
+			"failure_reason":"image is unavailable"
+		}`)
+	}))
+	defer server.Close()
+	configPath := filepath.Join(directory, "dispatcher.yaml")
+	configText := "nats:\n  url: nats://invalid.example:4222\n  stream: SIGNALS\n  subjects: [signals.>]\n" +
+		"dispatcher:\n  enabled: true\n  subject: signals.github.>\n  durable: dispatcher-v1\n  recovery_start_sequence: 1\n  database_path: " + database + "\n" +
+		"  broker_url: " + server.URL + "\n  broker_token_env: TEST_BROKER_TOKEN\n  workers: 1\n" +
+		"  repository_task_routes:\n  - id: route\n    repository: owner/repo\n    event: issues\n    action: labeled\n    label: automation:requested\n    profile: repository-task\n" +
+		"routes:\n  - id: local\n    path: /local\n    source: manual\n    publish_subject: signals.local\n"
+	if err := os.WriteFile(configPath, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_BROKER_TOKEN", "broker-token")
+	args := []string{"--config", configPath, "--job-id", "6", "--broker-run-id", "run-6"}
+	now := time.Unix(150_000, 0).UTC()
+	var output bytes.Buffer
+	if err := runFailedLaunchReconciliation(args, &output, now); err != nil {
+		t.Fatal(err)
+	}
+	var report dispatcher.LaunchFailureReconciliation
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "plan" || report.Status != "validated" || report.PriorAttempts != 34 {
+		t.Fatalf("plan=%+v", report)
+	}
+	var status, runID string
+	if err := db.QueryRow(`SELECT status,broker_run_id FROM jobs WHERE id=6`).Scan(&status, &runID); err != nil {
+		t.Fatal(err)
+	}
+	if status != dispatcher.StateFailed || runID != "" {
+		t.Fatalf("plan changed status=%q run=%q", status, runID)
+	}
+	output.Reset()
+	if err := runFailedLaunchReconciliation(append(args, "--execute"), &output, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "execute" || report.Status != "requeued" {
+		t.Fatalf("execute=%+v", report)
+	}
+	if err := db.QueryRow(`SELECT status,broker_run_id FROM jobs WHERE id=6`).Scan(&status, &runID); err != nil {
+		t.Fatal(err)
+	}
+	if status != dispatcher.StateLaunched || runID != "run-6" {
+		t.Fatalf("execute status=%q run=%q", status, runID)
+	}
+}
+
 func TestRecoveryCommandDefaultsToReadOnlyPlan(t *testing.T) {
 	directory := t.TempDir()
 	database := filepath.Join(directory, "dispatcher.db")
