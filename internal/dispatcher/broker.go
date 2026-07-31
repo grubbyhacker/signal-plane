@@ -13,7 +13,10 @@ import (
 	"strings"
 )
 
-const maxBrokerResponseBytes = 1 << 20
+const (
+	maxBrokerResponseBytes  = 1 << 20
+	terminalReporterAgentID = "repository-task-terminal-reporter"
+)
 
 type Broker struct {
 	URL, Token                 string
@@ -67,7 +70,8 @@ func (b *Broker) Comment(ctx context.Context, job Job, body, key string) (Commen
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", key)
 	if b.ReporterToken != "" {
-		req.Header.Set("Authorization", "Bearer "+b.ReporterToken)
+		req.Header.Set("X-Agent-ID", terminalReporterAgentID)
+		req.Header.Set("X-Agent-Secret", b.ReporterToken)
 	}
 	var out CommentResult
 	if err = b.doJSON(req, &out); err != nil {
