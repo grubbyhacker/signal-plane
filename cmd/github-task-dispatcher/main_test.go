@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
@@ -101,6 +103,76 @@ func TestRecoveryMetadataCommandEmptyDatabase(t *testing.T) {
 func TestRecoveryMetadataCommandRequiresDatabase(t *testing.T) {
 	if err := runRecoveryMetadata(nil, &bytes.Buffer{}); err == nil {
 		t.Fatal("expected usage error")
+	}
+}
+
+func TestReportReconciliationCommandPlansThenRequeuesExactBlockedReport(t *testing.T) {
+	directory := t.TempDir()
+	database := filepath.Join(directory, "dispatcher.db")
+	store, err := dispatcher.OpenStore(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Unix(140_000, 0)
+	for _, statement := range []string{
+		`INSERT INTO jobs(id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,due_at,last_error,created_at,updated_at) VALUES(5,'repository-task:v1:route:owner/repo:issue:25','route','repository-task','owner/repo',25,'delivery-5','run-5','report_blocked',1,'agent authentication failed',1,1)`,
+		`INSERT INTO terminal_results(job_id,version,run_id,profile,repository,status,outcome,final_summary,recorded_at) VALUES(5,'repository-task-terminal-result/v1','run-5','repository-task','owner/repo','completed','no_change_required','work product',1)`,
+		`INSERT INTO notification_outbox(id,job_id,terminal_result_version,body,idempotency_key,status,attempts,due_at,last_error,created_at,updated_at) VALUES(1,5,'repository-task-terminal-result/v1','body','stable-key','blocked',1,1,'agent authentication failed',1,1)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(directory, "dispatcher.yaml")
+	configText := "nats:\n  url: nats://invalid.example:4222\n  stream: SIGNALS\n  subjects: [signals.>]\n" +
+		"dispatcher:\n  enabled: true\n  subject: signals.github.>\n  durable: dispatcher-v1\n  recovery_start_sequence: 1\n  database_path: " + database + "\n" +
+		"  broker_url: http://broker.invalid\n  broker_token_env: TEST_BROKER_TOKEN\n  workers: 1\n" +
+		"  repository_task_routes:\n  - id: route\n    repository: owner/repo\n    event: issues\n    action: labeled\n    label: automation:requested\n    profile: repository-task\n" +
+		"routes:\n  - id: local\n    path: /local\n    source: manual\n    publish_subject: signals.local\n"
+	if err := os.WriteFile(configPath, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--config", configPath, "--job-id", "5", "--broker-run-id", "run-5", "--idempotency-key", "stable-key"}
+	var output bytes.Buffer
+	if err := runReportReconciliation(args, &output, now); err != nil {
+		t.Fatal(err)
+	}
+	var report dispatcher.ReportReconciliation
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "plan" || report.Status != "validated" || report.PriorAttempts != 1 || report.PriorError != "agent authentication failed" {
+		t.Fatalf("plan=%+v", report)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM notification_outbox WHERE id=1`).Scan(&status); err != nil || status != "blocked" {
+		t.Fatalf("plan changed status=%q err=%v", status, err)
+	}
+	output.Reset()
+	if err := runReportReconciliation(append(args, "--execute"), &output, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "execute" || report.Status != "requeued" {
+		t.Fatalf("execute=%+v", report)
+	}
+	var attempts int
+	var key, priorError string
+	if err := db.QueryRow(`SELECT status,attempts,idempotency_key,last_error FROM notification_outbox WHERE id=1`).Scan(&status, &attempts, &key, &priorError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "retry" || attempts != 1 || key != "stable-key" || priorError != "agent authentication failed" {
+		t.Fatalf("status=%q attempts=%d key=%q error=%q", status, attempts, key, priorError)
 	}
 }
 

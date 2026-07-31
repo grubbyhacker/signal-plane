@@ -120,6 +120,14 @@ SQLite evidence. The command is read-only unless `--execute` is supplied and
 never calls the broker launch endpoint. An incomplete recovery marker blocks
 normal dispatcher startup and therefore blocks new launches.
 
+Permanent terminal-comment failures remain durably blocked until an operator
+validates and explicitly requeues the exact semantic job, broker run, and
+notification idempotency key. The dry-run-first
+`github-task-dispatcher reconcile-report` procedure is documented in
+[Blocked report reconciliation](docs/blocked-report-reconciliation.md). It
+does not fetch a terminal result, launch a worker, render a new comment, or post
+to GitHub; it only moves the existing immutable outbox entry back to `retry`.
+
 ## Development
 
 ```sh

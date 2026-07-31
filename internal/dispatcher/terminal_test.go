@@ -352,6 +352,51 @@ func TestPermanentReporterFailureIsDurablyBlocked(t *testing.T) {
 	if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now.Add(time.Hour)); err != nil || worked {
 		t.Fatalf("blocked report was retried: worked=%v err=%v", worked, err)
 	}
+	var key string
+	if err := store.db.QueryRow(`SELECT idempotency_key FROM notification_outbox WHERE job_id=5`).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReconcileBlockedReport(ctx, job.ID, "wrong-run", key, false, now.Add(time.Hour)); err == nil {
+		t.Fatal("mismatched broker run was accepted")
+	}
+	plan, err := store.ReconcileBlockedReport(ctx, job.ID, job.BrokerRunID, key, false, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Mode != "plan" || plan.Status != "validated" || plan.JobID != job.ID || plan.BrokerRunID != job.BrokerRunID ||
+		plan.IdempotencyKey != key || plan.PriorAttempts != 1 || plan.PriorError != outboxError {
+		t.Fatalf("reconciliation plan=%+v", plan)
+	}
+	if err := store.db.QueryRow(`SELECT status FROM notification_outbox WHERE job_id=5`).Scan(&outboxStatus); err != nil || outboxStatus != "blocked" {
+		t.Fatalf("plan modified outbox status=%q err=%v", outboxStatus, err)
+	}
+	requeued, err := store.ReconcileBlockedReport(ctx, job.ID, job.BrokerRunID, key, true, now.Add(time.Hour))
+	if err != nil || requeued.Mode != "execute" || requeued.Status != "requeued" {
+		t.Fatalf("requeued=%+v err=%v", requeued, err)
+	}
+	var storedKey string
+	if err := store.db.QueryRow(`SELECT status,attempts,last_error,idempotency_key FROM notification_outbox WHERE job_id=5`).Scan(&outboxStatus, &attempts, &outboxError, &storedKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status,last_error FROM jobs WHERE id=5`).Scan(&jobStatus, &jobError); err != nil {
+		t.Fatal(err)
+	}
+	if outboxStatus != "retry" || jobStatus != StateReportRetry || attempts != 1 || outboxError == "" || jobError != outboxError || storedKey != key {
+		t.Fatalf("requeued outbox=%s job=%s attempts=%d outbox_error=%q job_error=%q key_preserved=%v", outboxStatus, jobStatus, attempts, outboxError, jobError, storedKey == key)
+	}
+	report, ok, err := store.ClaimReportDue(ctx, now.Add(time.Hour))
+	if err != nil || !ok {
+		t.Fatalf("claim requeued report ok=%v err=%v", ok, err)
+	}
+	if err := store.MarkReportDelivered(ctx, report, 9001, "https://github.example/owner/repo/issues/25#issuecomment-9001", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status,last_error FROM jobs WHERE id=5`).Scan(&jobStatus, &jobError); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != StateCompleted || jobError != "" {
+		t.Fatalf("delivered job status=%q last_error=%q", jobStatus, jobError)
+	}
 }
 
 func TestTemporaryTerminalProjectionFailureRetriesWithoutFalseCompletion(t *testing.T) {
