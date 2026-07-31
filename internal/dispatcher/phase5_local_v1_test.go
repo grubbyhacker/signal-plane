@@ -158,11 +158,11 @@ func phase5V1EndToEnd(t *testing.T) {
 		t.Fatalf("terminal status poll worked=%v err=%v", worked, err)
 	}
 	launches, statuses = fakeBroker.Snapshot()
-	if len(launches) != 1 || len(statuses) != 2 || statuses[0] != "/v1/runs/run-phase5-v1" || statuses[1] != "/v1/runs/run-phase5-v1" {
+	if len(launches) != 1 || len(statuses) != 3 || statuses[0] != "/v1/runs/run-phase5-v1" || statuses[1] != "/v1/runs/run-phase5-v1" || statuses[2] != "/v1/runs/run-phase5-v1/terminal-result" {
 		t.Fatalf("restart relaunched or used unscoped status endpoint: launches=%d statuses=%v", len(launches), statuses)
 	}
 	var state string
-	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE issue_number=42`).Scan(&state); err != nil || state != StateCompleted {
+	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE issue_number=42`).Scan(&state); err != nil || state != StateReportPending {
 		t.Fatalf("correlated terminal state=%q err=%v", state, err)
 	}
 
@@ -271,9 +271,9 @@ func phase5V1RetryPolicy(t *testing.T) {
 
 func phase5V1TerminalMapping(t *testing.T) {
 	for _, test := range []struct{ broker, stored string }{
-		{broker: "completed", stored: StateCompleted},
-		{broker: "failed", stored: StateFailed},
-		{broker: "timed_out", stored: StateTimedOut},
+		{broker: "completed", stored: StateReportPending},
+		{broker: "failed", stored: StateReportPending},
+		{broker: "timed_out", stored: StateReportPending},
 	} {
 		t.Run(test.broker, func(t *testing.T) {
 			now := time.Unix(1_820_000_000, 0).UTC()
@@ -336,6 +336,20 @@ func (fake *phase5V1HTTPBroker) serveHTTP(w http.ResponseWriter, r *http.Request
 		}
 		fake.launches = append(fake.launches, phase5V1Launch{r.Header.Get("Idempotency-Key"), request.Parameters.IssueNumber, request.Parameters.SourceDeliveryID})
 		_, _ = io.WriteString(w, `{"run_id":"run-phase5-v1"}`)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-phase5-v1/terminal-result" {
+		if r.Header.Get("Authorization") != "Bearer phase5-v1-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fake.statuses = append(fake.statuses, r.URL.EscapedPath())
+		result := terminalTestResult("no_change_required")
+		result.RunID = "run-phase5-v1"
+		result.Repo = Repository
+		result.Result["run_id"] = "run-phase5-v1"
+		result.Result["repository"] = Repository
+		_ = json.NewEncoder(w).Encode(result)
 		return
 	}
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.EscapedPath(), "/v1/runs/") {

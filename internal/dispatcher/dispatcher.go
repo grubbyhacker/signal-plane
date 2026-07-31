@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/grubbyhacker/signal-plane/internal/buildinfo"
 	"github.com/grubbyhacker/signal-plane/internal/config"
@@ -193,10 +195,14 @@ type TerminalBroker interface {
 	TerminalResult(context.Context, string) (TerminalResult, error)
 	Comment(context.Context, Job, string, string) (CommentResult, error)
 }
+type TerminalProjectionClient interface {
+	TerminalResult(context.Context, string) (TerminalResult, error)
+}
 
 const (
 	LaunchRetryWindow      = 10 * time.Minute
 	ReportRetryMaxAttempts = 24
+	PreOutboxMaxAttempts   = 10
 	StatusPollInterval     = 2 * time.Second
 	// ReporterUnavailableDelay bounds disabled reporting checks without
 	// treating a deliberately absent reporter as a terminal broker failure.
@@ -224,6 +230,17 @@ func ReportRetryDelay(attempt int) time.Duration {
 	delay := 30 * time.Second * time.Duration(1<<min(attempt-1, 7))
 	if delay > time.Hour {
 		return time.Hour
+	}
+	return delay
+}
+
+func PreOutboxRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := StatusPollInterval * time.Duration(1<<min(attempt-1, 5))
+	if delay > time.Minute {
+		return time.Minute
 	}
 	return delay
 }
@@ -321,54 +338,83 @@ func safeLaunchFailureReason(err error) string {
 func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, job Job, now time.Time) (bool, error) {
 	result, err := broker.Status(ctx, job.BrokerRunID)
 	if err != nil {
-		if IsRetryable(err) {
+		state, storeErr := ReconcileStatusFailure(ctx, store, job, err, now)
+		if state == StateLaunched {
 			metrics.jobs.WithLabelValues("status_retry").Inc()
-			storeErr := store.MarkStatus(ctx, job.ID, StateLaunched, now.Add(StatusPollInterval), err.Error(), now)
-			_ = metrics.Refresh(ctx, store, now)
-			return true, storeErr
+		} else {
+			metrics.terminals.WithLabelValues(StateFailed).Inc()
 		}
-		metrics.terminals.WithLabelValues(StateFailed).Inc()
-		storeErr := store.MarkStatus(ctx, job.ID, StateFailed, now, err.Error(), now)
 		_ = metrics.Refresh(ctx, store, now)
 		return true, storeErr
 	}
-	state, err := ReconciledStatus(result.Status)
-	if err != nil {
-		state = StateFailed
-	}
-	due := now
+	terminal, _ := broker.(TerminalProjectionClient)
+	state, err := ReconcileStatusResult(ctx, store, terminal, job, result, now)
 	if state == StateLaunched {
-		due = now.Add(StatusPollInterval)
 		metrics.jobs.WithLabelValues("status_nonterminal").Inc()
-	} else {
+	} else if err == nil {
 		metrics.terminals.WithLabelValues(state).Inc()
 		logger.Info("broker run reached terminal state", "job_id", job.ID, "broker_run_id", job.BrokerRunID, "outcome", state)
 	}
-	message := ""
-	if err != nil {
-		message = err.Error()
-	}
-	if state != StateLaunched {
-		if terminal, ok := reportingBroker(broker); ok {
-			projected, projectionErr := terminal.TerminalResult(ctx, job.BrokerRunID)
-			if projectionErr != nil {
-				if IsRetryable(projectionErr) {
-					return true, store.MarkStatus(ctx, job.ID, StateReportPending, now.Add(StatusPollInterval), safeBrokerError(projectionErr), now)
-				}
-				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(projectionErr), now)
-			}
-			if validationErr := ValidateTerminalResult(job, projected); validationErr != nil {
-				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(validationErr), now)
-			}
-			if _, renderErr := RenderTerminalComment(job, projected); renderErr != nil {
-				return true, store.MarkStatus(ctx, job.ID, StateReportBlocked, now, safeBrokerError(renderErr), now)
-			}
-			return true, store.QueueTerminalResult(ctx, job, projected, now)
-		}
-	}
-	storeErr := store.MarkStatus(ctx, job.ID, state, due, message, now)
 	_ = metrics.Refresh(ctx, store, now)
-	return true, storeErr
+	return true, err
+}
+
+// ReconcileStatusFailure keeps status-fetch failures durable and bounded. A
+// permanent failure, or exhaustion of transient retries, is itself projected
+// through the terminal result/outbox path so it cannot look successful.
+func ReconcileStatusFailure(ctx context.Context, store *Store, job Job, failure error, now time.Time) (string, error) {
+	return reconcilePreOutboxFailure(ctx, store, job, StateLaunched, "broker_status", failure, IsRetryable(failure), now)
+}
+
+// ReconcileStatusResult is shared by the live loop and restored-job recovery.
+// It is idempotent because QueueTerminalResult validates the immutable row and
+// uses one terminal result and one outbox row per semantic job.
+func ReconcileStatusResult(ctx context.Context, store *Store, terminal TerminalProjectionClient, job Job, result RunStatus, now time.Time) (string, error) {
+	if result.RunID == "" || result.RunID != job.BrokerRunID {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", errors.New("broker status response has invalid run correlation"), false, now)
+	}
+	state, err := ReconciledStatus(result.Status)
+	if err != nil {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", err, false, now)
+	}
+	if state == StateLaunched {
+		return state, store.MarkStatus(ctx, job.ID, state, now.Add(StatusPollInterval), "", now)
+	}
+	if terminal == nil {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "terminal_projection", errors.New("broker does not provide terminal projection"), false, now)
+	}
+	projected, err := terminal.TerminalResult(ctx, job.BrokerRunID)
+	if err != nil {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "terminal_projection", err, IsRetryable(err), now)
+	}
+	if err := ValidateTerminalResult(job, projected); err != nil {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "terminal_correlation", err, false, now)
+	}
+	if _, err := RenderTerminalComment(job, projected); err != nil {
+		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "terminal_rendering", err, false, now)
+	}
+	if err := store.QueueTerminalResult(ctx, job, projected, now); err != nil {
+		return "", err
+	}
+	return StateReportPending, nil
+}
+
+func reconcilePreOutboxFailure(ctx context.Context, store *Store, job Job, recoverableState, stage string, failure error, retryable bool, now time.Time) (string, error) {
+	safe := safeBrokerError(failure)
+	attempts, err := store.MarkPreOutboxFailure(ctx, job.ID, recoverableState, now.Add(PreOutboxRetryDelay(job.PreOutboxAttempts+1)), safe, now)
+	if err != nil {
+		return "", err
+	}
+	if retryable && attempts < PreOutboxMaxAttempts {
+		return recoverableState, nil
+	}
+	if retryable {
+		safe = "pre-outbox terminal reconciliation retry limit exhausted: " + safe
+	}
+	if err := store.QueuePreOutboxFailure(ctx, job, stage, safe, now); err != nil {
+		return "", err
+	}
+	return StateReportPending, nil
 }
 
 func safeBrokerError(err error) string {
@@ -376,8 +422,12 @@ func safeBrokerError(err error) string {
 		return ""
 	}
 	text := err.Error()
+	text = strings.ToValidUTF8(text, "\uFFFD")
 	if len(text) > 512 {
 		text = text[:512]
+		for !utf8.ValidString(text) {
+			text = text[:len(text)-1]
+		}
 	}
 	return text
 }

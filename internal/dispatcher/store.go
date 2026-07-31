@@ -35,17 +35,18 @@ var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunch
 type Store struct{ db *sql.DB }
 
 type Job struct {
-	ID             int64
-	SemanticKey    string
-	RouteID        string
-	Profile        string
-	Repository     string
-	IssueNumber    int64
-	DeliveryID     string
-	BrokerRunID    string
-	Status         string
-	Attempts       int
-	FirstAttemptAt time.Time
+	ID                int64
+	SemanticKey       string
+	RouteID           string
+	Profile           string
+	Repository        string
+	IssueNumber       int64
+	DeliveryID        string
+	BrokerRunID       string
+	Status            string
+	Attempts          int
+	PreOutboxAttempts int
+	FirstAttemptAt    time.Time
 }
 
 // TerminalResult is the bounded, broker-projected work product. It is stored
@@ -127,7 +128,7 @@ func OpenStore(path string) (*Store, error) {
 	statements := []string{
 		`PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`, `PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS deliveries (delivery_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, semantic_key TEXT, stream_sequence INTEGER NOT NULL DEFAULT 0, recorded_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, semantic_key TEXT NOT NULL UNIQUE, route_id TEXT NOT NULL DEFAULT '', launch_profile TEXT NOT NULL DEFAULT '', repository TEXT NOT NULL, issue_number INTEGER NOT NULL, source_delivery_id TEXT NOT NULL, broker_run_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, pre_outbox_attempts INTEGER NOT NULL DEFAULT 0, first_launch_attempt_at INTEGER, due_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS dispatcher_metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 		`INSERT INTO dispatcher_metadata(key,value) VALUES('last_persisted_jetstream_sequence',0) ON CONFLICT(key) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS recovery_runs (recovery_id TEXT PRIMARY KEY, durable TEXT NOT NULL, manifest_sequence INTEGER NOT NULL, start_sequence INTEGER NOT NULL, restored_job_count INTEGER NOT NULL DEFAULT -1, replay_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, completed_at INTEGER)`,
@@ -150,6 +151,7 @@ func OpenStore(path string) (*Store, error) {
 		{"deliveries", "stream_sequence", `stream_sequence INTEGER NOT NULL DEFAULT 0`},
 		{"jobs", "route_id", `route_id TEXT NOT NULL DEFAULT ''`},
 		{"jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
+		{"jobs", "pre_outbox_attempts", `pre_outbox_attempts INTEGER NOT NULL DEFAULT 0`},
 		{"recovery_jobs", "route_id", `route_id TEXT NOT NULL DEFAULT ''`},
 		{"recovery_jobs", "launch_profile", `launch_profile TEXT NOT NULL DEFAULT ''`},
 		{"terminal_results", "finalize_reason", `finalize_reason TEXT NOT NULL DEFAULT ''`},
@@ -170,6 +172,7 @@ func OpenStore(path string) (*Store, error) {
 		`UPDATE jobs SET status='launched' WHERE status='succeeded' AND broker_run_id<>''`,
 		`UPDATE jobs SET status='failed' WHERE status IN ('succeeded','terminal')`,
 		`UPDATE jobs SET status='report_pending',due_at=updated_at WHERE broker_run_id<>'' AND status IN ('completed','failed','timed_out') AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)`,
+		`UPDATE jobs SET status='report_pending',due_at=updated_at WHERE broker_run_id<>'' AND status='report_blocked' AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id) AND NOT EXISTS (SELECT 1 FROM notification_outbox WHERE notification_outbox.job_id=jobs.id)`,
 		`CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at)`,
 		`UPDATE dispatcher_metadata SET value=MAX(value,(SELECT COALESCE(MAX(stream_sequence),0) FROM deliveries)) WHERE key='last_persisted_jetstream_sequence'`,
 	} {
@@ -426,7 +429,7 @@ func (s *Store) RecordReconciliation(ctx context.Context, recoveryID string, job
 	if job.Status != StateLaunched || job.BrokerRunID == "" {
 		return fmt.Errorf("restored nonterminal job %d has no reconcilable broker run", job.ID)
 	}
-	if !validLifecycleState(reconciledStatus) || reconciledStatus == StatePendingLaunch || reconciledStatus == StateLaunchRetry {
+	if reconciledStatus != StateLaunched && reconciledStatus != StateReportPending {
 		return fmt.Errorf("invalid reconciled status %q", reconciledStatus)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -441,13 +444,22 @@ func (s *Store) RecordReconciliation(ctx context.Context, recoveryID string, job
 	if existing == 1 {
 		return tx.Commit()
 	}
-	due := now
 	if reconciledStatus == StateLaunched {
-		due = now.Add(StatusPollInterval)
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error='',updated_at=? WHERE id=? AND status=? AND broker_run_id=?`, reconciledStatus, due.UnixMilli(), now.UnixMilli(), job.ID, job.Status, job.BrokerRunID)
-	if err := expectOne(result, err, "reconcile job"); err != nil {
-		return err
+		result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=? AND status IN (?,?) AND broker_run_id=? AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)`, StateLaunched, now.Add(StatusPollInterval).UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, job.BrokerRunID)
+		if err := expectOne(result, err, "reconcile nonterminal job"); err != nil {
+			return err
+		}
+	} else {
+		var terminalRows, outboxRows int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM terminal_results WHERE job_id=?`, job.ID).Scan(&terminalRows); err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM notification_outbox WHERE job_id=?`, job.ID).Scan(&outboxRows); err != nil {
+			return err
+		}
+		if terminalRows != 1 || outboxRows != 1 {
+			return errors.New("terminal recovery reconciliation requires result and outbox")
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_reconciliations(recovery_id,job_id,broker_run_id,prior_status,broker_status,reconciled_status,reconciled_at) VALUES(?,?,?,?,?,?,?)`, recoveryID, job.ID, job.BrokerRunID, job.Status, brokerStatus, reconciledStatus, now.UnixMilli()); err != nil {
 		return err
@@ -545,8 +557,8 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	var job Job
 	var first sql.NullInt64
 	var due int64
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?,?) AND (status<>? OR NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportPending).
-		Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &first, &due)
+	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,pre_outbox_attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?,?) AND (status<>? OR NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportPending).
+		Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &job.PreOutboxAttempts, &first, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Work{}, false, nil
 	}
@@ -597,8 +609,25 @@ func (s *Store) MarkLaunchFailure(ctx context.Context, id int64, retry bool, due
 }
 
 func (s *Store) MarkStatus(ctx context.Context, id int64, status string, due time.Time, message string, now time.Time) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=? WHERE id=? AND status IN (?,?)`, status, due.UnixMilli(), message, now.UnixMilli(), id, StateLaunched, StateReportPending)
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,last_error=?,updated_at=?,pre_outbox_attempts=CASE WHEN ?='' THEN 0 ELSE pre_outbox_attempts END WHERE id=? AND status IN (?,?)`, status, due.UnixMilli(), message, now.UnixMilli(), message, id, StateLaunched, StateReportPending)
 	return expectOne(result, err, "mark status")
+}
+
+// MarkPreOutboxFailure durably bounds failures that happen before a terminal
+// result and its notification outbox row can be committed.
+func (s *Store) MarkPreOutboxFailure(ctx context.Context, id int64, status string, due time.Time, message string, now time.Time) (int, error) {
+	if status != StateLaunched && status != StateReportPending {
+		return 0, errors.New("invalid pre-outbox recovery state")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status=?,pre_outbox_attempts=pre_outbox_attempts+1,due_at=?,last_error=?,updated_at=? WHERE id=? AND status IN (?,?) AND NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)`, status, due.UnixMilli(), message, now.UnixMilli(), id, StateLaunched, StateReportPending)
+	if err := expectOne(result, err, "mark pre-outbox failure"); err != nil {
+		return 0, err
+	}
+	var attempts int
+	if err := s.db.QueryRowContext(ctx, `SELECT pre_outbox_attempts FROM jobs WHERE id=?`, id).Scan(&attempts); err != nil {
+		return 0, err
+	}
+	return attempts, nil
 }
 
 // DeferReportPending preserves a migrated terminal job until terminal

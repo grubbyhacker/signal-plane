@@ -292,7 +292,7 @@ func (s *Store) QueueTerminalResult(ctx context.Context, job Job, r TerminalResu
 	if storedVersion != r.Version || storedBody != body || storedKey != key {
 		return errors.New("notification outbox conflicts with durable terminal result")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?,?,?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry, StateFailed, StatePendingLaunch, StateLaunchRetry)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='',pre_outbox_attempts=0 WHERE id=? AND status IN (?,?,?,?,?,?)`, StateReportPending, now.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateReportPending, StateReportRetry, StateFailed, StatePendingLaunch, StateLaunchRetry)
 	if err != nil {
 		return err
 	}
@@ -324,6 +324,29 @@ func (s *Store) QueueLaunchFailure(ctx context.Context, job Job, reason string, 
 		RequestFingerprint:   brokerSourceID(job),
 		LaunchConfigVersion:  "unavailable-before-broker-acknowledgement",
 		FailureStage:         "broker_launch",
+		FailureReason:        reason,
+	}
+	return s.QueueTerminalResult(ctx, job, result, now)
+}
+
+func (s *Store) QueuePreOutboxFailure(ctx context.Context, job Job, stage, reason string, now time.Time) error {
+	reason = safeBrokerError(errors.New(strings.TrimSpace(reason)))
+	if reason == "" {
+		reason = "terminal projection failed before durable reporting state was created"
+	}
+	result := TerminalResult{
+		Version:              terminalResultVersion,
+		RunID:                job.BrokerRunID,
+		Profile:              job.Profile,
+		Repo:                 job.Repository,
+		Status:               StateFailed,
+		Outcome:              StateFailed,
+		FinalizeReason:       "signal_plane_terminal_projection_failed",
+		TerminalSource:       "signal_plane",
+		IdempotencyKeyDigest: "unavailable-after-broker-acknowledgement",
+		RequestFingerprint:   brokerSourceID(job),
+		LaunchConfigVersion:  "unavailable-after-broker-acknowledgement",
+		FailureStage:         stage,
 		FailureReason:        reason,
 	}
 	return s.QueueTerminalResult(ctx, job, result, now)

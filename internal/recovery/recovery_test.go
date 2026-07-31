@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/envelope"
 	"github.com/grubbyhacker/signal-plane/internal/eventbus"
 	"github.com/nats-io/nats-server/v2/server"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -32,7 +34,7 @@ func recoveryRoutes() []config.RepositoryTaskRoute {
 
 func TestDispatcherRecoveryProof(t *testing.T) {
 	t.Run("reset replay reconcile evidence and startup gate", proveRecovery)
-	t.Run("status failures remain incomplete and block startup", proveRecoveryFailure)
+	t.Run("permanent status failures become reportable recovery evidence", proveRecoveryFailure)
 }
 
 func proveRecovery(t *testing.T) {
@@ -53,7 +55,7 @@ func proveRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := recoveryStoreWithLaunchedJob(t, now)
-	broker := &statusSequence{statuses: map[string]dispatcher.RunStatus{"restored-run": {RunID: "restored-run", Status: "completed"}}}
+	broker := recoveryBroker("completed")
 	runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Routes: recoveryRoutes(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
 	report, err := runner.Run(ctx, Options{RecoveryID: "restore-20260713", Durable: "recovery-proof", Subject: recoverySubject, ManifestSequence: 2, Execute: true})
 	if err != nil {
@@ -62,11 +64,11 @@ func proveRecovery(t *testing.T) {
 	if report.Status != dispatcher.RecoveryCompleted || report.StartSequence != 3 || report.ReplayCount != 2 || report.RestoredNonterminalJobs != 1 || len(report.Reconciliations) != 1 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
-	if report.Reconciliations[0].BrokerStatus != "completed" || report.Reconciliations[0].ReconciledStatus != dispatcher.StateCompleted {
+	if report.Reconciliations[0].BrokerStatus != "completed" || report.Reconciliations[0].ReconciledStatus != dispatcher.StateReportPending {
 		t.Fatalf("unexpected reconciliation: %+v", report.Reconciliations[0])
 	}
-	if broker.calls != 1 {
-		t.Fatalf("status calls=%d want=1", broker.calls)
+	if broker.calls != 1 || broker.terminalCalls != 1 {
+		t.Fatalf("status calls=%d terminal calls=%d want=1 each", broker.calls, broker.terminalCalls)
 	}
 	deliveries, jobs, err := store.Counts(ctx)
 	if err != nil || deliveries != 3 || jobs != 2 {
@@ -93,27 +95,102 @@ func proveRecoveryFailure(t *testing.T) {
 			now := time.Unix(1_900_000_000, 0).UTC()
 			store := recoveryStoreWithLaunchedJob(t, now)
 			bus := recoveryBus(t)
-			broker := &statusSequence{statuses: map[string]dispatcher.RunStatus{"restored-run": test.result}, err: test.err}
+			broker := recoveryBroker(test.result.Status)
+			broker.err = test.err
 			runner := Runner{Store: store, Broker: broker, Stream: NATSStream{Bus: bus}, Routes: recoveryRoutes(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return now }, Timeout: time.Second}
-			_, err := runner.Run(context.Background(), Options{RecoveryID: "failed-restore", Durable: "failed-recovery", Subject: recoverySubject, ManifestSequence: 2, Execute: true})
-			if err == nil {
-				t.Fatal("recovery unexpectedly succeeded")
+			report, err := runner.Run(context.Background(), Options{RecoveryID: "failed-restore", Durable: "failed-recovery", Subject: recoverySubject, ManifestSequence: 2, Execute: true})
+			if err != nil || report.Status != dispatcher.RecoveryCompleted {
+				t.Fatalf("recovery report=%+v err=%v", report, err)
 			}
-			if gateErr := store.AssertRecoveryComplete(context.Background(), "failed-recovery", 3); gateErr == nil {
-				t.Fatal("normal startup bypassed incomplete recovery")
+			if gateErr := store.AssertRecoveryComplete(context.Background(), "failed-recovery", 3); gateErr != nil {
+				t.Fatalf("reportable failure did not complete recovery: %v", gateErr)
 			}
 			evidence, outcomes, evidenceErr := store.RecoveryEvidence(context.Background(), "failed-restore")
-			if evidenceErr != nil || evidence.Status != dispatcher.RecoveryIncomplete || evidence.Error == "" || len(outcomes) != 0 {
+			if evidenceErr != nil || evidence.Status != dispatcher.RecoveryCompleted || evidence.Error != "" || len(outcomes) != 1 || outcomes[0].ReconciledStatus != dispatcher.StateReportPending {
 				t.Fatalf("failure evidence=%+v outcomes=%v err=%v", evidence, outcomes, evidenceErr)
+			}
+			reportable, ok, claimErr := store.ClaimReportDue(context.Background(), now)
+			if claimErr != nil || !ok || reportable.Job.Status != dispatcher.StateReportPending {
+				t.Fatalf("reportable failure ok=%v report=%+v err=%v", ok, reportable, claimErr)
 			}
 		})
 	}
 }
 
 type statusSequence struct {
-	statuses map[string]dispatcher.RunStatus
-	err      error
-	calls    int
+	statuses      map[string]dispatcher.RunStatus
+	terminals     map[string]dispatcher.TerminalResult
+	err           error
+	calls         int
+	terminalCalls int
+}
+
+func (s *statusSequence) TerminalResult(_ context.Context, runID string) (dispatcher.TerminalResult, error) {
+	s.terminalCalls++
+	result, ok := s.terminals[runID]
+	if !ok {
+		return dispatcher.TerminalResult{}, errors.New("unknown fake terminal result")
+	}
+	return result, nil
+}
+
+func recoveryBroker(status string) *statusSequence {
+	return &statusSequence{
+		statuses: map[string]dispatcher.RunStatus{"restored-run": {RunID: "restored-run", Status: status}},
+		terminals: map[string]dispatcher.TerminalResult{"restored-run": {
+			Version: "repository-task-terminal-result/v1", RunID: "restored-run",
+			Profile: "repository-task", Repo: recoveryRepo, Status: "completed",
+			Outcome: "no_change_required", FinalizeReason: "worker_exit", TerminalSource: "exited",
+			IdempotencyKeyDigest: "digest", RequestFingerprint: "fingerprint",
+			LaunchConfigVersion: "route-config-v1", FinalSummary: "complete",
+			Result: map[string]any{
+				"version": "repository-task-worker-result/v1", "outcome": "no_change_required",
+				"detail": "complete", "stage": "completed", "run_id": "restored-run",
+				"repository": recoveryRepo, "base_branch": "main", "branch": "",
+				"verify_task": "verify", "verification": map[string]any{"status": "passed"},
+			},
+		}},
+	}
+}
+
+func TestRestoredTerminalProjectionIsExactlyOnceAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_900_000_000, 0).UTC()
+	path := filepath.Join(t.TempDir(), "dispatcher.db")
+	store, job := recoveryStoreAtPath(t, path, now)
+	broker := recoveryBroker("completed")
+	status := broker.statuses[job.BrokerRunID]
+	if state, err := dispatcher.ReconcileStatusResult(ctx, store, broker, job, status, now); err != nil || state != dispatcher.StateReportPending {
+		t.Fatalf("first projection state=%q err=%v", state, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dispatcher.OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, err := dispatcher.ReconcileStatusResult(ctx, store, broker, job, status, now.Add(time.Second)); err != nil || state != dispatcher.StateReportPending {
+		t.Fatalf("replayed projection state=%q err=%v", state, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var terminalRows, outboxRows int
+	if err := db.QueryRow(`SELECT count(*) FROM terminal_results`).Scan(&terminalRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM notification_outbox`).Scan(&outboxRows); err != nil {
+		t.Fatal(err)
+	}
+	if terminalRows != 1 || outboxRows != 1 {
+		t.Fatalf("terminal rows=%d outbox rows=%d", terminalRows, outboxRows)
+	}
 }
 
 func (s *statusSequence) Status(_ context.Context, runID string) (dispatcher.RunStatus, error) {
@@ -130,11 +207,17 @@ func (s *statusSequence) Status(_ context.Context, runID string) (dispatcher.Run
 
 func recoveryStoreWithLaunchedJob(t *testing.T, now time.Time) *dispatcher.Store {
 	t.Helper()
-	store, err := dispatcher.OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	store, _ := recoveryStoreAtPath(t, filepath.Join(t.TempDir(), "dispatcher.db"), now)
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func recoveryStoreAtPath(t *testing.T, path string, now time.Time) (*dispatcher.Store, dispatcher.Job) {
+	t.Helper()
+	store, err := dispatcher.OpenStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
 	candidate := dispatcher.Candidate{Repository: recoveryRepo, IssueNumber: 42, DeliveryID: "restored-delivery", RouteID: "fixture", Profile: "repository-task"}
 	if err := store.Record(context.Background(), candidate.DeliveryID, "accepted", 2, &candidate, now); err != nil {
 		t.Fatal(err)
@@ -146,7 +229,9 @@ func recoveryStoreWithLaunchedJob(t *testing.T, now time.Time) *dispatcher.Store
 	if err := store.MarkLaunched(context.Background(), work.Job.ID, "restored-run", now, now); err != nil {
 		t.Fatal(err)
 	}
-	return store
+	work.Job.BrokerRunID = "restored-run"
+	work.Job.Status = dispatcher.StateLaunched
+	return store, work.Job
 }
 
 func recoverySignal(delivery string, issue int64) envelope.Signal {
