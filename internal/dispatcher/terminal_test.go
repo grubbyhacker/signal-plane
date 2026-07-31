@@ -463,7 +463,7 @@ func TestTemporaryTerminalProjectionFailureRetriesWithoutFalseCompletion(t *test
 	}
 }
 
-func TestOpenStoreBackfillsUnreportedPrelaunchFailure(t *testing.T) {
+func TestReconcileFailedLaunchBindsBrokerTerminalResultWithoutLaunching(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dispatcher.db")
 	store, err := OpenStore(path)
 	if err != nil {
@@ -483,37 +483,46 @@ func TestOpenStoreBackfillsUnreportedPrelaunchFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
+	defer store.Close()
+	result := TerminalResult{
+		Version: terminalResultVersion, RunID: "run-6", Profile: "profile",
+		Repo: "owner/repo", Branch: "agent/run-6", Status: StateFailed, Outcome: StateFailed,
+		FinalizeReason: "launch_create_failed", TerminalSource: "startup_failure",
+		IdempotencyKeyDigest: "digest", RequestFingerprint: "fingerprint",
+		LaunchConfigVersion: "config", FailureStage: "sandbox_startup",
+		FailureReason: "image is unavailable",
 	}
-
-	reopened, err := OpenStore(path)
+	plan, err := store.ReconcileFailedLaunch(context.Background(), 6, "run-6", result, false, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
-	var state, body, outboxState, runID, source, stage, reason string
-	if err := reopened.db.QueryRow(`SELECT status FROM jobs WHERE id=6`).Scan(&state); err != nil {
+	if plan.Mode != "plan" || plan.Status != "validated" || plan.PriorAttempts != 34 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	var state, runID string
+	if err := store.db.QueryRow(`SELECT status,broker_run_id FROM jobs WHERE id=6`).Scan(&state, &runID); err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.db.QueryRow(`
-		SELECT o.body,o.status,t.run_id,t.terminal_source,t.failure_stage,t.failure_reason
-		FROM notification_outbox o JOIN terminal_results t ON t.job_id=o.job_id
-		WHERE o.job_id=6`).Scan(&body, &outboxState, &runID, &source, &stage, &reason); err != nil {
+	if state != StateFailed || runID != "" {
+		t.Fatalf("dry run changed state=%q run=%q", state, runID)
+	}
+	executed, err := store.ReconcileFailedLaunch(context.Background(), 6, "run-6", result, true, now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if state != StateReportPending || outboxState != "pending" || runID != "" ||
-		source != "signal_plane" || stage != "broker_launch" ||
-		reason != "launch retry window exhausted" {
-		t.Fatalf("state=%q outbox=%q run=%q source=%q stage=%q reason=%q", state, outboxState, runID, source, stage, reason)
+	if executed.Mode != "execute" || executed.Status != "requeued" {
+		t.Fatalf("execute=%+v", executed)
 	}
-	for _, want := range []string{
-		"Broker run: `not acknowledged`",
-		"Failure stage: `broker_launch`",
-		"Diagnostic: launch retry window exhausted",
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("comment missing %q:\n%s", want, body)
-		}
+	if err := store.db.QueryRow(`SELECT status,broker_run_id FROM jobs WHERE id=6`).Scan(&state, &runID); err != nil {
+		t.Fatal(err)
+	}
+	if state != StateLaunched || runID != "run-6" {
+		t.Fatalf("execute state=%q run=%q", state, runID)
+	}
+	var terminalRows, outboxRows int
+	_ = store.db.QueryRow(`SELECT count(*) FROM terminal_results WHERE job_id=6`).Scan(&terminalRows)
+	_ = store.db.QueryRow(`SELECT count(*) FROM notification_outbox WHERE job_id=6`).Scan(&outboxRows)
+	if terminalRows != 0 || outboxRows != 0 {
+		t.Fatalf("reconciliation bypassed normal outbox: terminal=%d outbox=%d", terminalRows, outboxRows)
 	}
 }

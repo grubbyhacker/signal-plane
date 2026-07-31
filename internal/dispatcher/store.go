@@ -182,12 +182,7 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	store := &Store{db: db}
-	if err := store.QueueUnreportedLaunchFailures(context.Background(), time.Now().UTC()); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("queue unreported launch failures: %w", err)
-	}
-	return store, nil
+	return &Store{db: db}, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
