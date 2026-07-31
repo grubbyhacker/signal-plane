@@ -106,6 +106,29 @@ type RepositoryTaskRoute struct {
 	Profile    string `yaml:"profile"`
 }
 
+func (r *RepositoryTaskRoute) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("dispatcher repository task route must be a mapping")
+	}
+	allowed := map[string]bool{
+		"id": true, "repository": true, "event": true,
+		"action": true, "label": true, "profile": true,
+	}
+	seen := map[string]bool{}
+	for i := 0; i < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		if !allowed[key] {
+			return fmt.Errorf("dispatcher repository task route rejects launch parameter %q", key)
+		}
+		if seen[key] {
+			return fmt.Errorf("dispatcher repository task route contains duplicate field %q", key)
+		}
+		seen[key] = true
+	}
+	type plainRoute RepositoryTaskRoute
+	return node.Decode((*plainRoute)(r))
+}
+
 type GatewayConfig struct {
 	Addr string `yaml:"addr"`
 }

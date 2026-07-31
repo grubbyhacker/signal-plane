@@ -84,6 +84,35 @@ func TestValidateDispatcherRequiresFixedBrokerOriginAndReviewedRoutes(t *testing
 	}
 }
 
+func TestLoadRejectsRepositoryTaskRouteModelSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := []byte(`
+gateway: {addr: ":8080"}
+nats: {url: "nats://127.0.0.1:4222", stream: SIGNALS, subjects: ["signals.>"]}
+dispatcher:
+  enabled: true
+  broker_url: https://broker.internal
+  broker_token_env: BROKER_TOKEN
+  workers: 1
+  repository_task_routes:
+    - id: route
+      repository: owner/repo
+      event: issues
+      action: labeled
+      label: automation:requested
+      profile: repository-task
+      model: arbitrary-model
+routes:
+  - {id: manual, path: /manual, source: manual, max_body_bytes: 1, publish_subject: signals.manual}
+`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), `rejects launch parameter "model"`) {
+		t.Fatalf("model selection error=%v", err)
+	}
+}
+
 func TestValidateWorkRouterAuthModesFailClosed(t *testing.T) {
 	base := Config{Gateway: GatewayConfig{Addr: ":8080"}, NATS: NATSConfig{URL: DefaultNATSURL, Stream: DefaultStreamName, Subjects: []string{DefaultSubject}}, Routes: []Route{{ID: "manual", Path: "/manual", Source: "manual", MaxBodyBytes: 1, PublishSubject: "signals.manual"}}}
 	base.WorkRouter = WorkRouterConfig{Enabled: true, Subject: "signals.github.webhook", Durable: "resume-release-router", DatabasePath: "jobs.db", YKMURL: "https://mcp.fleiglabs.cc/mcp", YKMAuthMode: "cloudflare_access", GitHubPrivateKeyPath: "/run/secrets/app.pem", YKMClientIDEnv: "CF_ID", YKMClientSecretEnv: "CF_SECRET"}

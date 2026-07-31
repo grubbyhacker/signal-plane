@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 18
+const SchemaVersion = 19
 
 type WorkState string
 

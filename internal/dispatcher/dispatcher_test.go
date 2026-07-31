@@ -383,11 +383,11 @@ func TestStatusLifecycleSerializesLaunches(t *testing.T) {
 
 func TestBrokerTerminalStatusMapping(t *testing.T) {
 	for _, tt := range []struct{ broker, stored string }{
-		{"completed", StateCompleted},
-		{"failed", StateFailed},
-		{"timed_out", StateTimedOut},
-		{"stopped", StateStopped},
-		{"cancelled", StateCancelled},
+		{"completed", StateReportPending},
+		{"failed", StateReportPending},
+		{"timed_out", StateReportPending},
+		{"stopped", StateReportPending},
+		{"cancelled", StateReportPending},
 	} {
 		t.Run(tt.broker, func(t *testing.T) {
 			ctx := context.Background()

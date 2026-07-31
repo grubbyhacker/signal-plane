@@ -122,11 +122,20 @@ Every recorded delivery includes its JetStream stream sequence. Restores use
 the managed, offline `github-task-dispatcher recover` procedure documented in
 [Dispatcher recovery](docs/dispatcher-recovery.md). It validates the restored
 checkpoint against the backup manifest, resets the configured durable to
-checkpoint + 1, replays the bounded backlog, reconciles every restored active
-run through the authenticated broker status endpoint, and records JSON plus
-SQLite evidence. The command is read-only unless `--execute` is supplied and
-never calls the broker launch endpoint. An incomplete recovery marker blocks
-normal dispatcher startup and therefore blocks new launches.
+checkpoint + 1, replays the bounded backlog, and reconciles every restored
+active run through authenticated status plus terminal-result projection. A
+restored terminal run enters the same atomic terminal-result/outbox path as a
+live run rather than being written directly to a terminal job state. The
+command records JSON plus SQLite evidence, is read-only unless `--execute` is
+supplied, and never calls the broker launch endpoint. An incomplete recovery
+marker blocks normal dispatcher startup and therefore blocks new launches.
+
+Status-fetch and terminal-projection failures before outbox creation are
+durably visible and bounded to 10 attempts with a two-second-to-one-minute
+backoff. Permanent failures and exhausted retries become a correlated Signal
+Plane failure result with a pending outbox entry. `report_blocked` is reserved
+for an existing outbox that could not be delivered; it is never a successful
+terminal state and never exists without terminal-result/outbox evidence.
 
 Temporary terminal-comment failures retry the same outbox row and stable
 idempotency key with a bounded 30-second-to-one-hour backoff. After 24 failed

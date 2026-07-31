@@ -156,7 +156,7 @@ func TestMigratedReportPendingDefersWithoutReporterThenReconciles(t *testing.T) 
 	}
 }
 
-func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo18(t *testing.T) {
+func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo19(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dispatcher.db")
 	deployed, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -167,6 +167,7 @@ func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo18(t *testing.T) {
 		`CREATE TABLE terminal_results (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), version TEXT NOT NULL, run_id TEXT NOT NULL, profile TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, outcome TEXT NOT NULL, final_summary TEXT NOT NULL, failure_stage TEXT NOT NULL DEFAULT '', failure_reason TEXT NOT NULL DEFAULT '', recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE notification_outbox (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id), terminal_result_version TEXT NOT NULL, body TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('pending','retry','delivered','blocked')), attempts INTEGER NOT NULL DEFAULT 0, due_at INTEGER NOT NULL, comment_id INTEGER, comment_url TEXT NOT NULL DEFAULT '', delivered_at INTEGER, last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`INSERT INTO jobs(id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,due_at,created_at,updated_at) VALUES(5,'semantic-5','route','repository-task','owner/repo',25,'delivery-5','run-5','report_pending',1,1,1)`,
+		`INSERT INTO jobs(id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,due_at,last_error,created_at,updated_at) VALUES(6,'semantic-6','route','repository-task','owner/repo',26,'delivery-6','run-6','report_blocked',1,'orphaned projection failure',1,1)`,
 		`INSERT INTO terminal_results(job_id,version,run_id,profile,repository,branch,status,outcome,final_summary,recorded_at) VALUES(5,'repository-task-terminal-result/v1','run-5','repository-task','owner/repo','agent/run-5','completed','no_change_required','complete output',1)`,
 		`INSERT INTO notification_outbox(job_id,terminal_result_version,body,idempotency_key,status,due_at,created_at,updated_at) VALUES(5,'repository-task-terminal-result/v1','body','key','pending',1,1,1)`,
 		`PRAGMA user_version=17`,
@@ -185,7 +186,7 @@ func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo18(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 18 {
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != SchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
 	var finalizeReason, terminalSource, idempotencyDigest, fingerprint, launchConfig, resultJSON, summary string
@@ -199,5 +200,13 @@ func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo18(t *testing.T) {
 	var outboxStatus string
 	if err := store.db.QueryRow(`SELECT status FROM notification_outbox WHERE job_id=5`).Scan(&outboxStatus); err != nil || outboxStatus != "pending" {
 		t.Fatalf("outbox status=%q err=%v", outboxStatus, err)
+	}
+	var orphanStatus string
+	var preOutboxAttempts int
+	if err := store.db.QueryRow(`SELECT status,pre_outbox_attempts FROM jobs WHERE id=6`).Scan(&orphanStatus, &preOutboxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if orphanStatus != StateReportPending || preOutboxAttempts != 0 {
+		t.Fatalf("orphaned projection status=%q pre-outbox attempts=%d", orphanStatus, preOutboxAttempts)
 	}
 }

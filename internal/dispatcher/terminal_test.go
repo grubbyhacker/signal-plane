@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -512,6 +513,115 @@ func TestTemporaryTerminalProjectionFailureRetriesWithoutFalseCompletion(t *test
 	}
 	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE id=5`).Scan(&status); err != nil || status != StateReportPending {
 		t.Fatalf("queued status=%s err=%v", status, err)
+	}
+}
+
+type preOutboxFailureBroker struct {
+	statusErr     error
+	projectionErr error
+	projected     TerminalResult
+}
+
+func (*preOutboxFailureBroker) Launch(context.Context, Job) (LaunchResult, error) {
+	return LaunchResult{}, errors.New("unexpected launch")
+}
+func (b *preOutboxFailureBroker) Status(context.Context, string) (RunStatus, error) {
+	if b.statusErr != nil {
+		return RunStatus{}, b.statusErr
+	}
+	return RunStatus{RunID: "run-5", Status: "completed"}, nil
+}
+func (b *preOutboxFailureBroker) TerminalResult(context.Context, string) (TerminalResult, error) {
+	return b.projected, b.projectionErr
+}
+
+func TestPermanentStatusFetchFailureQueuesReportableFailureExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(131_000, 0)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_ = terminalTestJob(t, store, now)
+	broker := &preOutboxFailureBroker{statusErr: BrokerError{Status: http.StatusUnauthorized, Message: "unauthorized"}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now); err != nil || !worked {
+		t.Fatalf("status failure worked=%v err=%v", worked, err)
+	}
+	if worked, err := RunOne(ctx, logger, NewMetrics(), store, broker, now.Add(time.Hour)); err != nil || worked {
+		t.Fatalf("reportable failure was reprocessed: worked=%v err=%v", worked, err)
+	}
+	var jobStatus, outcome, stage string
+	var terminalRows, outboxRows int
+	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE id=5`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT outcome,failure_stage FROM terminal_results WHERE job_id=5`).Scan(&outcome, &stage); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.db.QueryRow(`SELECT count(*) FROM terminal_results WHERE job_id=5`).Scan(&terminalRows)
+	_ = store.db.QueryRow(`SELECT count(*) FROM notification_outbox WHERE job_id=5`).Scan(&outboxRows)
+	if jobStatus != StateReportPending || outcome != StateFailed || stage != "broker_status" || terminalRows != 1 || outboxRows != 1 {
+		t.Fatalf("job=%s outcome=%s stage=%s terminal=%d outbox=%d", jobStatus, outcome, stage, terminalRows, outboxRows)
+	}
+}
+
+func TestPreOutboxProjectionRetriesAreBoundedAndNeverReportBlocked(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(132_000, 0)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	job := terminalTestJob(t, store, now)
+	if _, err := store.db.Exec(`UPDATE jobs SET pre_outbox_attempts=? WHERE id=?`, PreOutboxMaxAttempts-1, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	broker := &preOutboxFailureBroker{projectionErr: BrokerError{Transport: true, Message: "temporary projection outage"}}
+	if worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), store, broker, now); err != nil || !worked {
+		t.Fatalf("projection exhaustion worked=%v err=%v", worked, err)
+	}
+	var jobStatus, outboxStatus, outcome, stage string
+	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE id=5`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT status FROM notification_outbox WHERE job_id=5`).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT outcome,failure_stage FROM terminal_results WHERE job_id=5`).Scan(&outcome, &stage); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != StateReportPending || outboxStatus != "pending" || outcome != StateFailed || stage != "terminal_projection" {
+		t.Fatalf("job=%s outbox=%s outcome=%s stage=%s", jobStatus, outboxStatus, outcome, stage)
+	}
+}
+
+func TestInvalidTerminalCorrelationQueuesFailureInsteadOfOrphanedReportBlocked(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(133_000, 0)
+	store, err := OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_ = terminalTestJob(t, store, now)
+	projected := terminalTestResult("no_change_required")
+	projected.RunID = "wrong-run"
+	broker := &preOutboxFailureBroker{projected: projected}
+	if worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), store, broker, now); err != nil || !worked {
+		t.Fatalf("invalid correlation worked=%v err=%v", worked, err)
+	}
+	var jobStatus, outcome, stage string
+	if err := store.db.QueryRow(`SELECT status FROM jobs WHERE id=5`).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT outcome,failure_stage FROM terminal_results WHERE job_id=5`).Scan(&outcome, &stage); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != StateReportPending || outcome != StateFailed || stage != "terminal_correlation" {
+		t.Fatalf("job=%s outcome=%s stage=%s", jobStatus, outcome, stage)
 	}
 }
 

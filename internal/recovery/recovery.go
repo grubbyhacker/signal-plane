@@ -36,6 +36,7 @@ type Report struct {
 
 type StatusClient interface {
 	Status(context.Context, string) (dispatcher.RunStatus, error)
+	TerminalResult(context.Context, string) (dispatcher.TerminalResult, error)
 }
 
 type Stream interface {
@@ -126,26 +127,24 @@ func (r Runner) Run(ctx context.Context, opts Options) (report Report, err error
 		}
 	}
 
-	type checked struct {
-		job          dispatcher.Job
-		brokerStatus string
-		state        string
-	}
-	checkedStatuses := make([]checked, 0, len(jobs))
 	for _, job := range jobs {
 		status, statusErr := r.Broker.Status(ctx, job.BrokerRunID)
 		if statusErr != nil {
-			return report, fmt.Errorf("reconcile restored job %d: %w", job.ID, statusErr)
+			state, reconcileErr := dispatcher.ReconcileStatusFailure(ctx, r.Store, job, statusErr, now())
+			if reconcileErr != nil {
+				return report, fmt.Errorf("reconcile restored job %d status failure: %w", job.ID, reconcileErr)
+			}
+			if err := r.Store.RecordReconciliation(ctx, opts.RecoveryID, job, "status_fetch_failed", state, now()); err != nil {
+				return report, fmt.Errorf("record restored job %d reconciliation: %w", job.ID, err)
+			}
+			continue
 		}
-		state, stateErr := dispatcher.ReconciledStatus(status.Status)
-		if stateErr != nil {
-			return report, fmt.Errorf("reconcile restored job %d: %w", job.ID, stateErr)
+		state, reconcileErr := dispatcher.ReconcileStatusResult(ctx, r.Store, r.Broker, job, status, now())
+		if reconcileErr != nil {
+			return report, fmt.Errorf("reconcile restored job %d: %w", job.ID, reconcileErr)
 		}
-		checkedStatuses = append(checkedStatuses, checked{job: job, brokerStatus: status.Status, state: state})
-	}
-	for _, item := range checkedStatuses {
-		if err := r.Store.RecordReconciliation(ctx, opts.RecoveryID, item.job, item.brokerStatus, item.state, now()); err != nil {
-			return report, fmt.Errorf("record restored job %d reconciliation: %w", item.job.ID, err)
+		if err := r.Store.RecordReconciliation(ctx, opts.RecoveryID, job, status.Status, state, now()); err != nil {
+			return report, fmt.Errorf("record restored job %d reconciliation: %w", job.ID, err)
 		}
 	}
 	run, outcomes, err := r.Store.CompleteRecovery(ctx, opts.RecoveryID, len(jobs), now())
