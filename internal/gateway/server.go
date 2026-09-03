@@ -266,6 +266,19 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			TagName   string `json:"tag_name"`
 			UpdatedAt string `json:"updated_at"`
 		} `json:"release"`
+		CheckRun *struct {
+			HeadSHA      string `json:"head_sha"`
+			PullRequests []struct {
+				Number int64 `json:"number"`
+			} `json:"pull_requests"`
+		} `json:"check_run"`
+		CheckSuite *struct {
+			HeadSHA      string `json:"head_sha"`
+			PullRequests []struct {
+				Number int64 `json:"number"`
+			} `json:"pull_requests"`
+		} `json:"check_suite"`
+		SHA        string `json:"sha"`
 		Ref        string `json:"ref"`
 		Before     string `json:"before"`
 		After      string `json:"after"`
@@ -293,9 +306,23 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_push_identity"}
 		}
 	}
+	switch event {
+	case "check_run":
+		if decoded.CheckRun == nil || !validGitHubSHA(decoded.CheckRun.HeadSHA) {
+			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_ci_identity"}
+		}
+	case "check_suite":
+		if decoded.CheckSuite == nil || !validGitHubSHA(decoded.CheckSuite.HeadSHA) {
+			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_ci_identity"}
+		}
+	case "status":
+		if !validGitHubSHA(decoded.SHA) {
+			return admissionResult{}, rejectedRequest{status: http.StatusBadRequest, reason: "invalid_ci_identity"}
+		}
+	}
 	if len(route.Admission.Tuples) > 0 {
 		result, err := admitGitHubTuple(route, event, deliveryID, decoded.Action, decoded.Repository.FullName)
-		return enrichGitHubAdmission(result, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), err
+		return enrichGitHubAdmission(result, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.CheckRun, decoded.CheckSuite, decoded.SHA, decoded.Sender.Type), err
 	}
 	if !config.ContainsAllowed(route.Admission.Repositories, decoded.Repository.FullName) {
 		return admissionResult{}, rejectedRequest{status: http.StatusForbidden, reason: "repository_not_allowed"}
@@ -315,7 +342,7 @@ func admitGitHub(r *http.Request, route config.Route, body []byte) (admissionRes
 			ignoreReason: "action_filtered",
 		}, nil
 	}
-	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.Sender.Type), nil
+	return enrichGitHubAdmission(admissionResult{event: event, action: decoded.Action, deliveryID: deliveryID}, route, event, decoded.Repository.FullName, decoded.Ref, decoded.Before, decoded.After, pushedAt, decoded.HeadCommit, decoded.Issue, decoded.PullRequest, decoded.Release, decoded.CheckRun, decoded.CheckSuite, decoded.SHA, decoded.Sender.Type), nil
 }
 
 func enrichGitHubAdmission(result admissionResult, route config.Route, event, repository, ref, before, after string, pushedAt *time.Time, headCommit *struct {
@@ -333,7 +360,17 @@ func enrichGitHubAdmission(result admissionResult, route config.Route, event, re
 	ID        int64  `json:"id"`
 	TagName   string `json:"tag_name"`
 	UpdatedAt string `json:"updated_at"`
-}, actorType string) admissionResult {
+}, checkRun *struct {
+	HeadSHA      string `json:"head_sha"`
+	PullRequests []struct {
+		Number int64 `json:"number"`
+	} `json:"pull_requests"`
+}, checkSuite *struct {
+	HeadSHA      string `json:"head_sha"`
+	PullRequests []struct {
+		Number int64 `json:"number"`
+	} `json:"pull_requests"`
+}, statusSHA, actorType string) admissionResult {
 	result.namespace = repository
 	result.objectKind = event
 	result.authMethod = "github_hmac_sha256"
@@ -366,6 +403,26 @@ func enrichGitHubAdmission(result admissionResult, route config.Route, event, re
 		if result.sourceRevision == "" {
 			result.sourceRevision = release.TagName
 		}
+	}
+	// CI webhooks are merely durable wake-ups. Downstream code always asks the
+	// broker for the complete authoritative state of this exact head rather
+	// than interpreting one provider payload as the result.
+	if checkRun != nil {
+		result.objectKind, result.sourceRevision = "commit", checkRun.HeadSHA
+		result.objectID = checkRun.HeadSHA
+		if len(checkRun.PullRequests) == 1 && checkRun.PullRequests[0].Number > 0 {
+			result.objectKind, result.objectID = "pull_request", fmt.Sprint(checkRun.PullRequests[0].Number)
+		}
+	}
+	if checkSuite != nil {
+		result.objectKind, result.sourceRevision = "commit", checkSuite.HeadSHA
+		result.objectID = checkSuite.HeadSHA
+		if len(checkSuite.PullRequests) == 1 && checkSuite.PullRequests[0].Number > 0 {
+			result.objectKind, result.objectID = "pull_request", fmt.Sprint(checkSuite.PullRequests[0].Number)
+		}
+	}
+	if event == "status" && statusSHA != "" {
+		result.objectKind, result.objectID, result.sourceRevision = "commit", statusSHA, statusSHA
 	}
 	return result
 }
@@ -423,7 +480,7 @@ func admitGitHubTuple(route config.Route, event, deliveryID, action, repository 
 		if event == "ping" && !route.GitHub.PublishPing {
 			return admissionResult{ignore: true, ignoreReason: "ping"}, nil
 		}
-		if event == "push" {
+		if event == "push" || event == "status" {
 			return admissionResult{event: event, deliveryID: deliveryID}, nil
 		}
 		if !config.ContainsAllowed(tuple.Actions, action) {

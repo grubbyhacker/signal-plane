@@ -195,6 +195,44 @@ func TestGitHubRoutePublishesAllowedEvent(t *testing.T) {
 	}
 }
 
+func TestGitHubCILifecycleEventsPublishExactHeadIdentity(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	head := strings.Repeat("a", 40)
+	tests := []struct {
+		name, event, action, payload, objectKind, objectID string
+	}{
+		{"check run", "check_run", "completed", `{"action":"completed","repository":{"full_name":"grubbyhacker/repository-agent-fixture"},"check_run":{"head_sha":"` + head + `","pull_requests":[{"number":7}]},"sender":{"type":"Bot"}}`, "pull_request", "7"},
+		{"check suite without PR", "check_suite", "completed", `{"action":"completed","repository":{"full_name":"grubbyhacker/repository-agent-fixture"},"check_suite":{"head_sha":"` + head + `","pull_requests":[]},"sender":{"type":"Bot"}}`, "commit", head},
+		{"commit status", "status", "", `{"repository":{"full_name":"grubbyhacker/repository-agent-fixture"},"sha":"` + head + `","state":"failure","sender":{"type":"Bot"}}`, "commit", head},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &capturePublisher{}
+			route := config.Route{
+				ID: "github", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 4096, PublishSubject: "signals.github.webhook",
+				GitHub:    config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET"},
+				Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{{Repository: "grubbyhacker/repository-agent-fixture", Event: tt.event, Actions: []string{tt.action}}}},
+			}
+			body := []byte(tt.payload)
+			request := httptest.NewRequest(http.MethodPost, route.Path, bytes.NewReader(body))
+			request.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+			request.Header.Set("X-GitHub-Event", tt.event)
+			request.Header.Set("X-GitHub-Delivery", "delivery-"+strings.ReplaceAll(tt.name, " ", "-"))
+			recorder := httptest.NewRecorder()
+
+			New(slog.Default(), []config.Route{route}, publisher).Handler().ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusAccepted {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			meta := publisher.signal.Meta
+			if meta.SourceEvent != tt.event || meta.SourceAction != tt.action || meta.ObjectKind != tt.objectKind || meta.ObjectID != tt.objectID || meta.SourceRevision != head || meta.ActorClass != "bot" {
+				t.Fatalf("normalized CI metadata = %#v", meta)
+			}
+		})
+	}
+}
+
 func TestGitHubIssueAdmissionAcceptsRepositoryTimestampString(t *testing.T) {
 	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
 	publisher := &capturePublisher{}
@@ -392,6 +430,48 @@ func TestGitHubAdmissionTuplesRejectCartesianCrossCombinations(t *testing.T) {
 				t.Fatalf("status=%d body=%s published=%q", rec.Code, rec.Body.String(), publisher.subject)
 			}
 		})
+	}
+}
+
+func TestGitHubStatusTupleAcceptsActionlessPayload(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	route := config.Route{
+		ID: "github", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 1024, PublishSubject: "signals.github.webhook",
+		GitHub:    config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET"},
+		Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{{Repository: "example/automation-target", Event: "status"}}},
+	}
+	publisher := &capturePublisher{}
+	server := New(slog.Default(), []config.Route{route}, publisher)
+	body := []byte(`{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"example/automation-target"}}`)
+	req := httptest.NewRequest(http.MethodPost, route.Path, bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+	req.Header.Set("X-GitHub-Event", "status")
+	req.Header.Set("X-GitHub-Delivery", "status-delivery")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || publisher.subject == "" {
+		t.Fatalf("status=%d body=%s published=%q", rec.Code, rec.Body.String(), publisher.subject)
+	}
+}
+
+func TestGitHubCIWebhookRejectsMissingExactHead(t *testing.T) {
+	t.Setenv("SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET", "secret")
+	route := config.Route{
+		ID: "github", Path: "/webhooks/github", Source: "github", MaxBodyBytes: 1024, PublishSubject: "signals.github.webhook",
+		GitHub:    config.GitHubConfig{WebhookSecretEnv: "SIGNAL_GATEWAY_GITHUB_WEBHOOK_SECRET"},
+		Admission: config.AdmissionSet{Tuples: []config.AdmissionTuple{{Repository: "example/automation-target", Event: "check_run", Actions: []string{"completed"}}}},
+	}
+	publisher := &capturePublisher{}
+	server := New(slog.Default(), []config.Route{route}, publisher)
+	body := []byte(`{"action":"completed","check_run":{},"repository":{"full_name":"example/automation-target"}}`)
+	req := httptest.NewRequest(http.MethodPost, route.Path, bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", githubSignature("secret", body))
+	req.Header.Set("X-GitHub-Event", "check_run")
+	req.Header.Set("X-GitHub-Delivery", "missing-head")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || publisher.subject != "" {
+		t.Fatalf("status=%d body=%s published=%q", rec.Code, rec.Body.String(), publisher.subject)
 	}
 }
 

@@ -158,6 +158,13 @@ func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *
 		}
 		return fmt.Errorf("decode replayed signal: %w", err)
 	}
+	if isCIWakeEvent(signal.Meta.SourceEvent) && routeOwnsRepository(routes, signal.Meta.Namespace) {
+		if _, err := store.RecordCIEvent(ctx, signal, now); err != nil {
+			metrics.deliveries.WithLabelValues("store_failed").Inc()
+			logger.Error("persist CI wake-up failed", "error", err)
+			return fmt.Errorf("persist CI wake-up: %w", err)
+		}
+	}
 	candidate, outcome := Select(signal, routes)
 	var selected *Candidate
 	if outcome == "accepted" {
@@ -187,6 +194,15 @@ func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *
 	return nil
 }
 
+func routeOwnsRepository(routes []config.RepositoryTaskRoute, repository string) bool {
+	for _, route := range routes {
+		if route.Repository == repository {
+			return true
+		}
+	}
+	return false
+}
+
 type BrokerClient interface {
 	Launch(context.Context, Job) (LaunchResult, error)
 	Status(context.Context, string) (RunStatus, error)
@@ -196,6 +212,12 @@ type TerminalBroker interface {
 	Comment(context.Context, Job, string, string) (CommentResult, error)
 }
 type TerminalProjectionClient interface {
+	TerminalResult(context.Context, string) (TerminalResult, error)
+}
+type CIRepairBroker interface {
+	ObserveCI(context.Context, CIRepairTask, string) (CIObservation, error)
+	LaunchRepair(context.Context, CIRepairTask, CIRepairAttempt, time.Time) (LaunchResult, error)
+	Status(context.Context, string) (RunStatus, error)
 	TerminalResult(context.Context, string) (TerminalResult, error)
 }
 
@@ -246,6 +268,62 @@ func PreOutboxRetryDelay(attempt int) time.Duration {
 }
 
 func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, now time.Time) (bool, error) {
+	if store.ciPolicy.Validate() == nil {
+		if expired, err := store.ExpireCIDeadline(ctx, now, store.ciPolicy.MaxAttempts); err != nil || expired {
+			return expired, err
+		}
+	}
+	if terminal, ok := reportingBroker(broker); ok && store.ciPolicy.Validate() == nil {
+		if report, due, err := store.ClaimCIEscalation(ctx, now); err != nil || due {
+			if err != nil {
+				return due, err
+			}
+			result, err := terminal.Comment(ctx, report.Job, report.Body, report.OperationKey)
+			if err == nil {
+				return true, store.MarkCIEscalationDelivered(ctx, report, result, now)
+			}
+			return true, store.MarkCIEscalationFailure(ctx, report, IsRetryable(err), safeBrokerError(err), now)
+		}
+	}
+	if repair, ok := broker.(CIRepairBroker); ok && store.ciPolicy.Validate() == nil {
+		if work, due, err := store.ClaimCIReconciliation(ctx, now); err != nil || due {
+			if err != nil {
+				return due, err
+			}
+			operationCtx, cancel := context.WithTimeout(ctx, work.Task.DeadlineAt.Sub(now))
+			observation, observeErr := repair.ObserveCI(operationCtx, work.Task, work.HeadSHA)
+			cancel()
+			if observeErr != nil {
+				return true, store.FailCIReconciliation(ctx, work, observeErr, IsRetryable(observeErr), now)
+			}
+			return true, store.ApplyCIObservation(ctx, work, observation, store.ciPolicy.MaxAttempts, now)
+		}
+		if task, attempt, due, err := store.ClaimCIRepair(ctx, now); err != nil || due {
+			if err != nil {
+				return due, err
+			}
+			operationCtx, cancel := context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
+			result, launchErr := repair.LaunchRepair(operationCtx, task, attempt, now)
+			cancel()
+			if launchErr == nil {
+				return true, store.BindCIRepairRun(ctx, attempt, result.RunID, now)
+			}
+			retryDue := now.Add(LaunchRetryDelay(attempt.Operations + 1))
+			if retryDue.After(task.DeadlineAt) {
+				retryDue = task.DeadlineAt
+			}
+			if IsRetryable(launchErr) && attempt.Operations+1 < PreOutboxMaxAttempts && retryDue.After(now) {
+				return true, store.DeferCIRepairLaunch(ctx, attempt.AttemptKey, retryDue, launchErr, now)
+			}
+			return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(launchErr), store.ciPolicy.MaxAttempts, now)
+		}
+		if task, attempt, due, err := store.ClaimCIRepairStatus(ctx, now); err != nil || due {
+			if err != nil {
+				return due, err
+			}
+			return runCIRepairStatus(ctx, store, repair, task, attempt, now)
+		}
+	}
 	if terminal, ok := reportingBroker(broker); ok {
 		if report, due, err := store.ClaimReportDue(ctx, now); err != nil || due {
 			if err != nil {
@@ -314,6 +392,107 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 	}
 	_ = metrics.Refresh(ctx, store, now)
 	return true, storeErr
+}
+
+func runCIRepairStatus(ctx context.Context, store *Store, broker CIRepairBroker, task CIRepairTask, attempt CIRepairAttempt, now time.Time) (bool, error) {
+	operationCtx, cancel := context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
+	status, err := broker.Status(operationCtx, attempt.BrokerRunID)
+	cancel()
+	if err != nil {
+		return true, deferOrFailCIRepairStatus(ctx, store, task, attempt, err, now)
+	}
+	if status.RunID != attempt.BrokerRunID {
+		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, "broker repair status run correlation is invalid", store.ciPolicy.MaxAttempts, now)
+	}
+	state, err := ReconciledStatus(status.Status)
+	if err != nil {
+		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(err), store.ciPolicy.MaxAttempts, now)
+	}
+	if state == StateLaunched {
+		due := now.Add(StatusPollInterval)
+		if due.After(task.DeadlineAt) {
+			due = task.DeadlineAt
+		}
+		if !due.After(now) {
+			_, expireErr := store.ExpireCIDeadline(ctx, now, store.ciPolicy.MaxAttempts)
+			return true, expireErr
+		}
+		return true, store.ScheduleCIRepairStatus(ctx, attempt.AttemptKey, due, now)
+	}
+	operationCtx, cancel = context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
+	terminal, err := broker.TerminalResult(operationCtx, attempt.BrokerRunID)
+	cancel()
+	if err != nil {
+		return true, deferOrFailCIRepairStatus(ctx, store, task, attempt, err, now)
+	}
+	if err := validateCIRepairTerminal(task, attempt, terminal); err != nil {
+		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, err.Error(), store.ciPolicy.MaxAttempts, now)
+	}
+	if terminal.Outcome != "ready_for_review" {
+		if terminal.Outcome == "no_change_required" {
+			return true, store.FinishCIRepairFailure(ctx, attempt, "model_or_code", terminal.ModelExecutionStarted, "repair execution produced no candidate head", store.ciPolicy.MaxAttempts, now)
+		}
+		detail := strings.TrimSpace(terminal.FailureReason)
+		if detail == "" {
+			detail = "repair execution failed"
+		}
+		return true, store.FinishCIRepairFailure(ctx, attempt, terminal.FailureClass, terminal.ModelExecutionStarted, detail, store.ciPolicy.MaxAttempts, now)
+	}
+	if !terminal.ModelExecutionStarted {
+		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, "successful repair terminal lacks model execution proof", store.ciPolicy.MaxAttempts, now)
+	}
+	encoded, _ := json.Marshal(terminal.Result)
+	var worker workerTerminalResult
+	if err := json.Unmarshal(encoded, &worker); err != nil {
+		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, "repair terminal result is malformed", store.ciPolicy.MaxAttempts, now)
+	}
+	if err := store.ChargeCIRepairAttempt(ctx, attempt.AttemptKey, now); err != nil {
+		return true, err
+	}
+	return true, store.CompleteCIRepairDelivery(ctx, attempt.AttemptKey, CIRepairDelivery{
+		ExpectedOldHeadSHA: worker.ExpectedOldHeadSHA, CandidateHeadSHA: worker.CandidateHeadSHA,
+		DeliveredHeadSHA: worker.DeliveredHeadSHA, ValidatedTreeSHA: worker.ValidatedTreeSHA,
+		DeliveredTreeSHA: worker.DeliveredTreeSHA,
+	}, now)
+}
+
+func deferOrFailCIRepairStatus(ctx context.Context, store *Store, task CIRepairTask, attempt CIRepairAttempt, failure error, now time.Time) error {
+	due := now.Add(PreOutboxRetryDelay(attempt.Operations + 1))
+	if due.After(task.DeadlineAt) {
+		due = task.DeadlineAt
+	}
+	if IsRetryable(failure) && attempt.Operations+1 < PreOutboxMaxAttempts && due.After(now) {
+		return store.DeferCIRepairStatus(ctx, attempt.AttemptKey, due, failure, now)
+	}
+	return store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(failure), store.ciPolicy.MaxAttempts, now)
+}
+
+func validateCIRepairTerminal(task CIRepairTask, attempt CIRepairAttempt, terminal TerminalResult) error {
+	job := Job{BrokerRunID: attempt.BrokerRunID, Profile: attempt.AgentModel, Repository: task.Repository}
+	if terminal.Version != terminalResultVersion || terminal.RunID != job.BrokerRunID || terminal.Profile != job.Profile || terminal.Repo != job.Repository || !terminalOutcomeMatchesStatus(terminal.Status, terminal.Outcome, terminal.FailureStage) {
+		return errors.New("repair terminal result correlation is invalid")
+	}
+	if terminal.Outcome == "ready_for_review" {
+		encoded, err := json.Marshal(terminal.Result)
+		if err != nil {
+			return errors.New("repair terminal result is invalid")
+		}
+		var worker workerTerminalResult
+		if json.Unmarshal(encoded, &worker) != nil || worker.PullRequest == nil || worker.PullRequest.Number != task.PullNumber || worker.Branch != task.Branch ||
+			!githubSHA.MatchString(worker.ExpectedOldHeadSHA) || !githubSHA.MatchString(worker.CandidateHeadSHA) || !githubSHA.MatchString(worker.DeliveredHeadSHA) || !githubSHA.MatchString(worker.ValidatedTreeSHA) || !githubSHA.MatchString(worker.DeliveredTreeSHA) || worker.DeliveredTreeSHA != worker.ValidatedTreeSHA {
+			return errors.New("repair terminal lacks exact delivery provenance")
+		}
+		return nil
+	}
+	if terminal.Outcome == "no_change_required" {
+		return nil
+	}
+	switch terminal.FailureClass {
+	case "infrastructure", "model_or_code", "delivery_or_lease":
+		return nil
+	default:
+		return errors.New("repair terminal failure_class is invalid")
+	}
 }
 
 func safeLaunchFailureReason(err error) string {
@@ -393,10 +572,34 @@ func ReconcileStatusResult(ctx context.Context, store *Store, terminal TerminalP
 	if _, err := RenderTerminalComment(job, projected); err != nil {
 		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "terminal_rendering", err, false, now)
 	}
+	if projected.Outcome == "ready_for_review" && store.ciPolicy.Validate() == nil {
+		encoded, err := json.Marshal(projected)
+		if err != nil {
+			return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "ci_wait_serialization", err, false, now)
+		}
+		var worker workerTerminalResult
+		workerBytes, _ := json.Marshal(projected.Result)
+		if err := json.Unmarshal(workerBytes, &worker); err != nil || worker.PullRequest == nil {
+			return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "ci_wait_correlation", errors.New("ready result lacks durable pull request coordinates"), false, now)
+		}
+		if err := store.BeginCIWait(ctx, job, worker.PullRequest.Number, projected.Branch, worker.DeliveredHeadSHA, projected.Profile, now.Add(store.ciPolicy.Deadline), now, encoded); err != nil {
+			return "", err
+		}
+		return StateCIWaiting, nil
+	}
 	if err := store.QueueTerminalResult(ctx, job, projected, now); err != nil {
 		return "", err
 	}
 	return StateReportPending, nil
+}
+
+func isCIWakeEvent(event string) bool {
+	switch event {
+	case "check_run", "check_suite", "status", "pull_request":
+		return true
+	default:
+		return false
+	}
 }
 
 func reconcilePreOutboxFailure(ctx context.Context, store *Store, job Job, recoverableState, stage string, failure error, retryable bool, now time.Time) (string, error) {

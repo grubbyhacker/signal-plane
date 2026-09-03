@@ -26,13 +26,19 @@ const (
 	StateReportBlocked = "report_blocked"
 	StateStopped       = "stopped"
 	StateCancelled     = "cancelled"
+	StateCIWaiting     = "ci_waiting"
+	StateCIRepair      = "ci_repair"
+	StateCIEscalation  = "ci_escalation"
 	RecoveryIncomplete = "incomplete"
 	RecoveryCompleted  = "completed"
 )
 
-var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportRetry, StateReportBlocked, StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled}
+var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateCIWaiting, StateCIRepair, StateCIEscalation, StateReportPending, StateReportRetry, StateReportBlocked, StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled}
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db       *sql.DB
+	ciPolicy CIRepairPolicy
+}
 
 type Job struct {
 	ID                int64
@@ -52,22 +58,24 @@ type Job struct {
 // TerminalResult is the bounded, broker-projected work product. It is stored
 // verbatim enough for an operator to audit the exact immutable report input.
 type TerminalResult struct {
-	Version              string         `json:"version"`
-	RunID                string         `json:"run_id"`
-	Profile              string         `json:"profile"`
-	Repo                 string         `json:"repo"`
-	Branch               string         `json:"branch,omitempty"`
-	Status               string         `json:"status"`
-	Outcome              string         `json:"outcome"`
-	FinalizeReason       string         `json:"finalize_reason,omitempty"`
-	TerminalSource       string         `json:"terminal_source,omitempty"`
-	IdempotencyKeyDigest string         `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint   string         `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion  string         `json:"launch_config_version,omitempty"`
-	Result               map[string]any `json:"result,omitempty"`
-	FinalSummary         string         `json:"final_summary"`
-	FailureStage         string         `json:"failure_stage,omitempty"`
-	FailureReason        string         `json:"failure_reason,omitempty"`
+	Version               string         `json:"version"`
+	RunID                 string         `json:"run_id"`
+	Profile               string         `json:"profile"`
+	Repo                  string         `json:"repo"`
+	Branch                string         `json:"branch,omitempty"`
+	Status                string         `json:"status"`
+	Outcome               string         `json:"outcome"`
+	FinalizeReason        string         `json:"finalize_reason,omitempty"`
+	TerminalSource        string         `json:"terminal_source,omitempty"`
+	IdempotencyKeyDigest  string         `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint    string         `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion   string         `json:"launch_config_version,omitempty"`
+	Result                map[string]any `json:"result,omitempty"`
+	FinalSummary          string         `json:"final_summary"`
+	FailureStage          string         `json:"failure_stage,omitempty"`
+	FailureReason         string         `json:"failure_reason,omitempty"`
+	ModelExecutionStarted bool           `json:"model_execution_started"`
+	FailureClass          string         `json:"failure_class,omitempty"`
 }
 
 type Report struct {
