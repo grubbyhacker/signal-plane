@@ -151,7 +151,7 @@ func TestReadyForReviewTransitionsToDurableCIWaitWithoutRoutineComment(t *testin
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.ConfigureCIRepair(CIRepairPolicy{Deadline: 2 * time.Hour, MaxAttempts: 2}); err != nil {
+	if err := store.ConfigureCIRepair(CIRepairPolicy{ReconciliationWake: 2 * time.Hour, ActiveTimeout: time.Hour, MaxAttempts: 2}); err != nil {
 		t.Fatal(err)
 	}
 	job := terminalTestJob(t, store, now)

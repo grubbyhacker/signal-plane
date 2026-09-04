@@ -45,18 +45,25 @@ type CIRepairTask struct {
 	AgentModel     string
 	State          string
 	RepairAttempts int
-	DeadlineAt     time.Time
+	ReconcileAt    time.Time
 	LastCIState    string
 }
 
 type CIRepairPolicy struct {
-	Deadline    time.Duration
-	MaxAttempts int
+	ReconciliationWake time.Duration
+	ActiveTimeout      time.Duration
+	MaxAttempts        int
 }
 
 func (policy CIRepairPolicy) Validate() error {
-	if policy.Deadline < time.Minute || policy.Deadline > 7*24*time.Hour {
-		return errors.New("CI repair deadline must be between one minute and seven days")
+	if policy.ReconciliationWake == 0 {
+		policy.ReconciliationWake = policy.ActiveTimeout
+	}
+	if policy.ReconciliationWake < time.Minute || policy.ReconciliationWake > 7*24*time.Hour {
+		return errors.New("CI repair reconciliation wake must be between one minute and seven days")
+	}
+	if policy.ActiveTimeout < time.Minute || policy.ActiveTimeout > time.Hour {
+		return errors.New("CI repair active timeout must be between one minute and the reviewed 60-minute broker template maximum")
 	}
 	if policy.MaxAttempts < 1 || policy.MaxAttempts > 2 {
 		return errors.New("CI repair attempts must be between one and two")
@@ -64,7 +71,14 @@ func (policy CIRepairPolicy) Validate() error {
 	return nil
 }
 
+func durationSeconds(value time.Duration) int {
+	return int((value + time.Second - 1) / time.Second)
+}
+
 func (s *Store) ConfigureCIRepair(policy CIRepairPolicy) error {
+	if policy.ReconciliationWake == 0 {
+		policy.ReconciliationWake = policy.ActiveTimeout
+	}
 	if err := policy.Validate(); err != nil {
 		return err
 	}
@@ -98,15 +112,54 @@ type CIObservation struct {
 }
 
 type CIRepairAttempt struct {
-	AttemptKey    string
-	JobID         int64
-	AttemptNumber int
-	FailedHeadSHA string
-	AgentModel    string
-	State         string
-	Charged       bool
-	BrokerRunID   string
-	Operations    int
+	AttemptKey        string
+	JobID             int64
+	AttemptNumber     int
+	FailedHeadSHA     string
+	AgentModel        string
+	State             string
+	Charged           bool
+	BrokerRunID       string
+	MaxRuntimeSeconds int
+	ExternalWait      *CIExternalWait
+	ExternalResumeKey string
+	ResumedGeneration int
+	Operations        int
+}
+
+type CIExternalWait struct {
+	Service    string    `json:"service"`
+	Phase      string    `json:"phase"`
+	Operation  string    `json:"operation"`
+	Reason     string    `json:"reason"`
+	Generation int       `json:"generation"`
+	Since      time.Time `json:"since"`
+}
+
+func (wait CIExternalWait) Validate() error {
+	if wait.Service != "github" || wait.Generation < 1 || wait.Since.IsZero() {
+		return errors.New("external wait lacks GitHub identity, generation, or timestamp")
+	}
+	if wait.Reason != "unavailable" && wait.Reason != "rate_limited" {
+		return errors.New("external wait has invalid reason")
+	}
+	var operations map[string]bool
+	switch wait.Phase {
+	case "preparation":
+		operations = map[string]bool{"issue.read": true, "issue_comments.read": true, "pull.read": true, "ci.observe": true, "actions_job_log.read": true}
+	case "delivery":
+		operations = map[string]bool{"pull.read": true, "pull.reconcile": true, "pull.create": true, "git.push": true}
+	default:
+		return errors.New("external wait has invalid phase")
+	}
+	if !operations[wait.Operation] {
+		return errors.New("external wait has invalid operation")
+	}
+	return nil
+}
+
+func ciResumeKey(attemptKey string, generation int) string {
+	return fmt.Sprintf("ci-repair-resume:v1:%s:%d", attemptKey, generation)
 }
 
 type CIRepairDelivery struct {
@@ -124,11 +177,11 @@ type CIEscalationReport struct {
 	Attempts     int
 }
 
-// BeginCIWait makes ready-for-review a nonterminal state. Replays must bind the
-// same PR, branch, head, agent/model combination, and absolute deadline.
+// BeginCIWait makes ready-for-review a nonterminal state. deadline is the next
+// durable reconciliation wake, not an end-to-end lifecycle cutoff.
 func (s *Store) BeginCIWait(ctx context.Context, job Job, pullNumber int64, branch, headSHA, agentModel string, deadline, now time.Time, initialResult json.RawMessage) error {
 	if job.ID < 1 || job.Repository == "" || job.IssueNumber < 1 || pullNumber < 1 || branch == "" || !githubSHA.MatchString(headSHA) || agentModel == "" || !deadline.After(now) || len(initialResult) == 0 || len(initialResult) > 64*1024 || !json.Valid(initialResult) {
-		return errors.New("CI wait requires durable job, PR, branch, exact head, agent/model, and future deadline")
+		return errors.New("CI wait requires durable job, PR, branch, exact head, agent/model, and future reconciliation wake")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -146,8 +199,8 @@ func (s *Store) BeginCIWait(ctx context.Context, job Job, pullNumber int64, bran
 	if err != nil {
 		return err
 	}
-	stored.DeadlineAt = time.UnixMilli(deadlineMillis).UTC()
-	if stored.Repository != job.Repository || stored.IssueNumber != job.IssueNumber || stored.PullNumber != pullNumber || stored.Branch != branch || stored.CurrentHeadSHA != headSHA || stored.AgentModel != agentModel || !stored.DeadlineAt.Equal(deadline.UTC()) || storedInitial != string(initialResult) {
+	stored.ReconcileAt = time.UnixMilli(deadlineMillis).UTC()
+	if stored.Repository != job.Repository || stored.IssueNumber != job.IssueNumber || stored.PullNumber != pullNumber || stored.Branch != branch || stored.CurrentHeadSHA != headSHA || stored.AgentModel != agentModel || !stored.ReconcileAt.Equal(deadline.UTC()) || storedInitial != string(initialResult) {
 		return errors.New("ready-for-review replay conflicts with durable CI coordinates")
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=?,last_error='' WHERE id=? AND status IN (?,?)`, StateCIWaiting, deadline.UnixMilli(), now.UnixMilli(), job.ID, StateLaunched, StateCIWaiting); err != nil {
@@ -192,18 +245,22 @@ func (s *Store) RecordCIEvent(ctx context.Context, signal envelope.Signal, now t
 	if inserted == 0 {
 		return false, tx.Commit()
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT job_id,current_head_sha FROM repository_ci_tasks WHERE repository=? AND state=? AND ((? > 0 AND pull_number=?) OR current_head_sha=?)`, signal.Meta.Namespace, CIWaiting, pullNumber, pullNumber, signal.Meta.SourceRevision)
+	rows, err := tx.QueryContext(ctx, `SELECT t.job_id,t.current_head_sha,t.state,COALESCE(a.attempt_key,''),COALESCE(a.external_wait_generation,0),COALESCE(a.resumed_external_wait_generation,0) FROM repository_ci_tasks t LEFT JOIN repository_ci_attempts a ON a.job_id=t.job_id AND a.state='running' WHERE t.repository=? AND t.state IN ('waiting_ci','repair_running') AND ((? > 0 AND t.pull_number=?) OR t.current_head_sha=?)`, signal.Meta.Namespace, pullNumber, pullNumber, signal.Meta.SourceRevision)
 	if err != nil {
 		return false, err
 	}
 	type target struct {
 		jobID       int64
 		currentHead string
+		state       string
+		attemptKey  string
+		waitGen     int
+		resumedGen  int
 	}
 	var targets []target
 	for rows.Next() {
 		var t target
-		if err := rows.Scan(&t.jobID, &t.currentHead); err != nil {
+		if err := rows.Scan(&t.jobID, &t.currentHead, &t.state, &t.attemptKey, &t.waitGen, &t.resumedGen); err != nil {
 			rows.Close()
 			return false, err
 		}
@@ -214,6 +271,16 @@ func (s *Store) RecordCIEvent(ctx context.Context, signal envelope.Signal, now t
 	}
 	queued := false
 	for _, target := range targets {
+		if target.state == CIRepairRunning {
+			if target.attemptKey == "" || target.waitGen <= target.resumedGen {
+				continue
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET due_at=MIN(due_at,?),updated_at=? WHERE attempt_key=? AND state='running'`, now.UnixMilli(), now.UnixMilli(), target.attemptKey); err != nil {
+				return false, err
+			}
+			queued = true
+			continue
+		}
 		head := signal.Meta.SourceRevision
 		key := ciReconcileKey(target.jobID, head)
 		_, err = tx.ExecContext(ctx, `INSERT INTO repository_ci_reconciliations(operation_key,job_id,head_sha,state,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(job_id,head_sha) DO UPDATE SET state=CASE WHEN repository_ci_reconciliations.state='running' THEN 'running' ELSE 'queued' END,dirty=CASE WHEN repository_ci_reconciliations.state='running' THEN 1 ELSE repository_ci_reconciliations.dirty END,due_at=excluded.due_at,updated_at=excluded.updated_at`, key, target.jobID, head, "queued", now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
@@ -251,7 +318,7 @@ func (s *Store) ClaimCIReconciliation(ctx context.Context, now time.Time) (CIRec
 		return CIReconciliation{}, false, err
 	}
 	work.DeadlineWake = deadlineWake == 1
-	work.Task.DeadlineAt = time.UnixMilli(deadlineMillis).UTC()
+	work.Task.ReconcileAt = time.UnixMilli(deadlineMillis).UTC()
 	_, err = tx.ExecContext(ctx, `UPDATE repository_ci_reconciliations SET state='running',dirty=0,due_at=?,updated_at=? WHERE operation_key=?`, now.Add(ciReconcileLease).UnixMilli(), now.UnixMilli(), work.OperationKey)
 	if err != nil {
 		return CIReconciliation{}, false, err
@@ -263,11 +330,8 @@ func (s *Store) FailCIReconciliation(ctx context.Context, work CIReconciliation,
 	if work.OperationKey == "" || failure == nil {
 		return errors.New("CI reconciliation failure requires operation identity and error")
 	}
-	if retry && !work.DeadlineWake && now.Before(work.Task.DeadlineAt) && work.Operations < 4 {
+	if retry {
 		due := now.Add(PreOutboxRetryDelay(work.Operations + 1))
-		if due.After(work.Task.DeadlineAt) {
-			due = work.Task.DeadlineAt
-		}
 		result, err := s.db.ExecContext(ctx, `UPDATE repository_ci_reconciliations SET state='queued',operation_attempts=operation_attempts+1,last_error=?,due_at=?,updated_at=? WHERE operation_key=? AND state='running'`, safeBrokerError(failure), due.UnixMilli(), now.UnixMilli(), work.OperationKey)
 		return expectOne(result, err, "defer CI reconciliation")
 	}
@@ -280,9 +344,18 @@ func (s *Store) FailCIReconciliation(ctx context.Context, work CIReconciliation,
 	if err := expectOne(result, err, "complete failed CI reconciliation"); err != nil {
 		return err
 	}
-	if work.DeadlineWake || !now.Before(work.Task.DeadlineAt) {
+	var brokerErr BrokerError
+	if errors.As(failure, &brokerErr) && brokerErr.Code == "stale_pull_head" {
+		nextWake := now.Add(s.ciPolicy.ReconciliationWake)
+		if _, err := tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET deadline_at=?,updated_at=? WHERE job_id=? AND state='waiting_ci'`, nextWake.UnixMilli(), now.UnixMilli(), work.Task.JobID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET due_at=?,updated_at=? WHERE id=? AND status=?`, nextWake.UnixMilli(), now.UnixMilli(), work.Task.JobID, StateCIWaiting); err != nil {
+			return err
+		}
+	} else {
 		observation := CIObservation{Repository: work.Task.Repository, PullNumber: work.Task.PullNumber, HeadSHA: work.Task.CurrentHeadSHA, State: CIStateInfrastructure, FailedChecks: []FailedCheck{{Name: "CI observation", Conclusion: "unavailable", Summary: safeBrokerError(failure)}}}
-		if err := queueCIEscalation(ctx, tx, work.Task.JobID, observation, work.Task.RepairAttempts, s.ciPolicy.MaxAttempts, "observation_unavailable", now); err != nil {
+		if err := queueCIEscalation(ctx, tx, work.Task.JobID, observation, work.Task.RepairAttempts, s.ciPolicy.MaxAttempts, "observation_invalid", now); err != nil {
 			return err
 		}
 	}
@@ -313,19 +386,14 @@ func (s *Store) ApplyCIObservation(ctx context.Context, work CIReconciliation, o
 	defer tx.Rollback()
 	var state, currentHead, agentModel string
 	var attempts int
-	var deadlineMillis int64
-	err = tx.QueryRowContext(ctx, `SELECT state,current_head_sha,agent_model,repair_attempts,deadline_at FROM repository_ci_tasks WHERE job_id=?`, work.Task.JobID).Scan(&state, &currentHead, &agentModel, &attempts, &deadlineMillis)
+	err = tx.QueryRowContext(ctx, `SELECT state,current_head_sha,agent_model,repair_attempts FROM repository_ci_tasks WHERE job_id=?`, work.Task.JobID).Scan(&state, &currentHead, &agentModel, &attempts)
 	if err != nil {
 		return err
 	}
 	if state == CICompleted || state == CIEscalated || state == CIEscalationPending || state == CIEscalationBlocked {
 		return tx.Commit()
 	}
-	deadline := time.UnixMilli(deadlineMillis)
-	preserveWake := observation.State == CIStatePending || observation.State == CIStateInfrastructure
-	if !now.Before(deadline) {
-		preserveWake = false
-	}
+	preserveWake := observation.State == CIStatePending
 	if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_reconciliations SET state=CASE WHEN dirty=1 AND ?=1 THEN 'queued' ELSE 'completed' END,due_at=CASE WHEN dirty=1 AND ?=1 THEN ? ELSE due_at END,result_digest=?,updated_at=? WHERE operation_key=?`, preserveWake, preserveWake, now.UnixMilli(), "sha256:"+hex.EncodeToString(digest[:]), now.UnixMilli(), work.OperationKey); err != nil {
 		return err
 	}
@@ -354,20 +422,17 @@ func (s *Store) ApplyCIObservation(ctx context.Context, work CIReconciliation, o
 		}
 		return tx.Commit()
 	}
-	if !now.Before(deadline) || (observation.State == CIStateCodeFailure && attempts >= maxAttempts) {
-		reason := "attempts_exhausted"
-		if !now.Before(deadline) {
-			reason = "deadline_expired"
-		}
-		if err := queueCIEscalation(ctx, tx, work.Task.JobID, observation, attempts, maxAttempts, reason, now); err != nil {
+	if observation.State == CIStateCodeFailure && attempts >= maxAttempts {
+		if err := queueCIEscalation(ctx, tx, work.Task.JobID, observation, attempts, maxAttempts, "attempts_exhausted", now); err != nil {
 			return err
 		}
 		return tx.Commit()
 	}
 	if observation.State != CIStateCodeFailure {
-		_, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='waiting_ci',updated_at=? WHERE job_id=?`, now.UnixMilli(), work.Task.JobID)
+		nextWake := now.Add(s.ciPolicy.ReconciliationWake)
+		_, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='waiting_ci',deadline_at=?,updated_at=? WHERE job_id=?`, nextWake.UnixMilli(), now.UnixMilli(), work.Task.JobID)
 		if err == nil {
-			_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=?`, StateCIWaiting, deadline.UnixMilli(), now.UnixMilli(), work.Task.JobID)
+			_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=?`, StateCIWaiting, nextWake.UnixMilli(), now.UnixMilli(), work.Task.JobID)
 		}
 		if err != nil {
 			return err
@@ -376,53 +441,18 @@ func (s *Store) ApplyCIObservation(ctx context.Context, work CIReconciliation, o
 	}
 	number := attempts + 1
 	attemptKey := fmt.Sprintf("ci-repair:v1:%d:%s:%s:%d", work.Task.JobID, agentModel, currentHead, number)
-	_, err = tx.ExecContext(ctx, `INSERT INTO repository_ci_attempts(attempt_key,job_id,attempt_number,failed_head_sha,agent_model,state,expected_old_head_sha,due_at,created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?,?,?) ON CONFLICT(attempt_key) DO NOTHING`, attemptKey, work.Task.JobID, number, currentHead, agentModel, currentHead, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
+	maxRuntimeSeconds := durationSeconds(s.ciPolicy.ActiveTimeout)
+	_, err = tx.ExecContext(ctx, `INSERT INTO repository_ci_attempts(attempt_key,job_id,attempt_number,failed_head_sha,agent_model,state,max_runtime_seconds,expected_old_head_sha,due_at,created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?,?,?,?) ON CONFLICT(attempt_key) DO NOTHING`, attemptKey, work.Task.JobID, number, currentHead, agentModel, maxRuntimeSeconds, currentHead, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
 	if err == nil {
 		_, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='repair_ready',updated_at=? WHERE job_id=?`, now.UnixMilli(), work.Task.JobID)
 	}
 	if err == nil {
-		_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=?`, StateCIRepair, deadline.UnixMilli(), now.UnixMilli(), work.Task.JobID)
+		_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=?`, StateCIRepair, now.UnixMilli(), now.UnixMilli(), work.Task.JobID)
 	}
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
-}
-
-// ExpireCIDeadline bounds an authorized repair execution. Waiting-CI tasks use
-// ClaimCIReconciliation's deadline wake so GitHub gets one final authoritative
-// say before escalation.
-func (s *Store) ExpireCIDeadline(ctx context.Context, now time.Time, maxAttempts int) (bool, error) {
-	if maxAttempts < 1 || maxAttempts > 2 {
-		return false, errors.New("CI repair attempts must be between one and two")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	var jobID, pullNumber int64
-	var repository, headSHA, lastJSON string
-	var attempts int
-	err = tx.QueryRowContext(ctx, `SELECT job_id,repository,pull_number,current_head_sha,repair_attempts,last_ci_json FROM repository_ci_tasks WHERE state IN ('repair_ready','repair_running') AND deadline_at<=? ORDER BY deadline_at,job_id LIMIT 1`, now.UnixMilli()).Scan(&jobID, &repository, &pullNumber, &headSHA, &attempts, &lastJSON)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, tx.Commit()
-	}
-	if err != nil {
-		return false, err
-	}
-	observation := CIObservation{Repository: repository, PullNumber: pullNumber, HeadSHA: headSHA, State: CIStatePending}
-	if lastJSON != "" {
-		var stored CIObservation
-		if json.Unmarshal([]byte(lastJSON), &stored) == nil && stored.Repository == repository && stored.PullNumber == pullNumber && githubSHA.MatchString(stored.HeadSHA) {
-			observation = stored
-			observation.HeadSHA = headSHA
-		}
-	}
-	if err := queueCIEscalation(ctx, tx, jobID, observation, attempts, maxAttempts, "deadline_expired", now); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
 }
 
 func (s *Store) ClaimCIRepair(ctx context.Context, now time.Time) (CIRepairTask, CIRepairAttempt, bool, error) {
@@ -434,8 +464,7 @@ func (s *Store) ClaimCIRepair(ctx context.Context, now time.Time) (CIRepairTask,
 	var task CIRepairTask
 	var attempt CIRepairAttempt
 	var charged int
-	var deadlineMillis int64
-	err = tx.QueryRowContext(ctx, `SELECT t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.deadline_at,t.last_ci_state,a.attempt_key,a.attempt_number,a.failed_head_sha,a.agent_model,a.state,a.charged,a.broker_run_id,a.operation_attempts FROM repository_ci_tasks t JOIN repository_ci_attempts a ON a.job_id=t.job_id WHERE t.state='repair_ready' AND a.state='ready' AND a.due_at<=? ORDER BY a.due_at,t.job_id LIMIT 1`, now.UnixMilli()).Scan(&task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &deadlineMillis, &task.LastCIState, &attempt.AttemptKey, &attempt.AttemptNumber, &attempt.FailedHeadSHA, &attempt.AgentModel, &attempt.State, &charged, &attempt.BrokerRunID, &attempt.Operations)
+	err = tx.QueryRowContext(ctx, `SELECT t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.last_ci_state,a.attempt_key,a.attempt_number,a.failed_head_sha,a.agent_model,a.state,a.charged,a.broker_run_id,a.max_runtime_seconds,a.operation_attempts FROM repository_ci_tasks t JOIN repository_ci_attempts a ON a.job_id=t.job_id WHERE t.state='repair_ready' AND a.state='ready' AND a.due_at<=? ORDER BY a.due_at,t.job_id LIMIT 1`, now.UnixMilli()).Scan(&task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &task.LastCIState, &attempt.AttemptKey, &attempt.AttemptNumber, &attempt.FailedHeadSHA, &attempt.AgentModel, &attempt.State, &charged, &attempt.BrokerRunID, &attempt.MaxRuntimeSeconds, &attempt.Operations)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return task, attempt, false, err
@@ -445,9 +474,14 @@ func (s *Store) ClaimCIRepair(ctx context.Context, now time.Time) (CIRepairTask,
 	if err != nil {
 		return task, attempt, false, err
 	}
-	task.DeadlineAt = time.UnixMilli(deadlineMillis).UTC()
 	attempt.JobID = task.JobID
 	attempt.Charged = charged == 1
+	if attempt.MaxRuntimeSeconds == 0 {
+		attempt.MaxRuntimeSeconds = durationSeconds(s.ciPolicy.ActiveTimeout)
+		if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET max_runtime_seconds=?,updated_at=? WHERE attempt_key=? AND max_runtime_seconds=0`, attempt.MaxRuntimeSeconds, now.UnixMilli(), attempt.AttemptKey); err != nil {
+			return task, attempt, false, err
+		}
+	}
 	return task, attempt, true, tx.Commit()
 }
 
@@ -498,21 +532,96 @@ func (s *Store) ClaimCIRepairStatus(ctx context.Context, now time.Time) (CIRepai
 	var task CIRepairTask
 	var attempt CIRepairAttempt
 	var charged int
-	var deadlineMillis int64
-	err = tx.QueryRowContext(ctx, `SELECT t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.deadline_at,t.last_ci_state,a.attempt_key,a.attempt_number,a.failed_head_sha,a.agent_model,a.state,a.charged,a.broker_run_id,a.operation_attempts FROM repository_ci_tasks t JOIN repository_ci_attempts a ON a.job_id=t.job_id WHERE t.state='repair_running' AND a.state='running' AND a.due_at<=? ORDER BY a.due_at,t.job_id LIMIT 1`, now.UnixMilli()).Scan(&task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &deadlineMillis, &task.LastCIState, &attempt.AttemptKey, &attempt.AttemptNumber, &attempt.FailedHeadSHA, &attempt.AgentModel, &attempt.State, &charged, &attempt.BrokerRunID, &attempt.Operations)
+	var wait CIExternalWait
+	var waitSince sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.last_ci_state,a.attempt_key,a.attempt_number,a.failed_head_sha,a.agent_model,a.state,a.charged,a.broker_run_id,a.max_runtime_seconds,a.external_wait_service,a.external_wait_phase,a.external_wait_operation,a.external_wait_reason,a.external_wait_generation,a.external_wait_since,a.external_resume_key,a.resumed_external_wait_generation,a.operation_attempts FROM repository_ci_tasks t JOIN repository_ci_attempts a ON a.job_id=t.job_id WHERE t.state='repair_running' AND a.state='running' AND a.due_at<=? ORDER BY a.due_at,t.job_id LIMIT 1`, now.UnixMilli()).Scan(&task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &task.LastCIState, &attempt.AttemptKey, &attempt.AttemptNumber, &attempt.FailedHeadSHA, &attempt.AgentModel, &attempt.State, &charged, &attempt.BrokerRunID, &attempt.MaxRuntimeSeconds, &wait.Service, &wait.Phase, &wait.Operation, &wait.Reason, &wait.Generation, &waitSince, &attempt.ExternalResumeKey, &attempt.ResumedGeneration, &attempt.Operations)
 	if errors.Is(err, sql.ErrNoRows) {
 		return task, attempt, false, tx.Commit()
 	}
 	if err != nil {
 		return task, attempt, false, err
 	}
-	task.DeadlineAt = time.UnixMilli(deadlineMillis).UTC()
 	attempt.JobID = task.JobID
 	attempt.Charged = charged == 1
+	if attempt.MaxRuntimeSeconds == 0 {
+		attempt.MaxRuntimeSeconds = durationSeconds(s.ciPolicy.ActiveTimeout)
+		if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET max_runtime_seconds=?,updated_at=? WHERE attempt_key=? AND max_runtime_seconds=0`, attempt.MaxRuntimeSeconds, now.UnixMilli(), attempt.AttemptKey); err != nil {
+			return task, attempt, false, err
+		}
+	}
+	if wait.Generation > 0 {
+		if waitSince.Valid {
+			wait.Since = time.UnixMilli(waitSince.Int64).UTC()
+		}
+		attempt.ExternalWait = &wait
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET due_at=?,updated_at=? WHERE attempt_key=? AND state='running'`, now.Add(ciReconcileLease).UnixMilli(), now.UnixMilli(), attempt.AttemptKey); err != nil {
 		return task, attempt, false, err
 	}
 	return task, attempt, true, tx.Commit()
+}
+
+func (s *Store) RecordCIRepairExternalWait(ctx context.Context, attempt CIRepairAttempt, wait CIExternalWait, now time.Time) (string, error) {
+	if attempt.AttemptKey == "" || attempt.BrokerRunID == "" {
+		return "", errors.New("external wait requires durable attempt and broker run identities")
+	}
+	if err := wait.Validate(); err != nil {
+		return "", err
+	}
+	key := ciResumeKey(attempt.AttemptKey, wait.Generation)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var state, runID, service, phase, operation, reason, storedKey string
+	var generation, resumed int
+	var since sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT state,broker_run_id,external_wait_service,external_wait_phase,external_wait_operation,external_wait_reason,external_wait_generation,external_wait_since,external_resume_key,resumed_external_wait_generation FROM repository_ci_attempts WHERE attempt_key=?`, attempt.AttemptKey).Scan(&state, &runID, &service, &phase, &operation, &reason, &generation, &since, &storedKey, &resumed); err != nil {
+		return "", err
+	}
+	if state != "running" || runID != attempt.BrokerRunID {
+		return "", errors.New("external wait does not match the running repair attempt")
+	}
+	if wait.Generation < generation || wait.Generation <= resumed {
+		return "", errors.New("external wait generation is stale")
+	}
+	if wait.Generation == generation {
+		if service != wait.Service || phase != wait.Phase || operation != wait.Operation || reason != wait.Reason || !since.Valid || since.Int64 != wait.Since.UnixMilli() || storedKey != key {
+			return "", errors.New("external wait replay conflicts with durable state")
+		}
+		return key, tx.Commit()
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET external_wait_service=?,external_wait_phase=?,external_wait_operation=?,external_wait_reason=?,external_wait_generation=?,external_wait_since=?,external_resume_key=?,last_error='',updated_at=? WHERE attempt_key=? AND state='running'`, wait.Service, wait.Phase, wait.Operation, wait.Reason, wait.Generation, wait.Since.UnixMilli(), key, now.UnixMilli(), attempt.AttemptKey)
+	if err != nil {
+		return "", err
+	}
+	return key, tx.Commit()
+}
+
+func (s *Store) MarkCIRepairExternalResumed(ctx context.Context, attemptKey, resumeKey string, generation int, due, now time.Time) error {
+	if attemptKey == "" || resumeKey == "" || generation < 1 || !due.After(now) {
+		return errors.New("external resume requires durable identity, generation, and future status wake")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE repository_ci_attempts SET resumed_external_wait_generation=?,last_error='',due_at=?,updated_at=? WHERE attempt_key=? AND state='running' AND external_wait_generation=? AND external_resume_key=? AND resumed_external_wait_generation<?`, generation, due.UnixMilli(), now.UnixMilli(), attemptKey, generation, resumeKey, generation)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 1 {
+		return nil
+	}
+	var stored int
+	if err := s.db.QueryRowContext(ctx, `SELECT resumed_external_wait_generation FROM repository_ci_attempts WHERE attempt_key=?`, attemptKey).Scan(&stored); err != nil {
+		return err
+	}
+	if stored >= generation {
+		return nil
+	}
+	return errors.New("external resume no longer matches the running wait")
 }
 
 func (s *Store) DeferCIRepairStatus(ctx context.Context, attemptKey string, due time.Time, failure error, now time.Time) error {
@@ -546,10 +655,9 @@ func (s *Store) FinishCIRepairFailure(ctx context.Context, attempt CIRepairAttem
 	}
 	defer tx.Rollback()
 	var task CIRepairTask
-	var deadlineMillis int64
 	var state, storedClass, lastJSON string
 	var charged int
-	err = tx.QueryRowContext(ctx, `SELECT a.state,a.charged,a.failure_class,t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.deadline_at,t.last_ci_json FROM repository_ci_attempts a JOIN repository_ci_tasks t ON t.job_id=a.job_id WHERE a.attempt_key=?`, attempt.AttemptKey).Scan(&state, &charged, &storedClass, &task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &deadlineMillis, &lastJSON)
+	err = tx.QueryRowContext(ctx, `SELECT a.state,a.charged,a.failure_class,t.job_id,t.repository,t.issue_number,t.pull_number,t.branch,t.current_head_sha,t.agent_model,t.state,t.repair_attempts,t.last_ci_json FROM repository_ci_attempts a JOIN repository_ci_tasks t ON t.job_id=a.job_id WHERE a.attempt_key=?`, attempt.AttemptKey).Scan(&state, &charged, &storedClass, &task.JobID, &task.Repository, &task.IssueNumber, &task.PullNumber, &task.Branch, &task.CurrentHeadSHA, &task.AgentModel, &task.State, &task.RepairAttempts, &lastJSON)
 	if err != nil {
 		return err
 	}
@@ -577,8 +685,7 @@ func (s *Store) FinishCIRepairFailure(ctx context.Context, attempt CIRepairAttem
 	if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET state='failed',failure_class=?,last_error=?,updated_at=? WHERE attempt_key=?`, failureClass, safeBrokerError(errors.New(detail)), now.UnixMilli(), attempt.AttemptKey); err != nil {
 		return err
 	}
-	task.DeadlineAt = time.UnixMilli(deadlineMillis).UTC()
-	stop := !modelStarted || !now.Before(task.DeadlineAt) || task.RepairAttempts >= maxAttempts || attempt.AttemptNumber >= maxAttempts
+	stop := !modelStarted || failureClass == "delivery_or_lease" || task.RepairAttempts >= maxAttempts || attempt.AttemptNumber >= maxAttempts
 	if stop {
 		observation := CIObservation{Repository: task.Repository, PullNumber: task.PullNumber, HeadSHA: task.CurrentHeadSHA, State: CIStateCodeFailure}
 		if lastJSON != "" {
@@ -589,9 +696,6 @@ func (s *Store) FinishCIRepairFailure(ctx context.Context, attempt CIRepairAttem
 			reason = "infrastructure_failure"
 			observation.State = CIStateInfrastructure
 		}
-		if !now.Before(task.DeadlineAt) {
-			reason = "deadline_expired"
-		}
 		if err := queueCIEscalation(ctx, tx, task.JobID, observation, task.RepairAttempts, maxAttempts, reason, now); err != nil {
 			return err
 		}
@@ -599,7 +703,8 @@ func (s *Store) FinishCIRepairFailure(ctx context.Context, attempt CIRepairAttem
 	}
 	number := attempt.AttemptNumber + 1
 	key := fmt.Sprintf("ci-repair:v1:%d:%s:%s:%d", task.JobID, task.AgentModel, task.CurrentHeadSHA, number)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO repository_ci_attempts(attempt_key,job_id,attempt_number,failed_head_sha,agent_model,state,expected_old_head_sha,due_at,created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?,?,?)`, key, task.JobID, number, task.CurrentHeadSHA, task.AgentModel, task.CurrentHeadSHA, now.UnixMilli(), now.UnixMilli(), now.UnixMilli()); err != nil {
+	maxRuntimeSeconds := durationSeconds(s.ciPolicy.ActiveTimeout)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO repository_ci_attempts(attempt_key,job_id,attempt_number,failed_head_sha,agent_model,state,max_runtime_seconds,expected_old_head_sha,due_at,created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?,?,?,?)`, key, task.JobID, number, task.CurrentHeadSHA, task.AgentModel, maxRuntimeSeconds, task.CurrentHeadSHA, now.UnixMilli(), now.UnixMilli(), now.UnixMilli()); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='repair_ready',updated_at=? WHERE job_id=?`, now.UnixMilli(), task.JobID); err != nil {
@@ -679,10 +784,11 @@ func (s *Store) CompleteCIRepairDelivery(ctx context.Context, attemptKey string,
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE repository_ci_attempts SET state='candidate_delivered',expected_old_head_sha=?,candidate_head_sha=?,validated_tree_sha=?,delivered_head_sha=?,delivered_tree_sha=?,updated_at=? WHERE attempt_key=?`, delivery.ExpectedOldHeadSHA, delivery.CandidateHeadSHA, delivery.ValidatedTreeSHA, delivery.DeliveredHeadSHA, delivery.DeliveredTreeSHA, now.UnixMilli(), attemptKey)
 	if err == nil {
-		_, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='waiting_ci',current_head_sha=?,last_ci_state='',updated_at=? WHERE job_id=?`, delivery.DeliveredHeadSHA, now.UnixMilli(), jobID)
-	}
-	if err == nil {
-		_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,updated_at=? WHERE id=?`, StateCIWaiting, now.UnixMilli(), jobID)
+		nextWake := now.Add(s.ciPolicy.ReconciliationWake)
+		_, err = tx.ExecContext(ctx, `UPDATE repository_ci_tasks SET state='waiting_ci',current_head_sha=?,last_ci_state='',deadline_at=?,updated_at=? WHERE job_id=?`, delivery.DeliveredHeadSHA, nextWake.UnixMilli(), now.UnixMilli(), jobID)
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `UPDATE jobs SET status=?,due_at=?,updated_at=? WHERE id=?`, StateCIWaiting, nextWake.UnixMilli(), now.UnixMilli(), jobID)
+		}
 	}
 	if err != nil {
 		return err
@@ -752,8 +858,8 @@ func queueCIEscalation(ctx context.Context, tx *sql.Tx, jobID int64, observation
 	checks := append([]FailedCheck(nil), observation.FailedChecks...)
 	sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	lines := []string{fmt.Sprintf("CI repair stopped after %d of %d coding attempts.", attempts, maxAttempts), fmt.Sprintf("Pull request #%d remains open at `%s`.", observation.PullNumber, observation.HeadSHA[:12])}
-	if reason == "deadline_expired" {
-		lines[0] = fmt.Sprintf("The CI repair deadline expired after %d of %d coding attempts.", attempts, maxAttempts)
+	if reason == "observation_invalid" {
+		lines[0] = "The authoritative CI observation could not be validated; no speculative code repair was launched."
 	} else if observation.State == CIStateInfrastructure {
 		lines[0] = "CI reported an infrastructure or runner failure; no speculative code repair was launched."
 	}

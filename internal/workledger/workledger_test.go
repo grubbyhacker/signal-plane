@@ -123,6 +123,36 @@ func TestMigrationFromV3AddsOperationIdempotencyEvidence(t *testing.T) {
 	if !found {
 		t.Fatal("v3 migration omitted operation idempotency evidence")
 	}
+	rows, err = db.Query(`PRAGMA table_info(repository_ci_attempts)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantColumns := map[string]bool{
+		"max_runtime_seconds":              false,
+		"external_wait_generation":         false,
+		"external_resume_key":              false,
+		"resumed_external_wait_generation": false,
+	}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if _, ok := wantColumns[name]; ok {
+			wantColumns[name] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for name, found := range wantColumns {
+		if !found {
+			t.Fatalf("migration omitted durable repair column %s", name)
+		}
+	}
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != SchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)

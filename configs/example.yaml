@@ -25,7 +25,10 @@ dispatcher:
   reporter_broker_url: http://127.0.0.1:8080
   reporter_broker_token_env: GITHUB_TASK_DISPATCHER_REPORTER_BROKER_TOKEN
   workers: 1
-  repair_deadline: 2h
+  # Missing-event reconciliation is durable and nonterminal. Only an active
+  # broker phase has a runtime cap.
+  repair_reconciliation_wake: 24h
+  repair_active_timeout: 60m
   repair_max_attempts: 2
   repository_task_routes:
     - id: automation-target

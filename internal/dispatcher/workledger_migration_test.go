@@ -209,4 +209,8 @@ func TestOpenStoreMigratesDeployedSchema17TerminalLedgerTo19(t *testing.T) {
 	if orphanStatus != StateReportPending || preOutboxAttempts != 0 {
 		t.Fatalf("orphaned projection status=%q pre-outbox attempts=%d", orphanStatus, preOutboxAttempts)
 	}
+	var externalWaitTable string
+	if err := store.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='repository_run_external_waits'`).Scan(&externalWaitTable); err != nil || externalWaitTable != "repository_run_external_waits" {
+		t.Fatalf("external wait table=%q err=%v", externalWaitTable, err)
+	}
 }

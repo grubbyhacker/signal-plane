@@ -165,6 +165,13 @@ func process(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *
 			return fmt.Errorf("persist CI wake-up: %w", err)
 		}
 	}
+	if routeOwnsRepository(routes, signal.Meta.Namespace) {
+		if _, err := store.RecordRepositoryRunExternalWake(ctx, signal, now); err != nil {
+			metrics.deliveries.WithLabelValues("store_failed").Inc()
+			logger.Error("persist repository run external wake-up failed", "error", err)
+			return fmt.Errorf("persist repository run external wake-up: %w", err)
+		}
+	}
 	candidate, outcome := Select(signal, routes)
 	var selected *Candidate
 	if outcome == "accepted" {
@@ -216,7 +223,8 @@ type TerminalProjectionClient interface {
 }
 type CIRepairBroker interface {
 	ObserveCI(context.Context, CIRepairTask, string) (CIObservation, error)
-	LaunchRepair(context.Context, CIRepairTask, CIRepairAttempt, time.Time) (LaunchResult, error)
+	LaunchRepair(context.Context, CIRepairTask, CIRepairAttempt) (LaunchResult, error)
+	ResumeRun(context.Context, string, string, int) (RunStatus, error)
 	Status(context.Context, string) (RunStatus, error)
 	TerminalResult(context.Context, string) (TerminalResult, error)
 }
@@ -226,6 +234,8 @@ const (
 	ReportRetryMaxAttempts = 24
 	PreOutboxMaxAttempts   = 10
 	StatusPollInterval     = 2 * time.Second
+	BrokerOperationTimeout = 30 * time.Second
+	ExternalRecoveryWake   = 15 * time.Minute
 	// ReporterUnavailableDelay bounds disabled reporting checks without
 	// treating a deliberately absent reporter as a terminal broker failure.
 	ReporterUnavailableDelay = time.Minute
@@ -268,11 +278,6 @@ func PreOutboxRetryDelay(attempt int) time.Duration {
 }
 
 func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, now time.Time) (bool, error) {
-	if store.ciPolicy.Validate() == nil {
-		if expired, err := store.ExpireCIDeadline(ctx, now, store.ciPolicy.MaxAttempts); err != nil || expired {
-			return expired, err
-		}
-	}
 	if terminal, ok := reportingBroker(broker); ok && store.ciPolicy.Validate() == nil {
 		if report, due, err := store.ClaimCIEscalation(ctx, now); err != nil || due {
 			if err != nil {
@@ -290,7 +295,7 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 			if err != nil {
 				return due, err
 			}
-			operationCtx, cancel := context.WithTimeout(ctx, work.Task.DeadlineAt.Sub(now))
+			operationCtx, cancel := context.WithTimeout(ctx, BrokerOperationTimeout)
 			observation, observeErr := repair.ObserveCI(operationCtx, work.Task, work.HeadSHA)
 			cancel()
 			if observeErr != nil {
@@ -302,17 +307,14 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 			if err != nil {
 				return due, err
 			}
-			operationCtx, cancel := context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
-			result, launchErr := repair.LaunchRepair(operationCtx, task, attempt, now)
+			operationCtx, cancel := context.WithTimeout(ctx, BrokerOperationTimeout)
+			result, launchErr := repair.LaunchRepair(operationCtx, task, attempt)
 			cancel()
 			if launchErr == nil {
 				return true, store.BindCIRepairRun(ctx, attempt, result.RunID, now)
 			}
 			retryDue := now.Add(LaunchRetryDelay(attempt.Operations + 1))
-			if retryDue.After(task.DeadlineAt) {
-				retryDue = task.DeadlineAt
-			}
-			if IsRetryable(launchErr) && attempt.Operations+1 < PreOutboxMaxAttempts && retryDue.After(now) {
+			if IsRetryable(launchErr) {
 				return true, store.DeferCIRepairLaunch(ctx, attempt.AttemptKey, retryDue, launchErr, now)
 			}
 			return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(launchErr), store.ciPolicy.MaxAttempts, now)
@@ -395,7 +397,7 @@ func RunOne(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *S
 }
 
 func runCIRepairStatus(ctx context.Context, store *Store, broker CIRepairBroker, task CIRepairTask, attempt CIRepairAttempt, now time.Time) (bool, error) {
-	operationCtx, cancel := context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
+	operationCtx, cancel := context.WithTimeout(ctx, BrokerOperationTimeout)
 	status, err := broker.Status(operationCtx, attempt.BrokerRunID)
 	cancel()
 	if err != nil {
@@ -404,22 +406,48 @@ func runCIRepairStatus(ctx context.Context, store *Store, broker CIRepairBroker,
 	if status.RunID != attempt.BrokerRunID {
 		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, "broker repair status run correlation is invalid", store.ciPolicy.MaxAttempts, now)
 	}
+	if status.Status == "waiting_external" {
+		if status.ExternalWait == nil {
+			return true, errors.New("broker waiting_external status lacks structured external_wait")
+		}
+		resumeKey, err := store.RecordCIRepairExternalWait(ctx, attempt, *status.ExternalWait, now)
+		if err != nil {
+			return true, err
+		}
+		operationCtx, cancel = context.WithTimeout(ctx, BrokerOperationTimeout)
+		_, observeErr := broker.ObserveCI(operationCtx, task, attempt.FailedHeadSHA)
+		cancel()
+		if observeErr != nil && !isStalePullHead(observeErr) {
+			return true, store.DeferCIRepairStatus(ctx, attempt.AttemptKey, now.Add(ExternalRecoveryWake), observeErr, now)
+		}
+		operationCtx, cancel = context.WithTimeout(ctx, BrokerOperationTimeout)
+		resumed, resumeErr := broker.ResumeRun(operationCtx, attempt.BrokerRunID, resumeKey, attempt.MaxRuntimeSeconds)
+		cancel()
+		if resumeErr != nil {
+			return true, store.DeferCIRepairStatus(ctx, attempt.AttemptKey, now.Add(PreOutboxRetryDelay(attempt.Operations+1)), resumeErr, now)
+		}
+		if resumed.RunID != attempt.BrokerRunID {
+			return true, errors.New("broker repair resume run correlation is invalid")
+		}
+		if resumed.Status != "running" && resumed.Status != "pending" && resumed.Status != "waiting_external" && resumed.Status != "completed" && resumed.Status != "failed" && resumed.Status != "timed_out" && resumed.Status != "stopped" && resumed.Status != "cancelled" {
+			return true, errors.New("broker repair resume status is invalid")
+		}
+		return true, store.MarkCIRepairExternalResumed(ctx, attempt.AttemptKey, resumeKey, status.ExternalWait.Generation, now.Add(StatusPollInterval), now)
+	}
+	if attempt.ExternalWait != nil && attempt.ExternalWait.Generation > attempt.ResumedGeneration {
+		if err := store.MarkCIRepairExternalResumed(ctx, attempt.AttemptKey, attempt.ExternalResumeKey, attempt.ExternalWait.Generation, now.Add(StatusPollInterval), now); err != nil {
+			return true, err
+		}
+	}
 	state, err := ReconciledStatus(status.Status)
 	if err != nil {
 		return true, store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(err), store.ciPolicy.MaxAttempts, now)
 	}
 	if state == StateLaunched {
 		due := now.Add(StatusPollInterval)
-		if due.After(task.DeadlineAt) {
-			due = task.DeadlineAt
-		}
-		if !due.After(now) {
-			_, expireErr := store.ExpireCIDeadline(ctx, now, store.ciPolicy.MaxAttempts)
-			return true, expireErr
-		}
 		return true, store.ScheduleCIRepairStatus(ctx, attempt.AttemptKey, due, now)
 	}
-	operationCtx, cancel = context.WithTimeout(ctx, task.DeadlineAt.Sub(now))
+	operationCtx, cancel = context.WithTimeout(ctx, BrokerOperationTimeout)
 	terminal, err := broker.TerminalResult(operationCtx, attempt.BrokerRunID)
 	cancel()
 	if err != nil {
@@ -456,12 +484,14 @@ func runCIRepairStatus(ctx context.Context, store *Store, broker CIRepairBroker,
 	}, now)
 }
 
+func isStalePullHead(err error) bool {
+	var brokerErr BrokerError
+	return errors.As(err, &brokerErr) && brokerErr.Code == "stale_pull_head"
+}
+
 func deferOrFailCIRepairStatus(ctx context.Context, store *Store, task CIRepairTask, attempt CIRepairAttempt, failure error, now time.Time) error {
 	due := now.Add(PreOutboxRetryDelay(attempt.Operations + 1))
-	if due.After(task.DeadlineAt) {
-		due = task.DeadlineAt
-	}
-	if IsRetryable(failure) && attempt.Operations+1 < PreOutboxMaxAttempts && due.After(now) {
+	if IsRetryable(failure) {
 		return store.DeferCIRepairStatus(ctx, attempt.AttemptKey, due, failure, now)
 	}
 	return store.FinishCIRepairFailure(ctx, attempt, "infrastructure", false, safeBrokerError(failure), store.ciPolicy.MaxAttempts, now)
@@ -517,6 +547,9 @@ func safeLaunchFailureReason(err error) string {
 func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store *Store, broker BrokerClient, job Job, now time.Time) (bool, error) {
 	result, err := broker.Status(ctx, job.BrokerRunID)
 	if err != nil {
+		if job.Status == StateExternalWaiting {
+			return true, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(ExternalRecoveryWake), err, now)
+		}
 		state, storeErr := ReconcileStatusFailure(ctx, store, job, err, now)
 		if state == StateLaunched {
 			metrics.jobs.WithLabelValues("status_retry").Inc()
@@ -525,6 +558,42 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 		}
 		_ = metrics.Refresh(ctx, store, now)
 		return true, storeErr
+	}
+	if result.RunID == "" || result.RunID != job.BrokerRunID {
+		return true, errors.New("broker status response has invalid run correlation")
+	}
+	if result.Status == "waiting_external" {
+		if result.ExternalWait == nil {
+			_, storeErr := reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", errors.New("broker waiting_external status lacks structured external_wait"), false, now)
+			return true, storeErr
+		}
+		if err := result.ExternalWait.Validate(); err != nil {
+			_, storeErr := reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", err, false, now)
+			return true, storeErr
+		}
+		wait, err := store.RecordRepositoryRunExternalWait(ctx, job, *result.ExternalWait, now)
+		if err != nil || wait.State != "resume_ready" {
+			return true, err
+		}
+		resumer, ok := broker.(interface {
+			ResumeRun(context.Context, string, string, int) (RunStatus, error)
+		})
+		if !ok {
+			return true, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(ExternalRecoveryWake), errors.New("broker does not support external wait resume"), now)
+		}
+		operationCtx, cancel := context.WithTimeout(ctx, BrokerOperationTimeout)
+		resumed, resumeErr := resumer.ResumeRun(operationCtx, wait.BrokerRunID, wait.ResumeKey, wait.MaxRuntimeSeconds)
+		cancel()
+		if resumeErr != nil {
+			return true, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(PreOutboxRetryDelay(job.PreOutboxAttempts+1)), resumeErr, now)
+		}
+		if resumed.RunID != wait.BrokerRunID {
+			return true, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(ExternalRecoveryWake), errors.New("broker external resume run correlation is invalid"), now)
+		}
+		if _, statusErr := ReconciledStatus(resumed.Status); statusErr != nil && resumed.Status != "waiting_external" {
+			return true, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(ExternalRecoveryWake), statusErr, now)
+		}
+		return true, store.MarkRepositoryRunExternalResumed(ctx, wait, now)
 	}
 	terminal, _ := broker.(TerminalProjectionClient)
 	state, err := ReconcileStatusResult(ctx, store, terminal, job, result, now)
@@ -542,6 +611,9 @@ func runStatus(ctx context.Context, logger *slog.Logger, metrics *Metrics, store
 // permanent failure, or exhaustion of transient retries, is itself projected
 // through the terminal result/outbox path so it cannot look successful.
 func ReconcileStatusFailure(ctx context.Context, store *Store, job Job, failure error, now time.Time) (string, error) {
+	if job.Status == StateExternalWaiting {
+		return StateExternalWaiting, store.DeferRepositoryRunExternalResume(ctx, job, now.Add(ExternalRecoveryWake), failure, now)
+	}
 	return reconcilePreOutboxFailure(ctx, store, job, StateLaunched, "broker_status", failure, IsRetryable(failure), now)
 }
 
@@ -551,6 +623,21 @@ func ReconcileStatusFailure(ctx context.Context, store *Store, job Job, failure 
 func ReconcileStatusResult(ctx context.Context, store *Store, terminal TerminalProjectionClient, job Job, result RunStatus, now time.Time) (string, error) {
 	if result.RunID == "" || result.RunID != job.BrokerRunID {
 		return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", errors.New("broker status response has invalid run correlation"), false, now)
+	}
+	if result.Status == "waiting_external" {
+		if result.ExternalWait == nil {
+			return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "broker_status", errors.New("broker waiting_external status lacks structured external_wait"), false, now)
+		}
+		if _, err := store.RecordRepositoryRunExternalWait(ctx, job, *result.ExternalWait, now); err != nil {
+			return "", err
+		}
+		return StateExternalWaiting, nil
+	}
+	if job.Status == StateExternalWaiting {
+		if err := store.ReconcileRepositoryRunExternalResume(ctx, job, now); err != nil {
+			return "", err
+		}
+		job.Status = StateLaunched
 	}
 	state, err := ReconciledStatus(result.Status)
 	if err != nil {
@@ -582,7 +669,7 @@ func ReconcileStatusResult(ctx context.Context, store *Store, terminal TerminalP
 		if err := json.Unmarshal(workerBytes, &worker); err != nil || worker.PullRequest == nil {
 			return reconcilePreOutboxFailure(ctx, store, job, StateReportPending, "ci_wait_correlation", errors.New("ready result lacks durable pull request coordinates"), false, now)
 		}
-		if err := store.BeginCIWait(ctx, job, worker.PullRequest.Number, projected.Branch, worker.DeliveredHeadSHA, projected.Profile, now.Add(store.ciPolicy.Deadline), now, encoded); err != nil {
+		if err := store.BeginCIWait(ctx, job, worker.PullRequest.Number, projected.Branch, worker.DeliveredHeadSHA, projected.Profile, now.Add(store.ciPolicy.ReconciliationWake), now, encoded); err != nil {
 			return "", err
 		}
 		return StateCIWaiting, nil

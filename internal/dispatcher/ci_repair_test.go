@@ -3,6 +3,8 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +17,9 @@ func setupCIRepairTask(t *testing.T, deadline time.Time) (*Store, Job) {
 	t.Helper()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "ci-repair.db"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ConfigureCIRepair(CIRepairPolicy{ActiveTimeout: time.Hour, MaxAttempts: 2}); err != nil {
 		t.Fatal(err)
 	}
 	candidate, _ := Select(validSignal("issue-delivery", 41), testRepositoryTaskRoutes())
@@ -179,6 +184,96 @@ func TestCIEventDuringReconciliationLeavesDurableWake(t *testing.T) {
 	}
 }
 
+func TestCIDeadlineWakeRenewsPendingLifecycle(t *testing.T) {
+	ctx := context.Background()
+	wake := time.Unix(18_000, 0).UTC()
+	store, _ := setupCIRepairTask(t, wake)
+	defer store.Close()
+	head := strings.Repeat("a", 40)
+	work, ok, err := store.ClaimCIReconciliation(ctx, wake)
+	if err != nil || !ok || !work.DeadlineWake {
+		t.Fatalf("deadline claim=%+v ok=%v err=%v", work, ok, err)
+	}
+	if err := store.ApplyCIObservation(ctx, work, observation(head, CIStatePending), 2, wake); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var nextWake int64
+	var outbox int
+	if err := store.db.QueryRow(`SELECT state,deadline_at FROM repository_ci_tasks`).Scan(&state, &nextWake); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM repository_ci_escalation_outbox`).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if state != CIWaiting || nextWake != wake.Add(time.Hour).UnixMilli() || outbox != 0 {
+		t.Fatalf("state=%s next_wake=%d outbox=%d", state, nextWake, outbox)
+	}
+	if _, ok, err := store.ClaimCIReconciliation(ctx, wake.Add(time.Minute)); err != nil || ok {
+		t.Fatalf("early wake ok=%v err=%v", ok, err)
+	}
+	if next, ok, err := store.ClaimCIReconciliation(ctx, wake.Add(time.Hour)); err != nil || !ok || !next.DeadlineWake {
+		t.Fatalf("renewed wake=%+v ok=%v err=%v", next, ok, err)
+	}
+}
+
+func TestTransientCIObservationFailureRemainsDurablyRetryablePastWake(t *testing.T) {
+	ctx := context.Background()
+	wake := time.Unix(19_000, 0).UTC()
+	store, _ := setupCIRepairTask(t, wake)
+	defer store.Close()
+	work, ok, err := store.ClaimCIReconciliation(ctx, wake)
+	if err != nil || !ok || !work.DeadlineWake {
+		t.Fatalf("claim=%+v ok=%v err=%v", work, ok, err)
+	}
+	work.Operations = 100
+	failure := BrokerError{Transport: true, Message: "GitHub unavailable"}
+	if err := store.FailCIReconciliation(ctx, work, failure, true, wake); err != nil {
+		t.Fatal(err)
+	}
+	var reconcileState, taskState string
+	var outbox int
+	if err := store.db.QueryRow(`SELECT state FROM repository_ci_reconciliations WHERE operation_key=?`, work.OperationKey).Scan(&reconcileState); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT state FROM repository_ci_tasks`).Scan(&taskState); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM repository_ci_escalation_outbox`).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if reconcileState != "queued" || taskState != CIWaiting || outbox != 0 {
+		t.Fatalf("reconcile=%s task=%s outbox=%d", reconcileState, taskState, outbox)
+	}
+}
+
+func TestStalePullHeadWaitsForAuthoritativeHeadEvent(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(19_500, 0).UTC()
+	store, _ := setupCIRepairTask(t, now.Add(time.Hour))
+	defer store.Close()
+	work, ok, err := store.ClaimCIReconciliation(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim=%+v ok=%v err=%v", work, ok, err)
+	}
+	failure := BrokerError{Status: 409, Code: "stale_pull_head", Message: "head changed"}
+	if err := store.FailCIReconciliation(ctx, work, failure, false, now); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var nextWake int64
+	var outbox int
+	if err := store.db.QueryRow(`SELECT state,deadline_at FROM repository_ci_tasks`).Scan(&state, &nextWake); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT count(*) FROM repository_ci_escalation_outbox`).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if state != CIWaiting || nextWake != now.Add(time.Hour).UnixMilli() || outbox != 0 {
+		t.Fatalf("state=%s next_wake=%d outbox=%d", state, nextWake, outbox)
+	}
+}
+
 func TestCIInfrastructureFailureEscalatesWithoutChargingAttempt(t *testing.T) {
 	ctx := context.Background()
 	deadline := time.Unix(20_000, 0).UTC()
@@ -235,6 +330,7 @@ func TestRepairTerminalChargesOnlyWhenModelExecutionStarted(t *testing.T) {
 	}{
 		{name: "pre-model infrastructure", failureClass: "infrastructure", wantState: CIEscalationPending},
 		{name: "model failure", modelStarted: true, failureClass: "model_or_code", wantState: CIRepairReady, wantCharged: 1},
+		{name: "post-model delivery", modelStarted: true, failureClass: "delivery_or_lease", wantState: CIEscalationPending, wantCharged: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store, _ := setupCIRepairTask(t, now.Add(time.Hour))
@@ -271,7 +367,7 @@ func TestRepairTerminalChargesOnlyWhenModelExecutionStarted(t *testing.T) {
 	}
 }
 
-func TestCIDeadlineExpiresInFlightRepairExactlyOnce(t *testing.T) {
+func TestCIWakeDoesNotExpireInFlightRepair(t *testing.T) {
 	ctx := context.Background()
 	deadline := time.Unix(25_000, 0).UTC()
 	store, _ := setupCIRepairTask(t, deadline)
@@ -291,11 +387,10 @@ func TestCIDeadlineExpiresInFlightRepairExactlyOnce(t *testing.T) {
 	if err := store.BindCIRepairRun(ctx, attempt, "run-deadline", deadline.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if expired, err := store.ExpireCIDeadline(ctx, deadline, 2); err != nil || !expired {
-		t.Fatalf("expired=%v err=%v", expired, err)
-	}
-	if expired, err := store.ExpireCIDeadline(ctx, deadline.Add(time.Second), 2); err != nil || expired {
-		t.Fatalf("replayed expiration=%v err=%v", expired, err)
+	broker := &lifecycleRepairBroker{head: head, status: "running", runID: "run-deadline"}
+	worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), store, broker, deadline.Add(8*24*time.Hour))
+	if err != nil || !worked {
+		t.Fatalf("post-wake status worked=%v err=%v", worked, err)
 	}
 	var taskState string
 	var outbox int
@@ -305,7 +400,7 @@ func TestCIDeadlineExpiresInFlightRepairExactlyOnce(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT count(*) FROM repository_ci_escalation_outbox`).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
-	if taskState != CIEscalationPending || outbox != 1 {
+	if taskState != CIRepairRunning || outbox != 0 {
 		t.Fatalf("state=%s outbox=%d", taskState, outbox)
 	}
 }
@@ -344,6 +439,70 @@ func TestCIRepairRunStatusScheduleSurvivesRestart(t *testing.T) {
 	_, restored, ok, err := store.ClaimCIRepairStatus(ctx, now.Add(StatusPollInterval))
 	if err != nil || !ok || restored.AttemptKey != attempt.AttemptKey || restored.BrokerRunID != "run-restart" || restored.Charged {
 		t.Fatalf("restored=%+v ok=%v err=%v", restored, ok, err)
+	}
+}
+
+func TestGitHubEventAcceleratesDurableExternalWait(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(27_500, 0).UTC()
+	store, _ := setupCIRepairTask(t, now.Add(time.Hour))
+	defer store.Close()
+	head := strings.Repeat("a", 40)
+	work, ok, err := store.ClaimCIReconciliation(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if err := store.ApplyCIObservation(ctx, work, observation(head, CIStateCodeFailure), 2, now); err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, ok, err := store.ClaimCIRepair(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("attempt ok=%v err=%v", ok, err)
+	}
+	if err := store.BindCIRepairRun(ctx, attempt, "run-external-event", now); err != nil {
+		t.Fatal(err)
+	}
+	wait := CIExternalWait{Service: "github", Phase: "preparation", Operation: "ci.observe", Reason: "unavailable", Generation: 1, Since: now}
+	if _, err := store.RecordCIRepairExternalWait(ctx, CIRepairAttempt{AttemptKey: attempt.AttemptKey, BrokerRunID: "run-external-event"}, wait, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeferCIRepairStatus(ctx, attempt.AttemptKey, now.Add(ExternalRecoveryWake), BrokerError{Transport: true, Message: "GitHub unavailable"}, now); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.RecordCIEvent(ctx, ciSignal("external-recovered", "check_run", "completed", head, 9, map[string]any{"id": 99}), now.Add(time.Minute))
+	if err != nil || !queued {
+		t.Fatalf("event queued=%v err=%v", queued, err)
+	}
+	_, accelerated, ok, err := store.ClaimCIRepairStatus(ctx, now.Add(time.Minute))
+	if err != nil || !ok || accelerated.AttemptKey != attempt.AttemptKey || accelerated.ExternalWait == nil || accelerated.ExternalWait.Generation != 1 {
+		t.Fatalf("accelerated=%+v ok=%v err=%v", accelerated, ok, err)
+	}
+}
+
+func TestCIRepairLaunchRuntimeIsDurableAcrossDelayedReplay(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(28_000, 0).UTC()
+	store, _ := setupCIRepairTask(t, now.Add(time.Hour))
+	defer store.Close()
+	head := strings.Repeat("a", 40)
+	work, ok, err := store.ClaimCIReconciliation(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if err := store.ApplyCIObservation(ctx, work, observation(head, CIStateCodeFailure), 2, now); err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, ok, err := store.ClaimCIRepair(ctx, now)
+	if err != nil || !ok || attempt.MaxRuntimeSeconds != 3600 {
+		t.Fatalf("attempt=%+v ok=%v err=%v", attempt, ok, err)
+	}
+	delayed := now.Add(8 * 24 * time.Hour)
+	if err := store.DeferCIRepairLaunch(ctx, attempt.AttemptKey, delayed, BrokerError{Transport: true, Message: "unavailable"}, now); err != nil {
+		t.Fatal(err)
+	}
+	_, replay, ok, err := store.ClaimCIRepair(ctx, delayed)
+	if err != nil || !ok || replay.AttemptKey != attempt.AttemptKey || replay.MaxRuntimeSeconds != attempt.MaxRuntimeSeconds {
+		t.Fatalf("replay=%+v ok=%v err=%v", replay, ok, err)
 	}
 }
 
