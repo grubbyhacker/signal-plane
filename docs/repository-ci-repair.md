@@ -7,7 +7,16 @@ before acknowledging further work. New configuration separates
 `repair_active_timeout`, which bounds one active broker phase, from
 `repair_reconciliation_wake`, which covers missing events. Neither is an
 end-to-end completion cutoff. The old `repair_deadline` remains a rolling-upgrade
-alias; its active value is capped to the reviewed 60-minute broker template.
+alias; it may be removed only after the rendered production dispatcher
+configuration contains both `repair_reconciliation_wake` and
+`repair_active_timeout`.
+
+Signal Plane accepts only the broker response versions
+`broker-ci-observation/v1`, `broker-run-launch/v1`, `broker-run-status/v1`, and
+`broker-external-wait/v1`; terminal projections remain
+`repository-task-terminal-result/v1`. Missing or unknown versions fail closed
+at the broker boundary before Signal changes lifecycle state, charges a repair
+attempt, or resumes an external wait.
 
 Admitted `check_run`, `check_suite`, commit `status`, and `pull_request` events
 are wake-ups. Their payloads never decide CI. Each distinct delivery and
@@ -56,5 +65,5 @@ The SQLite schema stores event, reconciliation, attempt, charge, delivery, and
 reporting identities. Process restart therefore resumes the same broker run or
 outbox operation instead of duplicating model execution, pushes, or comments.
 
-The `waiting_external` and resume DTO is supplied by gh-agent-broker PR #169 at
-head `5fc55a6d935b885e8cba0bdccc5b4b33616ac6fe`.
+The `waiting_external` and resume DTO follows the versioned broker contract
+above.

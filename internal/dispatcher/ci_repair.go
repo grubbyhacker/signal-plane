@@ -128,6 +128,7 @@ type CIRepairAttempt struct {
 }
 
 type CIExternalWait struct {
+	Version    string    `json:"version"`
 	Service    string    `json:"service"`
 	Phase      string    `json:"phase"`
 	Operation  string    `json:"operation"`

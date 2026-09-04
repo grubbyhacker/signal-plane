@@ -508,7 +508,7 @@ func TestTemporaryTerminalProjectionFailureRetriesWithoutFalseCompletion(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/runs/run-5":
-			_, _ = w.Write([]byte(`{"run_id":"run-5","status":"completed"}`))
+			_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"run-5","status":"completed"}`))
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/runs/run-5/terminal-result":
 			projectionCalls++
 			if projectionCalls == 1 {

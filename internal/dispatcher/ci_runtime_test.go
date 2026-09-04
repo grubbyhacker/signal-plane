@@ -22,7 +22,7 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 		if r.Header.Get("X-Agent-ID") != terminalReporterAgentID || r.Header.Get("X-Agent-Secret") != "reporter-secret" {
 			t.Fatal("missing broker-scoped observation credentials")
 		}
-		_, _ = w.Write([]byte(`{"requested_head_sha":"` + head + `","pull":{"number":9,"head_sha":"` + head + `"},"commit_status":{"statuses":[{"context":"legacy","state":"failure","description":"legacy failed"}]},"check_runs":{"check_runs":[{"name":"unit","conclusion":"failure","output":{"title":"tests","summary":"assertion failed"}}]},"workflow_jobs":[{"name":"integration","conclusion":"timed_out"}],"aggregate_state":"code_failure"}`))
+		_, _ = w.Write([]byte(`{"version":"broker-ci-observation/v1","requested_head_sha":"` + head + `","pull":{"number":9,"head_sha":"` + head + `"},"commit_status":{"statuses":[{"context":"legacy","state":"failure","description":"legacy failed"}]},"check_runs":{"check_runs":[{"name":"unit","conclusion":"failure","output":{"title":"tests","summary":"assertion failed"}}]},"workflow_jobs":[{"name":"integration","conclusion":"timed_out"}],"aggregate_state":"code_failure"}`))
 	}))
 	defer mainBroker.Close()
 	sandbox := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,11 +37,11 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 			if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 1 || body["max_runtime_seconds"] != 600 {
 				t.Fatalf("unexpected resume body %+v", body)
 			}
-			_, _ = w.Write([]byte(`{"run_id":"repair-run","status":"running","replay":false}`))
+			_, _ = w.Write([]byte(`{"version":"broker-run-launch/v1","run_id":"repair-run","status":"running","replay":false}`))
 			return
 		}
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/repair-run" {
-			_, _ = w.Write([]byte(`{"run_id":"repair-run","status":"waiting_external","external_wait":{"service":"github","phase":"delivery","operation":"git.push","reason":"rate_limited","generation":3,"since":"2026-09-03T18:00:00Z"}}`))
+			_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"repair-run","status":"waiting_external","external_wait":{"version":"broker-external-wait/v1","service":"github","phase":"delivery","operation":"git.push","reason":"rate_limited","generation":3,"since":"2026-09-03T18:00:00Z"}}`))
 			return
 		}
 		if r.URL.Path != "/v1/launch-profiles/terra-medium-v1/launch" || r.Header.Get("Idempotency-Key") != "ci-repair:v1:7:terra-medium-v1:"+head+":1" {
@@ -59,7 +59,7 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 		if json.NewDecoder(r.Body).Decode(&body) != nil || body.MaxRuntimeSeconds != 600 || body.Parameters.IssueNumber != 41 || body.Parameters.RepairPRNumber != 9 || body.Parameters.ExpectedHeadSHA != head || !strings.HasPrefix(body.Parameters.SourceDeliveryID, "ci-repair-v1-") {
 			t.Fatalf("unexpected repair body %+v", body)
 		}
-		_, _ = w.Write([]byte(`{"run_id":"repair-run"}`))
+		_, _ = w.Write([]byte(`{"version":"broker-run-launch/v1","run_id":"repair-run"}`))
 	}))
 	defer sandbox.Close()
 	b := &Broker{URL: sandbox.URL, Token: "sandbox-token", ReporterURL: mainBroker.URL, ReporterToken: "reporter-secret", Client: sandbox.Client()}
@@ -80,6 +80,41 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 	resumed, err := b.ResumeRun(context.Background(), "repair-run", "resume-key", 600)
 	if err != nil || resumed.RunID != "repair-run" || resumed.Status != "running" || resumed.Replay {
 		t.Fatalf("resume=%+v err=%v", resumed, err)
+	}
+}
+
+func TestBrokerVersionGateRejectsMissingOrUnknownLifecycleResponses(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/repos/example/automation-target/pulls/9/ci-observation":
+			_, _ = w.Write([]byte(`{"requested_head_sha":"` + head + `","pull":{"number":9,"head_sha":"` + head + `"},"aggregate_state":"pending"}`))
+		case "/v1/launch-profiles/terra-medium-v1/launch":
+			_, _ = w.Write([]byte(`{"version":"broker-run-launch/v2","run_id":"repair-run"}`))
+		case "/v1/runs/repair-run":
+			_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"repair-run","status":"waiting_external","external_wait":{"version":"broker-external-wait/v2","service":"github","phase":"delivery","operation":"git.push","reason":"rate_limited","generation":1,"since":"2026-09-03T18:00:00Z"}}`))
+		case "/v1/runs/repair-run/resume":
+			_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"repair-run","status":"running"}`))
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	b := &Broker{URL: server.URL, ReporterURL: server.URL, Client: server.Client()}
+	task := CIRepairTask{Repository: "example/automation-target", PullNumber: 9}
+	attempt := CIRepairAttempt{AttemptKey: "repair-key", AgentModel: "terra-medium-v1", FailedHeadSHA: head, MaxRuntimeSeconds: 60}
+
+	if _, err := b.ObserveCI(context.Background(), task, head); err == nil || IsRetryable(err) {
+		t.Fatalf("missing observation version err=%v", err)
+	}
+	if _, err := b.LaunchRepair(context.Background(), task, attempt); err == nil || IsRetryable(err) {
+		t.Fatalf("unknown launch version err=%v", err)
+	}
+	if _, err := b.Status(context.Background(), "repair-run"); err == nil || IsRetryable(err) {
+		t.Fatalf("unknown external wait version err=%v", err)
+	}
+	if _, err := b.ResumeRun(context.Background(), "repair-run", "resume-key", 60); err == nil || IsRetryable(err) {
+		t.Fatalf("status version cannot substitute for resume version err=%v", err)
 	}
 }
 
