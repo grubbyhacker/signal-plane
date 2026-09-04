@@ -25,6 +25,8 @@ dispatcher:
   reporter_broker_url: http://127.0.0.1:8080
   reporter_broker_token_env: GITHUB_TASK_DISPATCHER_REPORTER_BROKER_TOKEN
   workers: 1
+  repair_deadline: 2h
+  repair_max_attempts: 2
   repository_task_routes:
     - id: automation-target
       repository: example/automation-target

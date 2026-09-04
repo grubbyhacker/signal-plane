@@ -33,7 +33,12 @@ type workerTerminalResult struct {
 	Verification struct {
 		Status string `json:"status"`
 	} `json:"verification"`
-	PullRequest *struct {
+	ExpectedOldHeadSHA string `json:"expected_old_head_sha"`
+	CandidateHeadSHA   string `json:"candidate_head_sha"`
+	DeliveredHeadSHA   string `json:"delivered_head_sha"`
+	ValidatedTreeSHA   string `json:"validated_tree_sha"`
+	DeliveredTreeSHA   string `json:"delivered_tree_sha"`
+	PullRequest        *struct {
 		Number  int64  `json:"number"`
 		HTMLURL string `json:"html_url"`
 		URL     string `json:"url"`
@@ -133,7 +138,7 @@ func ValidateTerminalResult(job Job, r TerminalResult) error {
 		return errors.New("worker result is missing final summary")
 	}
 	if worker.Outcome == "ready_for_review" {
-		if worker.PullRequest == nil || worker.PullRequest.Number < 1 || !validHTTPSURL(worker.PullRequest.HTMLURL) || !validHTTPSURL(worker.PullRequest.URL) {
+		if worker.PullRequest == nil || worker.PullRequest.Number < 1 || !validHTTPSURL(worker.PullRequest.HTMLURL) || !validHTTPSURL(worker.PullRequest.URL) || !githubSHA.MatchString(worker.DeliveredHeadSHA) || !githubSHA.MatchString(worker.ValidatedTreeSHA) {
 			return errors.New("ready worker result is missing pull request identity")
 		}
 	} else if worker.PullRequest != nil {

@@ -94,6 +94,8 @@ type DispatcherConfig struct {
 	ReporterBrokerTokenEnv string                `yaml:"reporter_broker_token_env"`
 	Workers                int                   `yaml:"workers"`
 	RecoveryStartSequence  uint64                `yaml:"recovery_start_sequence"`
+	RepairDeadline         time.Duration         `yaml:"repair_deadline"`
+	RepairMaxAttempts      int                   `yaml:"repair_max_attempts"`
 	RepositoryTaskRoutes   []RepositoryTaskRoute `yaml:"repository_task_routes"`
 }
 
@@ -311,6 +313,12 @@ func (cfg Config) Validate() error {
 		if cfg.Dispatcher.Workers != 1 {
 			return errors.New("enabled dispatcher requires exactly one worker")
 		}
+		if cfg.Dispatcher.RepairDeadline < time.Minute || cfg.Dispatcher.RepairDeadline > 7*24*time.Hour {
+			return errors.New("enabled dispatcher repair_deadline must be between one minute and seven days")
+		}
+		if cfg.Dispatcher.RepairMaxAttempts < 1 || cfg.Dispatcher.RepairMaxAttempts > 2 {
+			return errors.New("enabled dispatcher repair_max_attempts must be between one and two")
+		}
 		brokerURL, err := url.Parse(cfg.Dispatcher.BrokerURL)
 		if err != nil || (brokerURL.Scheme != "http" && brokerURL.Scheme != "https") || brokerURL.Host == "" || brokerURL.User != nil || (brokerURL.EscapedPath() != "" && brokerURL.EscapedPath() != "/") || brokerURL.RawQuery != "" || brokerURL.Fragment != "" {
 			return errors.New("enabled dispatcher broker_url must be a fixed broker origin without path, query, credentials, or fragment")
@@ -458,10 +466,11 @@ func (route Route) Validate() error {
 			if strings.TrimSpace(tuple.Repository) == "" || strings.TrimSpace(tuple.Event) == "" {
 				return fmt.Errorf("route %q admission tuple %d requires repository and event", route.ID, i)
 			}
-			if tuple.Event == "push" && len(tuple.Actions) != 0 {
-				return fmt.Errorf("route %q admission tuple %d push must be actionless", route.ID, i)
+			actionless := tuple.Event == "push" || tuple.Event == "status"
+			if actionless && len(tuple.Actions) != 0 {
+				return fmt.Errorf("route %q admission tuple %d %s must be actionless", route.ID, i, tuple.Event)
 			}
-			if tuple.Event != "push" && len(tuple.Actions) == 0 {
+			if !actionless && len(tuple.Actions) == 0 {
 				return fmt.Errorf("route %q admission tuple %d requires at least one action", route.ID, i)
 			}
 			key := tuple.Repository + "\x00" + tuple.Event

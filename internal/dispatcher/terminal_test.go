@@ -44,6 +44,8 @@ func terminalTestResult(outcome string) TerminalResult {
 		"verification": map[string]any{"status": "passed"}, "verify_task": "verify",
 	}
 	if outcome == "ready_for_review" {
+		worker["delivered_head_sha"] = strings.Repeat("a", 40)
+		worker["validated_tree_sha"] = strings.Repeat("b", 40)
 		worker["pull_request"] = map[string]any{
 			"number": float64(42), "html_url": "https://github.example/owner/repo/pull/42",
 			"url": "https://api.github.example/repos/owner/repo/pulls/42",
@@ -139,6 +141,47 @@ func TestRenderTerminalCommentsForEveryOutcome(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReadyForReviewTransitionsToDurableCIWaitWithoutRoutineComment(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(95_000, 0).UTC()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "dispatcher.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ConfigureCIRepair(CIRepairPolicy{Deadline: 2 * time.Hour, MaxAttempts: 2}); err != nil {
+		t.Fatal(err)
+	}
+	job := terminalTestJob(t, store, now)
+	terminal := terminalTestResult("ready_for_review")
+	client := &terminalProjectionStub{result: terminal}
+	state, err := ReconcileStatusResult(ctx, store, client, job, RunStatus{RunID: job.BrokerRunID, Status: "completed"}, now)
+	if err != nil || state != StateCIWaiting {
+		t.Fatalf("state=%s err=%v", state, err)
+	}
+	var jobState, ciState, head string
+	var deadline int64
+	if err := store.db.QueryRow(`SELECT j.status,c.state,c.current_head_sha,c.deadline_at FROM jobs j JOIN repository_ci_tasks c ON c.job_id=j.id WHERE j.id=?`, job.ID).Scan(&jobState, &ciState, &head, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	if jobState != StateCIWaiting || ciState != CIWaiting || head != strings.Repeat("a", 40) || deadline != now.Add(2*time.Hour).UnixMilli() {
+		t.Fatalf("job=%s ci=%s head=%s deadline=%d", jobState, ciState, head, deadline)
+	}
+	var reports int
+	if err := store.db.QueryRow(`SELECT count(*) FROM notification_outbox`).Scan(&reports); err != nil {
+		t.Fatal(err)
+	}
+	if reports != 0 {
+		t.Fatalf("ready-for-review queued %d routine comments", reports)
+	}
+}
+
+type terminalProjectionStub struct{ result TerminalResult }
+
+func (stub *terminalProjectionStub) TerminalResult(context.Context, string) (TerminalResult, error) {
+	return stub.result, nil
 }
 
 func TestOutboxSurvivesInsertionRestartAndAcceptedCommentReplay(t *testing.T) {

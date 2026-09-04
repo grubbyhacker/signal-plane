@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
 	maxBrokerResponseBytes  = 1 << 20
+	maxCIObservationBytes   = 16 << 20
 	terminalReporterAgentID = "repository-task-terminal-reporter"
 )
 
@@ -119,6 +121,158 @@ type RunStatus struct {
 	Status string `json:"status"`
 }
 
+type brokerCIObservation struct {
+	RequestedHeadSHA string `json:"requested_head_sha"`
+	Pull             struct {
+		Number  int64  `json:"number"`
+		HeadSHA string `json:"head_sha"`
+	} `json:"pull"`
+	CommitStatus struct {
+		Statuses []struct {
+			Context     string `json:"context"`
+			State       string `json:"state"`
+			Description string `json:"description"`
+		} `json:"statuses"`
+	} `json:"commit_status"`
+	CheckRuns struct {
+		CheckRuns []struct {
+			Name       string `json:"name"`
+			Conclusion string `json:"conclusion"`
+			Output     *struct {
+				Title   string `json:"title"`
+				Summary string `json:"summary"`
+			} `json:"output"`
+		} `json:"check_runs"`
+	} `json:"check_runs"`
+	WorkflowJobs []struct {
+		Name       string `json:"name"`
+		Conclusion string `json:"conclusion"`
+	} `json:"workflow_jobs"`
+	AggregateState string `json:"aggregate_state"`
+}
+
+func (b *Broker) ObserveCI(ctx context.Context, task CIRepairTask, requestedHead string) (CIObservation, error) {
+	parts := strings.Split(task.Repository, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || task.PullNumber < 1 || !githubSHA.MatchString(requestedHead) {
+		return CIObservation{}, permanentMalformed("invalid CI observation coordinates", nil)
+	}
+	base, err := url.Parse(b.ReporterURL)
+	if err != nil || b.ReporterURL == "" {
+		return CIObservation{}, permanentMalformed("parse CI broker URL", err)
+	}
+	base.Path = "/v1/repos/" + parts[0] + "/" + parts[1] + fmt.Sprintf("/pulls/%d/ci-observation", task.PullNumber)
+	base.RawPath = "/v1/repos/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1]) + fmt.Sprintf("/pulls/%d/ci-observation", task.PullNumber)
+	query := base.Query()
+	query.Set("head_sha", requestedHead)
+	base.RawQuery = query.Encode()
+	base.Fragment = ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	if err != nil {
+		return CIObservation{}, permanentMalformed("create CI observation request", err)
+	}
+	b.authorizeReporter(req)
+	var raw brokerCIObservation
+	if err := b.doJSONLimit(req, &raw, maxCIObservationBytes); err != nil {
+		return CIObservation{}, err
+	}
+	if raw.RequestedHeadSHA != requestedHead || raw.Pull.Number != task.PullNumber || raw.Pull.HeadSHA != requestedHead {
+		return CIObservation{}, permanentMalformed("CI observation does not match requested and authoritative PR head", nil)
+	}
+	switch raw.AggregateState {
+	case CIStatePending, CIStateSuccess, CIStateCodeFailure, CIStateInfrastructure:
+	default:
+		return CIObservation{}, permanentMalformed("CI observation has invalid aggregate_state", nil)
+	}
+	result := CIObservation{Repository: task.Repository, PullNumber: raw.Pull.Number, HeadSHA: raw.Pull.HeadSHA, State: raw.AggregateState}
+	appendFailure := func(name, conclusion, summary string) {
+		if len(result.FailedChecks) >= 32 {
+			return
+		}
+		name, conclusion, summary = strings.TrimSpace(name), strings.TrimSpace(conclusion), strings.TrimSpace(summary)
+		if name == "" {
+			return
+		}
+		if len(name) > 160 {
+			name = name[:160]
+		}
+		if len(conclusion) > 64 {
+			conclusion = conclusion[:64]
+		}
+		if len(summary) > 512 {
+			summary = summary[:512]
+		}
+		result.FailedChecks = append(result.FailedChecks, FailedCheck{Name: name, Conclusion: conclusion, Summary: summary})
+	}
+	for _, check := range raw.CheckRuns.CheckRuns {
+		if failedCIConclusion(check.Conclusion) {
+			summary := ""
+			if check.Output != nil {
+				summary = strings.TrimSpace(check.Output.Title + ": " + check.Output.Summary)
+			}
+			appendFailure(check.Name, check.Conclusion, summary)
+		}
+	}
+	for _, status := range raw.CommitStatus.Statuses {
+		if status.State == "failure" || status.State == "error" {
+			appendFailure(status.Context, status.State, status.Description)
+		}
+	}
+	for _, job := range raw.WorkflowJobs {
+		if failedCIConclusion(job.Conclusion) {
+			appendFailure(job.Name, job.Conclusion, "Actions job")
+		}
+	}
+	return result, nil
+}
+
+func failedCIConclusion(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "failure", "failed", "timed_out", "cancelled", "startup_failure", "stale":
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *Broker) LaunchRepair(ctx context.Context, task CIRepairTask, attempt CIRepairAttempt, now time.Time) (LaunchResult, error) {
+	remaining := task.DeadlineAt.Sub(now)
+	if remaining <= 0 {
+		return LaunchResult{}, permanentMalformed("repair deadline has expired", nil)
+	}
+	seconds := int((remaining + time.Second - 1) / time.Second)
+	body, err := json.Marshal(map[string]any{"max_runtime_seconds": seconds, "parameters": map[string]any{
+		"issue_number": task.IssueNumber, "source_delivery_id": repairSourceID(attempt.AttemptKey),
+		"repair_pr_number": task.PullNumber, "expected_head_sha": attempt.FailedHeadSHA,
+	}})
+	if err != nil {
+		return LaunchResult{}, permanentMalformed("encode repair launch request", err)
+	}
+	endpoint, err := b.launchURL(attempt.AgentModel)
+	if err != nil {
+		return LaunchResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return LaunchResult{}, permanentMalformed("create repair launch request", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", attempt.AttemptKey)
+	b.authorize(req)
+	var result LaunchResult
+	if err := b.doJSON(req, &result); err != nil {
+		return LaunchResult{}, err
+	}
+	result.RunID = strings.TrimSpace(result.RunID)
+	if result.RunID == "" {
+		return LaunchResult{}, permanentMalformed("repair launch response is missing run_id", nil)
+	}
+	return result, nil
+}
+
+func repairSourceID(attemptKey string) string {
+	return fmt.Sprintf("ci-repair-v1-%x", sha256.Sum256([]byte(attemptKey)))
+}
+
 func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 	body, err := json.Marshal(struct {
 		Parameters struct {
@@ -210,7 +364,18 @@ func (b *Broker) authorize(req *http.Request) {
 	}
 }
 
+func (b *Broker) authorizeReporter(req *http.Request) {
+	if b.ReporterToken != "" {
+		req.Header.Set("X-Agent-ID", terminalReporterAgentID)
+		req.Header.Set("X-Agent-Secret", b.ReporterToken)
+	}
+}
+
 func (b *Broker) doJSON(req *http.Request, destination any) error {
+	return b.doJSONLimit(req, destination, maxBrokerResponseBytes)
+}
+
+func (b *Broker) doJSONLimit(req *http.Request, destination any, limit int64) error {
 	client := b.Client
 	if client == nil {
 		client = http.DefaultClient
@@ -220,12 +385,12 @@ func (b *Broker) doJSON(req *http.Request, destination any) error {
 		return BrokerError{Transport: true, Message: "broker transport failure: " + err.Error()}
 	}
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxBrokerResponseBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
 		return BrokerError{Transport: true, Message: "read broker response: " + err.Error()}
 	}
-	if len(raw) > maxBrokerResponseBytes {
-		return permanentMalformed(fmt.Sprintf("broker response exceeds %d bytes", maxBrokerResponseBytes), nil)
+	if int64(len(raw)) > limit {
+		return permanentMalformed(fmt.Sprintf("broker response exceeds %d bytes", limit), nil)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		code, message := structuredBrokerError(raw)

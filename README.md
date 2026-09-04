@@ -46,7 +46,8 @@ isolated in `github-task-dispatcher`.
   `issues/labeled` event, label, and broker launch profile. Provider payloads
   can select only one of those routes; they cannot select images, commands,
   credentials, tasks, models, or launch arguments. The dispatcher stores only
-  delivery/job control data in SQLite WAL.
+  delivery/job control data in SQLite WAL. Ready pull requests continue through
+  the [event-driven CI repair lifecycle](docs/repository-ci-repair.md).
 - `internal/workledger`: source-neutral admission, deduplication,
   serialization, supersession, retry, and interrupted-attempt recovery behind
   a SQLite store. GitHub is the first authenticated ingress adapter. The core

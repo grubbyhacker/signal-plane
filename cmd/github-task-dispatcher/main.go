@@ -68,6 +68,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	if err := store.ConfigureCIRepair(dispatcher.CIRepairPolicy{Deadline: cfg.Dispatcher.RepairDeadline, MaxAttempts: cfg.Dispatcher.RepairMaxAttempts}); err != nil {
+		logger.Error("configure CI repair lifecycle failed", "error", err)
+		os.Exit(1)
+	}
 	if err := store.AssertRecoveryComplete(context.Background(), cfg.Dispatcher.Durable, cfg.Dispatcher.RecoveryStartSequence); err != nil {
 		logger.Error("dispatcher recovery gate failed", "error", err)
 		os.Exit(1)

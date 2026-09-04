@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadAppliesDefaultsAndEnvOverrides(t *testing.T) {
@@ -51,6 +52,7 @@ func TestValidateDispatcherRequiresFixedBrokerOriginAndReviewedRoutes(t *testing
 		Dispatcher: DispatcherConfig{
 			Enabled: true, Subject: "signals.github.>", Durable: "dispatcher", DatabasePath: "jobs.db",
 			BrokerURL: "https://broker.internal", BrokerTokenEnv: "BROKER_TOKEN", Workers: 1,
+			RepairDeadline: 2 * time.Hour, RepairMaxAttempts: 2,
 			RepositoryTaskRoutes: []RepositoryTaskRoute{{
 				ID: "thoughts-optimize-images", Repository: "grubbyhacker/thoughts",
 				Event: "issues", Action: "labeled", Label: "automation:requested", Profile: "thoughts-optimize-images",
@@ -94,6 +96,8 @@ dispatcher:
   broker_url: https://broker.internal
   broker_token_env: BROKER_TOKEN
   workers: 1
+  repair_deadline: 2h
+  repair_max_attempts: 2
   repository_task_routes:
     - id: route
       repository: owner/repo
@@ -173,6 +177,16 @@ func TestValidateAdmissionTuples(t *testing.T) {
 	push.Routes[0].Admission.Tuples[0].Actions = []string{"created"}
 	if err := push.Validate(); err == nil {
 		t.Fatal("push tuple with action was accepted")
+	}
+	status := base
+	status.Routes = append([]Route(nil), base.Routes...)
+	status.Routes[0].Admission.Tuples = []AdmissionTuple{{Repository: "owner/repo", Event: "status"}}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("valid actionless status tuple rejected: %v", err)
+	}
+	status.Routes[0].Admission.Tuples[0].Actions = []string{"completed"}
+	if err := status.Validate(); err == nil {
+		t.Fatal("status tuple with action was accepted")
 	}
 	tests := []struct {
 		name   string
