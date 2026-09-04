@@ -68,7 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
-	if err := store.ConfigureCIRepair(dispatcher.CIRepairPolicy{Deadline: cfg.Dispatcher.RepairDeadline, MaxAttempts: cfg.Dispatcher.RepairMaxAttempts}); err != nil {
+	if err := store.ConfigureCIRepair(dispatcher.CIRepairPolicy{ReconciliationWake: cfg.Dispatcher.CIRepairReconciliationWake(), ActiveTimeout: cfg.Dispatcher.CIRepairActiveTimeout(), MaxAttempts: cfg.Dispatcher.RepairMaxAttempts}); err != nil {
 		logger.Error("configure CI repair lifecycle failed", "error", err)
 		os.Exit(1)
 	}
@@ -273,6 +273,9 @@ func runRecovery(args []string, output io.Writer) error {
 		return fmt.Errorf("open restored dispatcher database: %w", err)
 	}
 	defer store.Close()
+	if err := store.ConfigureCIRepair(dispatcher.CIRepairPolicy{ReconciliationWake: cfg.Dispatcher.CIRepairReconciliationWake(), ActiveTimeout: cfg.Dispatcher.CIRepairActiveTimeout(), MaxAttempts: cfg.Dispatcher.RepairMaxAttempts}); err != nil {
+		return fmt.Errorf("configure recovery CI repair lifecycle: %w", err)
+	}
 	runner := recovery.Runner{Store: store, Routes: cfg.Dispatcher.RepositoryTaskRoutes, Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
 	if *execute {
 		token := os.Getenv(cfg.Dispatcher.BrokerTokenEnv)

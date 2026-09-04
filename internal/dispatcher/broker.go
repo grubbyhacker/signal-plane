@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const (
@@ -117,8 +116,10 @@ type LaunchResult struct {
 }
 
 type RunStatus struct {
-	RunID  string `json:"run_id"`
-	Status string `json:"status"`
+	RunID        string          `json:"run_id"`
+	Status       string          `json:"status"`
+	ExternalWait *CIExternalWait `json:"external_wait,omitempty"`
+	Replay       bool            `json:"replay,omitempty"`
 }
 
 type brokerCIObservation struct {
@@ -234,13 +235,11 @@ func failedCIConclusion(value string) bool {
 	}
 }
 
-func (b *Broker) LaunchRepair(ctx context.Context, task CIRepairTask, attempt CIRepairAttempt, now time.Time) (LaunchResult, error) {
-	remaining := task.DeadlineAt.Sub(now)
-	if remaining <= 0 {
-		return LaunchResult{}, permanentMalformed("repair deadline has expired", nil)
+func (b *Broker) LaunchRepair(ctx context.Context, task CIRepairTask, attempt CIRepairAttempt) (LaunchResult, error) {
+	if attempt.MaxRuntimeSeconds < 1 {
+		return LaunchResult{}, permanentMalformed("repair active runtime is missing", nil)
 	}
-	seconds := int((remaining + time.Second - 1) / time.Second)
-	body, err := json.Marshal(map[string]any{"max_runtime_seconds": seconds, "parameters": map[string]any{
+	body, err := json.Marshal(map[string]any{"max_runtime_seconds": attempt.MaxRuntimeSeconds, "parameters": map[string]any{
 		"issue_number": task.IssueNumber, "source_delivery_id": repairSourceID(attempt.AttemptKey),
 		"repair_pr_number": task.PullNumber, "expected_head_sha": attempt.FailedHeadSHA,
 	}})
@@ -265,6 +264,37 @@ func (b *Broker) LaunchRepair(ctx context.Context, task CIRepairTask, attempt CI
 	result.RunID = strings.TrimSpace(result.RunID)
 	if result.RunID == "" {
 		return LaunchResult{}, permanentMalformed("repair launch response is missing run_id", nil)
+	}
+	return result, nil
+}
+
+func (b *Broker) ResumeRun(ctx context.Context, runID, idempotencyKey string, maxRuntimeSeconds int) (RunStatus, error) {
+	if runID == "" || idempotencyKey == "" || maxRuntimeSeconds < 1 {
+		return RunStatus{}, permanentMalformed("run resume requires run, idempotency, and active runtime identities", nil)
+	}
+	body, err := json.Marshal(map[string]int{"max_runtime_seconds": maxRuntimeSeconds})
+	if err != nil {
+		return RunStatus{}, permanentMalformed("encode run resume request", err)
+	}
+	endpoint, err := runEndpoint(b.URL, runID, "resume")
+	if err != nil {
+		return RunStatus{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return RunStatus{}, permanentMalformed("create run resume request", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+	b.authorize(req)
+	var result RunStatus
+	if err := b.doJSON(req, &result); err != nil {
+		return RunStatus{}, err
+	}
+	result.RunID = strings.TrimSpace(result.RunID)
+	result.Status = strings.ToLower(strings.TrimSpace(result.Status))
+	if result.RunID != runID || result.Status == "" {
+		return RunStatus{}, permanentMalformed("run resume response has invalid run_id or status", nil)
 	}
 	return result, nil
 }

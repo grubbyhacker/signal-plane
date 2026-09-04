@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,7 +26,25 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 	}))
 	defer mainBroker.Close()
 	sandbox := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/launch-profiles/terra-medium-v1/launch" || r.Header.Get("Idempotency-Key") != "ci-repair:v1:7:terra-medium-v1:"+head+":1" || r.Header.Get("Authorization") != "Bearer sandbox-token" {
+		if r.Header.Get("Authorization") != "Bearer sandbox-token" {
+			t.Fatalf("unexpected launch request %s key=%q", r.URL.Path, r.Header.Get("Idempotency-Key"))
+		}
+		if r.URL.Path == "/v1/runs/repair-run/resume" {
+			if r.Header.Get("Idempotency-Key") != "resume-key" {
+				t.Fatalf("unexpected resume key %q", r.Header.Get("Idempotency-Key"))
+			}
+			var body map[string]int
+			if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 1 || body["max_runtime_seconds"] != 600 {
+				t.Fatalf("unexpected resume body %+v", body)
+			}
+			_, _ = w.Write([]byte(`{"run_id":"repair-run","status":"running","replay":false}`))
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/repair-run" {
+			_, _ = w.Write([]byte(`{"run_id":"repair-run","status":"waiting_external","external_wait":{"service":"github","phase":"delivery","operation":"git.push","reason":"rate_limited","generation":3,"since":"2026-09-03T18:00:00Z"}}`))
+			return
+		}
+		if r.URL.Path != "/v1/launch-profiles/terra-medium-v1/launch" || r.Header.Get("Idempotency-Key") != "ci-repair:v1:7:terra-medium-v1:"+head+":1" {
 			t.Fatalf("unexpected launch request %s key=%q", r.URL.Path, r.Header.Get("Idempotency-Key"))
 		}
 		var body struct {
@@ -44,16 +63,23 @@ func TestBrokerCIObservationAndRepairLaunchContract(t *testing.T) {
 	}))
 	defer sandbox.Close()
 	b := &Broker{URL: sandbox.URL, Token: "sandbox-token", ReporterURL: mainBroker.URL, ReporterToken: "reporter-secret", Client: sandbox.Client()}
-	now := time.Unix(50_000, 0).UTC()
-	task := CIRepairTask{JobID: 7, Repository: "example/automation-target", IssueNumber: 41, PullNumber: 9, DeadlineAt: now.Add(10 * time.Minute)}
+	task := CIRepairTask{JobID: 7, Repository: "example/automation-target", IssueNumber: 41, PullNumber: 9}
 	observation, err := b.ObserveCI(context.Background(), task, head)
 	if err != nil || observation.HeadSHA != head || observation.State != CIStateCodeFailure || len(observation.FailedChecks) != 3 {
 		t.Fatalf("observation=%+v err=%v", observation, err)
 	}
-	attempt := CIRepairAttempt{AttemptKey: "ci-repair:v1:7:terra-medium-v1:" + head + ":1", FailedHeadSHA: head, AgentModel: "terra-medium-v1"}
-	launch, err := b.LaunchRepair(context.Background(), task, attempt, now)
+	attempt := CIRepairAttempt{AttemptKey: "ci-repair:v1:7:terra-medium-v1:" + head + ":1", FailedHeadSHA: head, AgentModel: "terra-medium-v1", MaxRuntimeSeconds: 600}
+	launch, err := b.LaunchRepair(context.Background(), task, attempt)
 	if err != nil || launch.RunID != "repair-run" {
 		t.Fatalf("launch=%+v err=%v", launch, err)
+	}
+	status, err := b.Status(context.Background(), "repair-run")
+	if err != nil || status.Status != "waiting_external" || status.ExternalWait == nil || status.ExternalWait.Generation != 3 || status.ExternalWait.Operation != "git.push" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	resumed, err := b.ResumeRun(context.Background(), "repair-run", "resume-key", 600)
+	if err != nil || resumed.RunID != "repair-run" || resumed.Status != "running" || resumed.Replay {
+		t.Fatalf("resume=%+v err=%v", resumed, err)
 	}
 }
 
@@ -61,6 +87,8 @@ type lifecycleRepairBroker struct {
 	head    string
 	task    CIRepairTask
 	attempt CIRepairAttempt
+	status  string
+	runID   string
 }
 
 func (*lifecycleRepairBroker) Launch(context.Context, Job) (LaunchResult, error) {
@@ -70,12 +98,22 @@ func (b *lifecycleRepairBroker) ObserveCI(_ context.Context, task CIRepairTask, 
 	b.task = task
 	return observation(head, CIStateCodeFailure), nil
 }
-func (b *lifecycleRepairBroker) LaunchRepair(_ context.Context, task CIRepairTask, attempt CIRepairAttempt, _ time.Time) (LaunchResult, error) {
+func (b *lifecycleRepairBroker) LaunchRepair(_ context.Context, task CIRepairTask, attempt CIRepairAttempt) (LaunchResult, error) {
 	b.task, b.attempt = task, attempt
 	return LaunchResult{RunID: "repair-run-1"}, nil
 }
-func (*lifecycleRepairBroker) Status(context.Context, string) (RunStatus, error) {
-	return RunStatus{RunID: "repair-run-1", Status: "completed"}, nil
+func (b *lifecycleRepairBroker) Status(context.Context, string) (RunStatus, error) {
+	status, runID := b.status, b.runID
+	if status == "" {
+		status = "completed"
+	}
+	if runID == "" {
+		runID = "repair-run-1"
+	}
+	return RunStatus{RunID: runID, Status: status}, nil
+}
+func (*lifecycleRepairBroker) ResumeRun(context.Context, string, string, int) (RunStatus, error) {
+	return RunStatus{}, errors.New("unexpected resume")
 }
 func (b *lifecycleRepairBroker) TerminalResult(context.Context, string) (TerminalResult, error) {
 	tree := strings.Repeat("d", 40)
@@ -91,7 +129,7 @@ func TestRunOneDrivesRepairThroughExactDeliveredTree(t *testing.T) {
 	now := time.Unix(60_000, 0).UTC()
 	store, _ := setupCIRepairTask(t, now.Add(time.Hour))
 	defer store.Close()
-	if err := store.ConfigureCIRepair(CIRepairPolicy{Deadline: time.Hour, MaxAttempts: 2}); err != nil {
+	if err := store.ConfigureCIRepair(CIRepairPolicy{ActiveTimeout: time.Hour, MaxAttempts: 2}); err != nil {
 		t.Fatal(err)
 	}
 	broker := &lifecycleRepairBroker{head: strings.Repeat("a", 40)}
@@ -110,5 +148,73 @@ func TestRunOneDrivesRepairThroughExactDeliveredTree(t *testing.T) {
 	}
 	if state != CIWaiting || head != strings.Repeat("b", 40) || charged != 1 {
 		t.Fatalf("state=%s head=%s charged=%d", state, head, charged)
+	}
+}
+
+type externalWaitBroker struct {
+	head       string
+	wait       CIExternalWait
+	resumeKey  string
+	resumeSecs int
+	observed   int
+	resumed    int
+}
+
+func (*externalWaitBroker) Launch(context.Context, Job) (LaunchResult, error) {
+	return LaunchResult{}, nil
+}
+func (b *externalWaitBroker) ObserveCI(_ context.Context, task CIRepairTask, head string) (CIObservation, error) {
+	b.observed++
+	return observation(head, CIStateCodeFailure), nil
+}
+func (*externalWaitBroker) LaunchRepair(context.Context, CIRepairTask, CIRepairAttempt) (LaunchResult, error) {
+	return LaunchResult{}, errors.New("unexpected launch")
+}
+func (b *externalWaitBroker) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{RunID: "repair-run-wait", Status: "waiting_external", ExternalWait: &b.wait}, nil
+}
+func (*externalWaitBroker) TerminalResult(context.Context, string) (TerminalResult, error) {
+	return TerminalResult{}, errors.New("unexpected terminal")
+}
+func (b *externalWaitBroker) ResumeRun(_ context.Context, runID, key string, seconds int) (RunStatus, error) {
+	b.resumed++
+	b.resumeKey, b.resumeSecs = key, seconds
+	return RunStatus{RunID: runID, Status: "running"}, nil
+}
+
+func TestRunOneDurablyResumesBrokerExternalWaitWithoutCharging(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(70_000, 0).UTC()
+	store, _ := setupCIRepairTask(t, now.Add(time.Hour))
+	defer store.Close()
+	head := strings.Repeat("a", 40)
+	work, ok, err := store.ClaimCIReconciliation(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if err := store.ApplyCIObservation(ctx, work, observation(head, CIStateCodeFailure), 2, now); err != nil {
+		t.Fatal(err)
+	}
+	_, attempt, ok, err := store.ClaimCIRepair(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("attempt ok=%v err=%v", ok, err)
+	}
+	if err := store.BindCIRepairRun(ctx, attempt, "repair-run-wait", now); err != nil {
+		t.Fatal(err)
+	}
+	wait := CIExternalWait{Service: "github", Phase: "delivery", Operation: "git.push", Reason: "unavailable", Generation: 2, Since: now.Add(time.Second)}
+	broker := &externalWaitBroker{head: head, wait: wait}
+	worked, err := RunOne(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), NewMetrics(), store, broker, now.Add(StatusPollInterval))
+	if err != nil || !worked {
+		t.Fatalf("worked=%v err=%v", worked, err)
+	}
+	var generation, resumed, charged int
+	var key string
+	if err := store.db.QueryRow(`SELECT external_wait_generation,resumed_external_wait_generation,external_resume_key,charged FROM repository_ci_attempts WHERE attempt_key=?`, attempt.AttemptKey).Scan(&generation, &resumed, &key, &charged); err != nil {
+		t.Fatal(err)
+	}
+	wantKey := ciResumeKey(attempt.AttemptKey, wait.Generation)
+	if broker.observed != 1 || broker.resumed != 1 || broker.resumeKey != wantKey || broker.resumeSecs != 3600 || generation != 2 || resumed != 2 || key != wantKey || charged != 0 {
+		t.Fatalf("broker=%+v generation=%d resumed=%d key=%q charged=%d", broker, generation, resumed, key, charged)
 	}
 }

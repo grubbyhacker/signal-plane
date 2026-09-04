@@ -63,6 +63,32 @@ func TestValidateDispatcherRequiresFixedBrokerOriginAndReviewedRoutes(t *testing
 	if err := base.Validate(); err != nil {
 		t.Fatalf("valid fixed endpoint rejected: %v", err)
 	}
+	if got := base.Dispatcher.CIRepairReconciliationWake(); got != 2*time.Hour {
+		t.Fatalf("legacy reconciliation wake=%s", got)
+	}
+	if got := base.Dispatcher.CIRepairActiveTimeout(); got != time.Hour {
+		t.Fatalf("legacy active timeout was not capped to reviewed template: %s", got)
+	}
+	legacySevenDays := base
+	legacySevenDays.Dispatcher.RepairDeadline = 7 * 24 * time.Hour
+	if err := legacySevenDays.Validate(); err != nil {
+		t.Fatalf("legacy seven-day reconciliation wake rejected: %v", err)
+	}
+	if got := legacySevenDays.Dispatcher.CIRepairActiveTimeout(); got != time.Hour {
+		t.Fatalf("legacy seven-day active timeout was not capped to reviewed template: %s", got)
+	}
+	separate := base
+	separate.Dispatcher.RepairDeadline = 0
+	separate.Dispatcher.RepairReconciliationWake = 24 * time.Hour
+	separate.Dispatcher.RepairActiveTimeout = 45 * time.Minute
+	if err := separate.Validate(); err != nil {
+		t.Fatalf("separate repair timing rejected: %v", err)
+	}
+	partial := separate
+	partial.Dispatcher.RepairActiveTimeout = 0
+	if err := partial.Validate(); err == nil || !strings.Contains(err.Error(), "both repair_reconciliation_wake and repair_active_timeout") {
+		t.Fatalf("partial repair timing error=%v", err)
+	}
 	multipleWorkers := base
 	multipleWorkers.Dispatcher.Workers = 2
 	if err := multipleWorkers.Validate(); err == nil || !strings.Contains(err.Error(), "exactly one worker") {

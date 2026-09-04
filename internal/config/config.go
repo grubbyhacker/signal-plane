@@ -83,20 +83,39 @@ type WorkRouterConfig struct {
 }
 
 type DispatcherConfig struct {
-	Enabled                bool                  `yaml:"enabled"`
-	Addr                   string                `yaml:"addr"`
-	Subject                string                `yaml:"subject"`
-	Durable                string                `yaml:"durable"`
-	DatabasePath           string                `yaml:"database_path"`
-	BrokerURL              string                `yaml:"broker_url"`
-	BrokerTokenEnv         string                `yaml:"broker_token_env"`
-	ReporterBrokerURL      string                `yaml:"reporter_broker_url"`
-	ReporterBrokerTokenEnv string                `yaml:"reporter_broker_token_env"`
-	Workers                int                   `yaml:"workers"`
-	RecoveryStartSequence  uint64                `yaml:"recovery_start_sequence"`
-	RepairDeadline         time.Duration         `yaml:"repair_deadline"`
-	RepairMaxAttempts      int                   `yaml:"repair_max_attempts"`
-	RepositoryTaskRoutes   []RepositoryTaskRoute `yaml:"repository_task_routes"`
+	Enabled                bool   `yaml:"enabled"`
+	Addr                   string `yaml:"addr"`
+	Subject                string `yaml:"subject"`
+	Durable                string `yaml:"durable"`
+	DatabasePath           string `yaml:"database_path"`
+	BrokerURL              string `yaml:"broker_url"`
+	BrokerTokenEnv         string `yaml:"broker_token_env"`
+	ReporterBrokerURL      string `yaml:"reporter_broker_url"`
+	ReporterBrokerTokenEnv string `yaml:"reporter_broker_token_env"`
+	Workers                int    `yaml:"workers"`
+	RecoveryStartSequence  uint64 `yaml:"recovery_start_sequence"`
+	// RepairDeadline is the legacy combined key retained for rolling upgrade.
+	// New configuration separates durable reconciliation wakes from active
+	// broker execution time.
+	RepairDeadline           time.Duration         `yaml:"repair_deadline"`
+	RepairReconciliationWake time.Duration         `yaml:"repair_reconciliation_wake"`
+	RepairActiveTimeout      time.Duration         `yaml:"repair_active_timeout"`
+	RepairMaxAttempts        int                   `yaml:"repair_max_attempts"`
+	RepositoryTaskRoutes     []RepositoryTaskRoute `yaml:"repository_task_routes"`
+}
+
+func (cfg DispatcherConfig) CIRepairReconciliationWake() time.Duration {
+	if cfg.RepairReconciliationWake > 0 {
+		return cfg.RepairReconciliationWake
+	}
+	return cfg.RepairDeadline
+}
+
+func (cfg DispatcherConfig) CIRepairActiveTimeout() time.Duration {
+	if cfg.RepairActiveTimeout > 0 {
+		return cfg.RepairActiveTimeout
+	}
+	return min(cfg.RepairDeadline, time.Hour)
 }
 
 type RepositoryTaskRoute struct {
@@ -313,8 +332,18 @@ func (cfg Config) Validate() error {
 		if cfg.Dispatcher.Workers != 1 {
 			return errors.New("enabled dispatcher requires exactly one worker")
 		}
-		if cfg.Dispatcher.RepairDeadline < time.Minute || cfg.Dispatcher.RepairDeadline > 7*24*time.Hour {
-			return errors.New("enabled dispatcher repair_deadline must be between one minute and seven days")
+		legacyTiming := cfg.Dispatcher.RepairDeadline > 0
+		separateTiming := cfg.Dispatcher.RepairReconciliationWake > 0 || cfg.Dispatcher.RepairActiveTimeout > 0
+		if legacyTiming == separateTiming || (separateTiming && (cfg.Dispatcher.RepairReconciliationWake == 0 || cfg.Dispatcher.RepairActiveTimeout == 0)) {
+			return errors.New("enabled dispatcher requires either legacy repair_deadline or both repair_reconciliation_wake and repair_active_timeout")
+		}
+		wake := cfg.Dispatcher.CIRepairReconciliationWake()
+		active := cfg.Dispatcher.CIRepairActiveTimeout()
+		if wake < time.Minute || wake > 7*24*time.Hour {
+			return errors.New("enabled dispatcher repair reconciliation wake must be between one minute and seven days")
+		}
+		if active < time.Minute || active > time.Hour {
+			return errors.New("enabled dispatcher repair active timeout must be between one minute and the reviewed 60-minute broker template maximum")
 		}
 		if cfg.Dispatcher.RepairMaxAttempts < 1 || cfg.Dispatcher.RepairMaxAttempts > 2 {
 			return errors.New("enabled dispatcher repair_max_attempts must be between one and two")

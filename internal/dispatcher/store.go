@@ -13,27 +13,28 @@ import (
 )
 
 const (
-	SchemaVersion      = workledger.SchemaVersion
-	checkpointKey      = "last_persisted_jetstream_sequence"
-	StatePendingLaunch = "pending_launch"
-	StateLaunchRetry   = "launch_retry"
-	StateLaunched      = "launched"
-	StateCompleted     = "completed"
-	StateFailed        = "failed"
-	StateTimedOut      = "timed_out"
-	StateReportPending = "report_pending"
-	StateReportRetry   = "report_retry"
-	StateReportBlocked = "report_blocked"
-	StateStopped       = "stopped"
-	StateCancelled     = "cancelled"
-	StateCIWaiting     = "ci_waiting"
-	StateCIRepair      = "ci_repair"
-	StateCIEscalation  = "ci_escalation"
-	RecoveryIncomplete = "incomplete"
-	RecoveryCompleted  = "completed"
+	SchemaVersion        = workledger.SchemaVersion
+	checkpointKey        = "last_persisted_jetstream_sequence"
+	StatePendingLaunch   = "pending_launch"
+	StateLaunchRetry     = "launch_retry"
+	StateLaunched        = "launched"
+	StateCompleted       = "completed"
+	StateFailed          = "failed"
+	StateTimedOut        = "timed_out"
+	StateReportPending   = "report_pending"
+	StateReportRetry     = "report_retry"
+	StateReportBlocked   = "report_blocked"
+	StateStopped         = "stopped"
+	StateCancelled       = "cancelled"
+	StateCIWaiting       = "ci_waiting"
+	StateCIRepair        = "ci_repair"
+	StateCIEscalation    = "ci_escalation"
+	StateExternalWaiting = "external_waiting"
+	RecoveryIncomplete   = "incomplete"
+	RecoveryCompleted    = "completed"
 )
 
-var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateCIWaiting, StateCIRepair, StateCIEscalation, StateReportPending, StateReportRetry, StateReportBlocked, StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled}
+var lifecycleStates = []string{StatePendingLaunch, StateLaunchRetry, StateLaunched, StateExternalWaiting, StateCIWaiting, StateCIRepair, StateCIEscalation, StateReportPending, StateReportRetry, StateReportBlocked, StateCompleted, StateFailed, StateTimedOut, StateStopped, StateCancelled}
 
 type Store struct {
 	db       *sql.DB
@@ -367,7 +368,7 @@ func (s *Store) FailRecovery(ctx context.Context, id string, failure error) erro
 }
 
 func (s *Store) RecoveryJobs(ctx context.Context) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?) ORDER BY id`, StatePendingLaunch, StateLaunchRetry, StateLaunched)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?,?) ORDER BY id`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateExternalWaiting)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +401,7 @@ func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]J
 		return nil, err
 	}
 	if expected < 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_jobs(recovery_id,job_id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at) SELECT ?,id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?)`, recoveryID, StatePendingLaunch, StateLaunchRetry, StateLaunched); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO recovery_jobs(recovery_id,job_id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,prior_status,attempts,first_launch_attempt_at) SELECT ?,id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,first_launch_attempt_at FROM jobs WHERE status IN (?,?,?,?)`, recoveryID, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateExternalWaiting); err != nil {
 			return nil, err
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM recovery_jobs WHERE recovery_id=?`, recoveryID).Scan(&expected); err != nil {
@@ -434,10 +435,10 @@ func (s *Store) PrepareRecoveryJobs(ctx context.Context, recoveryID string) ([]J
 }
 
 func (s *Store) RecordReconciliation(ctx context.Context, recoveryID string, job Job, brokerStatus, reconciledStatus string, now time.Time) error {
-	if job.Status != StateLaunched || job.BrokerRunID == "" {
+	if (job.Status != StateLaunched && job.Status != StateExternalWaiting) || job.BrokerRunID == "" {
 		return fmt.Errorf("restored nonterminal job %d has no reconcilable broker run", job.ID)
 	}
-	if reconciledStatus != StateLaunched && reconciledStatus != StateReportPending {
+	if reconciledStatus != StateLaunched && reconciledStatus != StateExternalWaiting && reconciledStatus != StateReportPending {
 		return fmt.Errorf("invalid reconciled status %q", reconciledStatus)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -457,7 +458,7 @@ func (s *Store) RecordReconciliation(ctx context.Context, recoveryID string, job
 		if err := expectOne(result, err, "reconcile nonterminal job"); err != nil {
 			return err
 		}
-	} else {
+	} else if reconciledStatus == StateReportPending {
 		var terminalRows, outboxRows int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM terminal_results WHERE job_id=?`, job.ID).Scan(&terminalRows); err != nil {
 			return err
@@ -565,7 +566,7 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	var job Job
 	var first sql.NullInt64
 	var due int64
-	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,pre_outbox_attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?,?) AND (status<>? OR NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateReportPending, StateReportPending).
+	err = tx.QueryRowContext(ctx, `SELECT id,semantic_key,route_id,launch_profile,repository,issue_number,source_delivery_id,broker_run_id,status,attempts,pre_outbox_attempts,first_launch_attempt_at,due_at FROM jobs WHERE status IN (?,?,?,?,?) AND (status<>? OR NOT EXISTS (SELECT 1 FROM terminal_results WHERE terminal_results.job_id=jobs.id)) ORDER BY created_at,id LIMIT 1`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateExternalWaiting, StateReportPending, StateReportPending).
 		Scan(&job.ID, &job.SemanticKey, &job.RouteID, &job.Profile, &job.Repository, &job.IssueNumber, &job.DeliveryID, &job.BrokerRunID, &job.Status, &job.Attempts, &job.PreOutboxAttempts, &first, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Work{}, false, nil
@@ -579,7 +580,7 @@ func (s *Store) ClaimDue(ctx context.Context, now time.Time) (Work, bool, error)
 	if due > now.UnixMilli() {
 		return Work{}, false, nil
 	}
-	if job.Status == StateLaunched || job.Status == StateReportPending {
+	if job.Status == StateLaunched || job.Status == StateExternalWaiting || job.Status == StateReportPending {
 		return Work{Kind: WorkStatus, Job: job}, true, tx.Commit()
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE jobs SET attempts=attempts+1,first_launch_attempt_at=COALESCE(first_launch_attempt_at,?),updated_at=? WHERE id=? AND status IN (?,?)`, now.UnixMilli(), now.UnixMilli(), job.ID, StatePendingLaunch, StateLaunchRetry)
@@ -708,7 +709,7 @@ func (s *Store) Stats(ctx context.Context, now time.Time) (StoreStats, error) {
 		return stats, err
 	}
 	var oldest sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MIN(created_at) FROM jobs WHERE status IN (?,?,?)`, StatePendingLaunch, StateLaunchRetry, StateLaunched).Scan(&oldest); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(created_at) FROM jobs WHERE status IN (?,?,?,?)`, StatePendingLaunch, StateLaunchRetry, StateLaunched, StateExternalWaiting).Scan(&oldest); err != nil {
 		return stats, err
 	}
 	if oldest.Valid && now.After(time.UnixMilli(oldest.Int64)) {

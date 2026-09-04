@@ -36,10 +36,11 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS repository_ci_events_semantic ON repository_ci_events(semantic_identity)`,
 		`CREATE TABLE IF NOT EXISTS repository_ci_reconciliations (operation_key TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES repository_ci_tasks(job_id), head_sha TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','running','completed')), deadline_wake INTEGER NOT NULL DEFAULT 0, dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0,1)), operation_attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', due_at INTEGER NOT NULL, result_digest TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(job_id,head_sha))`,
 		`CREATE INDEX IF NOT EXISTS repository_ci_reconciliations_due ON repository_ci_reconciliations(state,due_at)`,
-		`CREATE TABLE IF NOT EXISTS repository_ci_attempts (attempt_key TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES repository_ci_tasks(job_id), attempt_number INTEGER NOT NULL CHECK(attempt_number BETWEEN 1 AND 2), failed_head_sha TEXT NOT NULL, agent_model TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('ready','running','candidate_delivered','failed')), charged INTEGER NOT NULL DEFAULT 0 CHECK(charged IN (0,1)), broker_run_id TEXT NOT NULL DEFAULT '', expected_old_head_sha TEXT NOT NULL DEFAULT '', candidate_head_sha TEXT NOT NULL DEFAULT '', validated_tree_sha TEXT NOT NULL DEFAULT '', delivered_head_sha TEXT NOT NULL DEFAULT '', delivered_tree_sha TEXT NOT NULL DEFAULT '', failure_class TEXT NOT NULL DEFAULT '', operation_attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', due_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(job_id,attempt_number))`,
+		`CREATE TABLE IF NOT EXISTS repository_ci_attempts (attempt_key TEXT PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES repository_ci_tasks(job_id), attempt_number INTEGER NOT NULL CHECK(attempt_number BETWEEN 1 AND 2), failed_head_sha TEXT NOT NULL, agent_model TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('ready','running','candidate_delivered','failed')), charged INTEGER NOT NULL DEFAULT 0 CHECK(charged IN (0,1)), broker_run_id TEXT NOT NULL DEFAULT '', max_runtime_seconds INTEGER NOT NULL DEFAULT 0 CHECK(max_runtime_seconds>=0), external_wait_service TEXT NOT NULL DEFAULT '', external_wait_phase TEXT NOT NULL DEFAULT '', external_wait_operation TEXT NOT NULL DEFAULT '', external_wait_reason TEXT NOT NULL DEFAULT '', external_wait_generation INTEGER NOT NULL DEFAULT 0 CHECK(external_wait_generation>=0), external_wait_since INTEGER, external_resume_key TEXT NOT NULL DEFAULT '', resumed_external_wait_generation INTEGER NOT NULL DEFAULT 0 CHECK(resumed_external_wait_generation>=0), expected_old_head_sha TEXT NOT NULL DEFAULT '', candidate_head_sha TEXT NOT NULL DEFAULT '', validated_tree_sha TEXT NOT NULL DEFAULT '', delivered_head_sha TEXT NOT NULL DEFAULT '', delivered_tree_sha TEXT NOT NULL DEFAULT '', failure_class TEXT NOT NULL DEFAULT '', operation_attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', due_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(job_id,attempt_number))`,
 		`CREATE INDEX IF NOT EXISTS repository_ci_attempts_due ON repository_ci_attempts(state,due_at)`,
+		`CREATE TABLE IF NOT EXISTS repository_run_external_waits (job_id INTEGER PRIMARY KEY REFERENCES jobs(id), broker_run_id TEXT NOT NULL, service TEXT NOT NULL, phase TEXT NOT NULL, operation TEXT NOT NULL, reason TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>0), since INTEGER NOT NULL, resume_key TEXT NOT NULL UNIQUE, max_runtime_seconds INTEGER NOT NULL CHECK(max_runtime_seconds>0), state TEXT NOT NULL CHECK(state IN ('waiting','resume_ready','resumed')), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS repository_ci_escalation_outbox (job_id INTEGER PRIMARY KEY REFERENCES repository_ci_tasks(job_id), operation_key TEXT NOT NULL UNIQUE, body TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','delivered','blocked')), attempts INTEGER NOT NULL DEFAULT 0, comment_id INTEGER, comment_url TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', due_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
-		`PRAGMA user_version=20`,
+		`PRAGMA user_version=21`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -55,6 +56,21 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		{"wait_deadline_at", `wait_deadline_at INTEGER`},
 	} {
 		if err := ensureMigrationColumn(ctx, tx, "work_items", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"max_runtime_seconds", `max_runtime_seconds INTEGER NOT NULL DEFAULT 0 CHECK(max_runtime_seconds>=0)`},
+		{"external_wait_service", `external_wait_service TEXT NOT NULL DEFAULT ''`},
+		{"external_wait_phase", `external_wait_phase TEXT NOT NULL DEFAULT ''`},
+		{"external_wait_operation", `external_wait_operation TEXT NOT NULL DEFAULT ''`},
+		{"external_wait_reason", `external_wait_reason TEXT NOT NULL DEFAULT ''`},
+		{"external_wait_generation", `external_wait_generation INTEGER NOT NULL DEFAULT 0 CHECK(external_wait_generation>=0)`},
+		{"external_wait_since", `external_wait_since INTEGER`},
+		{"external_resume_key", `external_resume_key TEXT NOT NULL DEFAULT ''`},
+		{"resumed_external_wait_generation", `resumed_external_wait_generation INTEGER NOT NULL DEFAULT 0 CHECK(resumed_external_wait_generation>=0)`},
+	} {
+		if err := ensureMigrationColumn(ctx, tx, "repository_ci_attempts", column.name, column.definition); err != nil {
 			return err
 		}
 	}
