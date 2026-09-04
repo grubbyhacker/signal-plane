@@ -335,7 +335,7 @@ func (fake *phase5V1HTTPBroker) serveHTTP(w http.ResponseWriter, r *http.Request
 			return
 		}
 		fake.launches = append(fake.launches, phase5V1Launch{r.Header.Get("Idempotency-Key"), request.Parameters.IssueNumber, request.Parameters.SourceDeliveryID})
-		_, _ = io.WriteString(w, `{"run_id":"run-phase5-v1"}`)
+		_, _ = io.WriteString(w, `{"version":"broker-run-launch/v1","run_id":"run-phase5-v1"}`)
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-phase5-v1/terminal-result" {
@@ -366,7 +366,7 @@ func (fake *phase5V1HTTPBroker) serveHTTP(w http.ResponseWriter, r *http.Request
 		}
 		status := states[0]
 		fake.runs[runID] = states[1:]
-		_, _ = io.WriteString(w, `{"run_id":`+strconv.Quote(runID)+`,"status":`+strconv.Quote(status)+`}`)
+		_, _ = io.WriteString(w, `{"version":"broker-run-status/v1","run_id":`+strconv.Quote(runID)+`,"status":`+strconv.Quote(status)+`}`)
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)

@@ -95,7 +95,7 @@ func TestMigratedReportPendingDefersWithoutReporterThenReconciles(t *testing.T) 
 		serverCalls++
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-5":
-			_, _ = w.Write([]byte(`{"run_id":"run-5","status":"completed"}`))
+			_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"run-5","status":"completed"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-5/terminal-result":
 			_, _ = w.Write([]byte(`{"version":"repository-task-terminal-result/v1","run_id":"run-5","profile":"","repo":"example/automation-target","branch":"agent/run-5","status":"completed","outcome":"ready_for_review","finalize_reason":"worker_exit","terminal_source":"exited","idempotency_key_digest":"idem-digest","request_fingerprint":"request-fingerprint","launch_config_version":"config-version","result":{"version":"repository-task-worker-result/v1","outcome":"ready_for_review","detail":"pull request created","stage":"completed","run_id":"run-5","repository":"example/automation-target","base_branch":"main","branch":"agent/run-5","verification":{"status":"passed"},"verify_task":"verify","delivered_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","validated_tree_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pull_request":{"number":42,"html_url":"https://example.test/pull/42","url":"https://api.example.test/pulls/42"}},"final_summary":"done"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/repos/example/automation-target/issues/5/comments":

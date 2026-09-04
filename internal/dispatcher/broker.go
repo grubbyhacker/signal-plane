@@ -17,6 +17,11 @@ const (
 	maxBrokerResponseBytes  = 1 << 20
 	maxCIObservationBytes   = 16 << 20
 	terminalReporterAgentID = "repository-task-terminal-reporter"
+
+	brokerCIObservationVersion = "broker-ci-observation/v1"
+	brokerRunLaunchVersion     = "broker-run-launch/v1"
+	brokerRunStatusVersion     = "broker-run-status/v1"
+	brokerExternalWaitVersion  = "broker-external-wait/v1"
 )
 
 type Broker struct {
@@ -112,10 +117,12 @@ func (e BrokerError) Retryable() bool {
 }
 
 type LaunchResult struct {
-	RunID string `json:"run_id"`
+	Version string `json:"version"`
+	RunID   string `json:"run_id"`
 }
 
 type RunStatus struct {
+	Version      string          `json:"version"`
 	RunID        string          `json:"run_id"`
 	Status       string          `json:"status"`
 	ExternalWait *CIExternalWait `json:"external_wait,omitempty"`
@@ -123,6 +130,7 @@ type RunStatus struct {
 }
 
 type brokerCIObservation struct {
+	Version          string `json:"version"`
 	RequestedHeadSHA string `json:"requested_head_sha"`
 	Pull             struct {
 		Number  int64  `json:"number"`
@@ -175,6 +183,9 @@ func (b *Broker) ObserveCI(ctx context.Context, task CIRepairTask, requestedHead
 	var raw brokerCIObservation
 	if err := b.doJSONLimit(req, &raw, maxCIObservationBytes); err != nil {
 		return CIObservation{}, err
+	}
+	if raw.Version != brokerCIObservationVersion {
+		return CIObservation{}, permanentMalformed("CI observation has unsupported response version", nil)
 	}
 	if raw.RequestedHeadSHA != requestedHead || raw.Pull.Number != task.PullNumber || raw.Pull.HeadSHA != requestedHead {
 		return CIObservation{}, permanentMalformed("CI observation does not match requested and authoritative PR head", nil)
@@ -261,6 +272,9 @@ func (b *Broker) LaunchRepair(ctx context.Context, task CIRepairTask, attempt CI
 	if err := b.doJSON(req, &result); err != nil {
 		return LaunchResult{}, err
 	}
+	if result.Version != brokerRunLaunchVersion {
+		return LaunchResult{}, permanentMalformed("repair launch response has unsupported version", nil)
+	}
 	result.RunID = strings.TrimSpace(result.RunID)
 	if result.RunID == "" {
 		return LaunchResult{}, permanentMalformed("repair launch response is missing run_id", nil)
@@ -289,6 +303,9 @@ func (b *Broker) ResumeRun(ctx context.Context, runID, idempotencyKey string, ma
 	b.authorize(req)
 	var result RunStatus
 	if err := b.doJSON(req, &result); err != nil {
+		return RunStatus{}, err
+	}
+	if err := validateBrokerRunStatus(result, brokerRunLaunchVersion, "run resume response"); err != nil {
 		return RunStatus{}, err
 	}
 	result.RunID = strings.TrimSpace(result.RunID)
@@ -331,6 +348,9 @@ func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 	var result LaunchResult
 	if err := b.doJSON(req, &result); err != nil {
 		return LaunchResult{}, err
+	}
+	if result.Version != brokerRunLaunchVersion {
+		return LaunchResult{}, permanentMalformed("broker launch response has unsupported version", nil)
 	}
 	result.RunID = strings.TrimSpace(result.RunID)
 	if result.RunID == "" {
@@ -380,12 +400,25 @@ func (b *Broker) Status(ctx context.Context, runID string) (RunStatus, error) {
 	if err := b.doJSON(req, &result); err != nil {
 		return RunStatus{}, err
 	}
+	if err := validateBrokerRunStatus(result, brokerRunStatusVersion, "broker status response"); err != nil {
+		return RunStatus{}, err
+	}
 	result.RunID = strings.TrimSpace(result.RunID)
 	result.Status = strings.ToLower(strings.TrimSpace(result.Status))
 	if result.RunID == "" || result.RunID != runID || result.Status == "" {
 		return RunStatus{}, permanentMalformed("broker status response has invalid run_id or status", nil)
 	}
 	return result, nil
+}
+
+func validateBrokerRunStatus(result RunStatus, expectedVersion, response string) error {
+	if result.Version != expectedVersion {
+		return permanentMalformed(response+" has unsupported version", nil)
+	}
+	if result.ExternalWait != nil && result.ExternalWait.Version != brokerExternalWaitVersion {
+		return permanentMalformed(response+" has unsupported external_wait version", nil)
+	}
+	return nil
 }
 
 func (b *Broker) authorize(req *http.Request) {

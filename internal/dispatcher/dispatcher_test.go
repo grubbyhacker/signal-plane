@@ -126,7 +126,7 @@ func TestBrokerRequest(t *testing.T) {
 		_ = json.Unmarshal(raw, &body)
 		bodies = append(bodies, body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"run_id":"run-123","status":"running"}`))
+		_, _ = w.Write([]byte(`{"version":"broker-run-launch/v1","run_id":"run-123","status":"running"}`))
 	}))
 	defer server.Close()
 	b := Broker{URL: server.URL, Token: "token", Client: server.Client()}
@@ -438,7 +438,7 @@ func TestBrokerStatusUsesOnlyScopedRunEndpoint(t *testing.T) {
 	var method, path, auth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method, path, auth = r.Method, r.URL.EscapedPath(), r.Header.Get("Authorization")
-		_, _ = w.Write([]byte(`{"run_id":"run/123","status":"running"}`))
+		_, _ = w.Write([]byte(`{"version":"broker-run-status/v1","run_id":"run/123","status":"running"}`))
 	}))
 	defer server.Close()
 	broker := &Broker{URL: server.URL, Token: "token", Client: server.Client()}
