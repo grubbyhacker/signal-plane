@@ -7,6 +7,37 @@ The first construction milestone ends with real GitHub events flowing through a
 secure public ingress into NATS JetStream and an observer log. It intentionally
 does not involve Hermes, agents, LLMs, or a semantic job controller.
 
+## Current status
+
+> This section reflects the current implementation. The design narrative below
+> it predates the dispatcher and describes the original ingress-and-observer
+> milestone; read that part as history, not as the current scope. The following
+> is configured state against the vps-ops production inventory (managed
+> configuration, not SSH-observed runtime).
+
+The repo now does more than ingress and observation. Implemented and enabled in
+production:
+
+- **github-task-dispatcher (enabled):** consumes accepted signals and decides
+  whether to launch work, keeping its decisions in a durable work ledger. It
+  EMITS only — it POSTs authenticated launch requests to an external broker and
+  never runs a model or spawns a process itself. No `os/exec` or process spawn
+  exists anywhere in this repo, and signal-plane holds no GitHub credential.
+- **Failed-CI repair lifecycle (enabled, bounded):** reconciliation wake 168h,
+  active timeout 60m, max 2 attempts.
+- **resume-release-router (enabled):** routes resume-builder `release` /
+  `published` events to the YouKnowMe MCP.
+
+Implemented but **disabled** in production:
+
+- **push-security-scanner.**
+
+The dispatcher's production route is the fixture only
+(`repository-agent-fixture` → `grubbyhacker/repository-agent-fixture`); it is not
+wired to a broader set of repositories. Inbound events are GitHub webhooks
+authenticated by HMAC-SHA-256; there is no CI polling — `check_run` /
+`check_suite` / `status` / `pull_request` are wake-ups, not the CI verdict.
+
 ## Core Shape
 
 ```text
