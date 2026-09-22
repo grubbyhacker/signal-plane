@@ -32,9 +32,9 @@ func TestAuthorizeUID(t *testing.T) {
 // the test process connects to its own socket, so the kernel-reported peer uid
 // is this process's uid and the default (own-uid) policy must accept it.
 func TestLinuxPeerCredAuthorizesOwnProcess(t *testing.T) {
-	shadow, snapshot := newShadow(t)
+	shadow, resolver, _ := newShadow(t)
 	socket := shortSocketPath(t)
-	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, nil)
+	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, resolver, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,15 +44,15 @@ func TestLinuxPeerCredAuthorizesOwnProcess(t *testing.T) {
 	go server.Serve(ctx)
 	waitForSocket(t, socket)
 
-	env := goodEnvelope(snapshot.ID, "d-peer", 1, "rev-peer")
+	env := goodEnvelope("d-peer", 1, "rev-peer")
 	result := request(t, socket, env)
-	if result.WorkItemID == "" || result.Launched {
+	if !result.Matched || result.WorkItemID == "" || result.Launched {
 		t.Fatalf("own-process peer admission = %#v", result)
 	}
 
 	// A restrictive allow-list that excludes our uid must reject the peer.
 	rejectSocket := shortSocketPath(t)
-	rejectServer, err := NewServer(Config{Enabled: true, SocketPath: rejectSocket, AllowedUIDs: []uint32{uint32(os.Getuid()) + 1}}, shadow, nil)
+	rejectServer, err := NewServer(Config{Enabled: true, SocketPath: rejectSocket, AllowedUIDs: []uint32{uint32(os.Getuid()) + 1}}, shadow, resolver, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

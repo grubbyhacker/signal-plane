@@ -21,13 +21,34 @@ func (testExecutor) Execute(context.Context, workledger.ExecutorRequest) (workle
 	return workledger.ExecutorResult{Outcome: workledger.OutcomeCompleted}, nil
 }
 
-// allowAll is a test authorizer that accepts any peer, so the socket round-trip
-// runs on non-Linux dev machines where SO_PEERCRED is unavailable.
+// allowAll accepts any peer, so the socket round-trip runs on non-Linux dev
+// machines where SO_PEERCRED is unavailable.
 type allowAll struct{}
 
 func (allowAll) authorize(net.Conn, []uint32) error { return nil }
 
-func newShadow(t *testing.T) (*shadowadmit.Shadow, workledger.RouteSnapshot) {
+// fakeResolver is a deployment-owned RouteResolver stand-in. It matches only a
+// configured object kind, returns a fixed route snapshot and binding, and
+// records the last event it saw so a test can prove the resolver — not the
+// caller — chose the routing.
+type fakeResolver struct {
+	snapshotID string
+	binding    workledger.AgentBinding
+	matchKind  string
+	lastEvent  workledger.Event
+	calls      int
+}
+
+func (resolver *fakeResolver) Resolve(_ context.Context, event workledger.Event) (Resolution, error) {
+	resolver.calls++
+	resolver.lastEvent = event
+	if resolver.matchKind != "" && event.ObjectKind != resolver.matchKind {
+		return Resolution{Matched: false}, nil
+	}
+	return Resolution{Matched: true, RouteSnapshotID: resolver.snapshotID, Binding: resolver.binding}, nil
+}
+
+func newShadow(t *testing.T) (*shadowadmit.Shadow, *fakeResolver, *workledger.Store) {
 	t.Helper()
 	ctx := context.Background()
 	store, err := workledger.Open(filepath.Join(t.TempDir(), "ingress.db"))
@@ -54,12 +75,19 @@ func newShadow(t *testing.T) (*shadowadmit.Shadow, workledger.RouteSnapshot) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return shadow, snapshot
+	resolver := &fakeResolver{
+		snapshotID: snapshot.ID,
+		binding:    workledger.AgentBinding{AgentType: "youknowme-curator", Mode: "reconcile", TypeContractRevision: "contract-v1"},
+		matchKind:  "pull_request",
+	}
+	return shadow, resolver, store
 }
 
-func goodEnvelope(snapshotID, delivery string, seq uint64, revision string) Envelope {
+// goodEnvelope builds a valid domain-fact envelope. It carries NO routing — the
+// resolver chooses the route snapshot.
+func goodEnvelope(delivery string, seq uint64, revision string) Envelope {
 	return Envelope{
-		RouteSnapshotID: snapshotID, SignalID: "signal-" + delivery, SourceDeliveryID: delivery,
+		SignalID: "signal-" + delivery, SourceDeliveryID: delivery,
 		TransportStream: "signals", TransportSeq: seq, Source: "github", Namespace: "example/widgets",
 		ObjectKind: "pull_request", ObjectID: "17", EventKind: "pull_request", Action: "synchronize",
 		ActorClass: "user", SourceRevision: revision, PayloadDigest: "sha256:payload", EvidenceRef: "nats://signals",
@@ -67,44 +95,50 @@ func goodEnvelope(snapshotID, delivery string, seq uint64, revision string) Enve
 }
 
 func TestEnvelopeValidationAndBounds(t *testing.T) {
-	env := goodEnvelope("route-1", "d-1", 1, "rev-1")
+	env := goodEnvelope("d-1", 1, "rev-1")
 	if err := env.Validate(); err != nil {
 		t.Fatalf("valid envelope rejected: %v", err)
 	}
-	// Missing required field.
 	bad := env
 	bad.Source = ""
 	if err := bad.Validate(); err == nil {
 		t.Fatal("envelope missing source was accepted")
 	}
-	// Zero transport sequence.
 	badSeq := env
 	badSeq.TransportSeq = 0
 	if err := badSeq.Validate(); err == nil {
 		t.Fatal("envelope with zero transport sequence accepted")
 	}
-	// Oversized field.
 	over := env
 	over.Namespace = strings.Repeat("n", 513)
 	if err := over.Validate(); err == nil {
 		t.Fatal("oversized field accepted")
 	}
-	// Oversize raw payload is refused by DecodeEnvelope before parsing.
 	huge := make([]byte, MaxEnvelopeBytes+1)
 	if _, err := DecodeEnvelope(huge); err != ErrEnvelopeTooLarge {
 		t.Fatalf("oversize payload = %v, want ErrEnvelopeTooLarge", err)
 	}
-	// Unknown fields rejected.
-	if _, err := DecodeEnvelope([]byte(`{"route_snapshot_id":"r","unknown":1}`)); err == nil {
-		t.Fatal("unknown field accepted")
-	}
-	// Envelope carries no agent/image/release fields at all — a struct round
-	// trip must not surface any such key.
-	encoded, _ := json.Marshal(env)
-	for _, forbidden := range []string{"agent_type", "resolved_release", "broker_run", "authoritative_pr"} {
-		if strings.Contains(string(encoded), forbidden) {
-			t.Fatalf("envelope serialization leaked a selection field %q: %s", forbidden, encoded)
+	// The caller may not select routing or an agent/image/release/generation:
+	// any such JSON field is an unknown field and is rejected by DecodeEnvelope.
+	base := `"source_delivery_id":"d","transport_stream":"s","transport_sequence":1,"source":"github","namespace":"n","object_kind":"pull_request","object_id":"1","event_kind":"pull_request","source_revision":"r","payload_digest":"sha256:p","evidence_ref":"e"`
+	for _, forbidden := range []string{
+		`"route_snapshot_id":"r"`,
+		`"agent_type":"youknowme-curator"`,
+		`"mode":"reconcile"`,
+		`"image":"ghcr.io/x@sha256:deadbeef"`,
+		`"resolved_release_generation":3`,
+		`"resolved_release_digest":"sha256:x"`,
+		`"generation":3`,
+		`"broker_run_id":"run-1"`,
+	} {
+		payload := "{" + base + "," + forbidden + "}"
+		if _, err := DecodeEnvelope([]byte(payload)); err == nil {
+			t.Fatalf("caller-supplied field accepted: %s", forbidden)
 		}
+	}
+	// The valid envelope decodes.
+	if _, err := DecodeEnvelope([]byte("{" + base + "}")); err != nil {
+		t.Fatalf("valid minimal envelope rejected: %v", err)
 	}
 }
 
@@ -119,7 +153,6 @@ func TestValidateSocketPath(t *testing.T) {
 	if err := validateSocketPath(filepath.Join(dir, "s.sock")); err != nil {
 		t.Fatalf("owner-only dir rejected: %v", err)
 	}
-	// A group/world-writable parent must be refused.
 	openDir := filepath.Join(dir, "open")
 	if err := os.Mkdir(openDir, 0o777); err != nil {
 		t.Fatal(err)
@@ -132,9 +165,16 @@ func TestValidateSocketPath(t *testing.T) {
 	}
 }
 
+func TestEnabledIngressRequiresResolver(t *testing.T) {
+	shadow, _, _ := newShadow(t)
+	if _, err := NewServer(Config{Enabled: true, SocketPath: shortSocketPath(t)}, shadow, nil, nil); err == nil {
+		t.Fatal("enabled ingress accepted a nil route resolver")
+	}
+}
+
 func TestDisabledIngressIsNoOp(t *testing.T) {
-	shadow, _ := newShadow(t)
-	server, err := NewServer(Config{Enabled: false}, shadow, nil)
+	shadow, _, _ := newShadow(t)
+	server, err := NewServer(Config{Enabled: false}, shadow, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,20 +183,19 @@ func TestDisabledIngressIsNoOp(t *testing.T) {
 	}
 }
 
-func TestSocketRoundTripAdmitsAndDedupesDeterministically(t *testing.T) {
-	shadow, snapshot := newShadow(t)
+func TestSocketRoundTripUsesResolverOutputAndDedupes(t *testing.T) {
+	shadow, resolver, store := newShadow(t)
 	socket := shortSocketPath(t)
-	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, nil)
+	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, resolver, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.setAuthorizer(allowAll{}) // SO_PEERCRED unavailable off-Linux
+	server.setAuthorizer(allowAll{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(ctx) }()
 	waitForSocket(t, socket)
-	// The socket must be owner-only.
 	info, err := os.Stat(socket)
 	if err != nil {
 		t.Fatal(err)
@@ -165,14 +204,26 @@ func TestSocketRoundTripAdmitsAndDedupesDeterministically(t *testing.T) {
 		t.Fatalf("socket mode = %#o, want %#o", info.Mode().Perm(), socketMode)
 	}
 
-	env := goodEnvelope(snapshot.ID, "d-round", 1, "rev-round")
+	env := goodEnvelope("d-round", 1, "rev-round")
 	first := request(t, socket, env)
-	if first.WorkItemID == "" || first.Duplicate || first.Launched {
+	if !first.Matched || first.WorkItemID == "" || first.Duplicate || first.Launched {
 		t.Fatalf("first admit = %#v", first)
 	}
-	// Same envelope again -> deterministic duplicate onto the same work item.
+	// The resolver saw the domain fact and chose the routing; the caller did not.
+	if resolver.calls == 0 || resolver.lastEvent.SourceDeliveryID != "d-round" {
+		t.Fatalf("resolver was not consulted: calls=%d last=%#v", resolver.calls, resolver.lastEvent)
+	}
+	// The persisted work item carries the RESOLVER's binding.
+	item, err := store.WorkItem(context.Background(), first.WorkItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.AgentType != "youknowme-curator" || item.AgentMode != "reconcile" || item.TypeContractRevision != "contract-v1" {
+		t.Fatalf("persisted binding is not the resolver's: %#v", item)
+	}
+
 	second := request(t, socket, env)
-	if !second.Duplicate || second.WorkItemID != first.WorkItemID || second.Launched {
+	if !second.Matched || !second.Duplicate || second.WorkItemID != first.WorkItemID || second.Launched {
 		t.Fatalf("second admit = %#v (want dup of %s)", second, first.WorkItemID)
 	}
 	cancel()
@@ -181,10 +232,11 @@ func TestSocketRoundTripAdmitsAndDedupesDeterministically(t *testing.T) {
 	}
 }
 
-func TestSocketRejectsOversizeAndBadEnvelope(t *testing.T) {
-	shadow, snapshot := newShadow(t)
+func TestUnmatchedFactIsDroppedNotAdmitted(t *testing.T) {
+	shadow, resolver, _ := newShadow(t)
+	resolver.matchKind = "issues" // the envelope's pull_request will not match
 	socket := shortSocketPath(t)
-	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, nil)
+	server, err := NewServer(Config{Enabled: true, SocketPath: socket}, shadow, resolver, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,25 +246,77 @@ func TestSocketRejectsOversizeAndBadEnvelope(t *testing.T) {
 	go server.Serve(ctx)
 	waitForSocket(t, socket)
 
-	// Missing route snapshot id -> error reply, nothing admitted.
-	bad := goodEnvelope("", "d-bad", 1, "rev-bad")
-	reply := requestRaw(t, socket, mustJSON(t, bad))
-	if !strings.Contains(reply, "error") {
-		t.Fatalf("bad envelope reply = %q", reply)
+	result := request(t, socket, goodEnvelope("d-nomatch", 1, "rev"))
+	if result.Matched || result.WorkItemID != "" || result.Launched {
+		t.Fatalf("unmatched fact was not dropped: %#v", result)
 	}
-	_ = snapshot
 }
 
-// shortSocketPath returns a socket path short enough for the platform sun_path
-// limit (macOS ~104 bytes), which t.TempDir()+test-name paths can exceed.
-func shortSocketPath(t *testing.T) string {
+func TestClearStaleSocketRefusesNonSocket(t *testing.T) {
+	dir := shortDir(t)
+	// A regular file at the socket path must be preserved and the clear refused.
+	regular := filepath.Join(dir, "notasock")
+	if err := os.WriteFile(regular, []byte("precious"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearStaleSocket(regular); err == nil {
+		t.Fatal("clearStaleSocket removed / accepted a regular file")
+	}
+	if data, err := os.ReadFile(regular); err != nil || string(data) != "precious" {
+		t.Fatalf("regular file was not preserved: data=%q err=%v", data, err)
+	}
+	// A missing path is a clean no-op.
+	if err := clearStaleSocket(filepath.Join(dir, "absent.sock")); err != nil {
+		t.Fatalf("clearStaleSocket on absent path = %v, want nil", err)
+	}
+	// A real socket is removed.
+	sockPath := filepath.Join(dir, "real.sock")
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	if err := clearStaleSocket(sockPath); err != nil {
+		t.Fatalf("clearStaleSocket on a real socket = %v, want nil", err)
+	}
+	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("real socket was not removed: %v", err)
+	}
+}
+
+func TestServeRefusesToStartOnNonSocketPath(t *testing.T) {
+	shadow, resolver, _ := newShadow(t)
+	dir := shortDir(t)
+	regular := filepath.Join(dir, "block")
+	if err := os.WriteFile(regular, []byte("do not delete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(Config{Enabled: true, SocketPath: regular}, shadow, resolver, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.setAuthorizer(allowAll{})
+	if err := server.Serve(context.Background()); err == nil {
+		t.Fatal("Serve started on a path occupied by a regular file")
+	}
+	if data, err := os.ReadFile(regular); err != nil || string(data) != "do not delete" {
+		t.Fatalf("regular file was clobbered by startup: data=%q err=%v", data, err)
+	}
+}
+
+func shortDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "si")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-	return filepath.Join(dir, "i.sock")
+	return dir
+}
+
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(shortDir(t), "i.sock")
 }
 
 func waitForSocket(t *testing.T, path string) {
@@ -246,7 +350,6 @@ func requestRaw(t *testing.T, socket string, payload []byte) string {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	// Half-close so the server's io.ReadAll returns.
 	if uc, ok := conn.(*net.UnixConn); ok {
 		_ = uc.CloseWrite()
 	}

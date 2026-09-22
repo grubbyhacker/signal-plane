@@ -53,11 +53,11 @@ type admitService interface {
 
 // Envelope is the bounded, source-neutral domain-fact intake message. An
 // emitter states WHAT happened (source, namespace, object, revision, evidence)
-// and the route snapshot the platform already matched. It carries NO agent
-// type, mode, image, release, generation, broker run, or PR correlation: those
-// are not an emitter's to name.
+// ONLY. It carries NO routing (route snapshot), agent type, mode, image,
+// release, generation, broker run, or PR correlation: routing to a route
+// snapshot and (agent_type, mode) is deployment-owned and chosen by the
+// RouteResolver, never by the caller.
 type Envelope struct {
-	RouteSnapshotID  string `json:"route_snapshot_id"`
 	SignalID         string `json:"signal_id"`
 	SourceDeliveryID string `json:"source_delivery_id"`
 	TransportStream  string `json:"transport_stream"`
@@ -75,8 +75,10 @@ type Envelope struct {
 }
 
 // Result is the deterministic reply written back to the caller. It reports the
-// admission outcome and never a launch.
+// admission outcome and never a launch. Matched=false means the domain fact
+// resolved to no route and was deterministically dropped (no admission).
 type Result struct {
+	Matched    bool   `json:"matched"`
 	WorkItemID string `json:"work_item_id"`
 	EventID    string `json:"event_id"`
 	Duplicate  bool   `json:"duplicate"`
@@ -117,7 +119,6 @@ func DecodeEnvelope(raw []byte) (Envelope, error) {
 // admit. It does not consult any live system, so it is runnable offline.
 func (envelope Envelope) Validate() error {
 	required := map[string]string{
-		"route_snapshot_id":  envelope.RouteSnapshotID,
 		"source_delivery_id": envelope.SourceDeliveryID,
 		"transport_stream":   envelope.TransportStream,
 		"source":             envelope.Source,

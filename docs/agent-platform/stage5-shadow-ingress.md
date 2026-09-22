@@ -27,12 +27,22 @@ seam (#62).
   credential to substitute, and production is Linux.
 - Envelope: a **bounded** (`64 KiB`), source-neutral domain-fact message with
   `DisallowUnknownFields`. It carries the event identity (source, namespace,
-  object, revision, evidence) and the route snapshot the platform matched. It
-  has **no** agent type, mode, image, release, generation, broker run, or PR
-  field — an emitter states a domain fact and names no agent.
-- Admission: the server admits through `shadowadmit.Shadow.Admit` **only**, with
-  a **zero `AgentBinding`**. The route→(agent_type, mode) mapping is a
-  deployment-owned dispatcher decision made elsewhere, not the emitter's.
+  object, revision, evidence) ONLY. It has **no** routing (route snapshot),
+  agent type, mode, image, release, generation, broker run, or PR field — an
+  emitter states a domain fact and names no agent and no route. Any such JSON
+  key is an unknown field and is rejected.
+- Routing: deployment-owned, via an injected `RouteResolver` that maps the
+  validated domain-fact `Event` to `{RouteSnapshotID, AgentBinding, Matched}`.
+  An enabled ingress **requires** a resolver. An unmatched fact routes to no
+  agent and is deterministically dropped (no admission, `matched:false` reply) —
+  silence is correct, guessing is the flaw. The route-table schema is not
+  implemented here; only the interface seam.
+- Admission: through `shadowadmit.Shadow.Admit` **only**, fed the **resolver's**
+  route snapshot and admission-safe binding — never any caller-supplied value.
+- Stale socket: cleared only after an `os.Lstat` + `os.ModeSocket` check.
+  A regular file, directory, symlink, or any non-socket at the socket path is
+  **preserved** and startup fails, so a misconfigured path can never destroy
+  real data.
 
 ## Invariant: no launch dependency
 
@@ -45,11 +55,16 @@ the zero binding, and the disabled-by-default no-op.
 
 ## Tests
 
-- Platform-neutral (`server_test.go`): envelope validation + bounds + no
-  selection fields; `validateSocketPath` (absolute + owner-only parent);
-  disabled no-op; socket round-trip admit + deterministic dedup + `0600` mode;
-  bad-envelope error reply. The round-trip injects an allow-all authorizer so it
-  runs off-Linux.
+- Platform-neutral (`server_test.go`): envelope validation + bounds; rejection
+  of caller-supplied route/agent/image/release/generation JSON fields (unknown
+  fields); `validateSocketPath` (absolute + owner-only parent); enabled ingress
+  requires a resolver; disabled no-op; socket round-trip that proves the
+  RESOLVER's output (not caller input) feeds shadowadmit and the persisted
+  binding is the resolver's, plus deterministic dedup and `0600` mode; an
+  unmatched fact is dropped, not admitted; `clearStaleSocket` removes a real
+  socket but preserves a regular file, and `Serve` refuses to start (without
+  clobbering it) on a non-socket path. The round-trip injects an allow-all
+  authorizer so it runs off-Linux.
 - Linux-only (`peercred_linux_test.go`): `authorizeUID` (own-uid and allow-list
   membership) and a real SO_PEERCRED handshake that accepts the test's own
   process and rejects an excluded UID.

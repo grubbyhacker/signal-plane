@@ -61,13 +61,24 @@ def main() -> int:
         errors.append("shadow ingress must listen on a unix-domain socket")
     if "SO_PEERCRED" not in joined:
         errors.append("shadow ingress must authenticate peers with SO_PEERCRED")
-    # It must admit with a zero agent binding (emitter names no agent) — the
-    # server constructs the candidate with an explicit empty AgentBinding.
-    if "workledger.AgentBinding{}" not in joined:
+    # Routing is deployment-owned, not caller-supplied. The caller Envelope must
+    # NOT carry a route snapshot, and the server must feed the RouteResolver's
+    # output (not envelope input) to shadowadmit.
+    if "route_snapshot_id" in joined:
         errors.append(
-            "shadow ingress must admit with a zero AgentBinding (an emitter names "
-            "no agent, image, release, or generation)"
+            "the caller Envelope must not carry route_snapshot_id: routing is "
+            "deployment-owned and chosen by the RouteResolver"
         )
+    if "RouteResolver" not in joined or "server.resolver.Resolve(" not in joined:
+        errors.append("shadow ingress must resolve routing through an injected RouteResolver")
+    if "resolution.RouteSnapshotID" not in joined:
+        errors.append("shadow ingress must admit with the resolver's route snapshot, not caller input")
+    # An enabled ingress must require the resolver.
+    if "route resolver when enabled" not in joined:
+        errors.append("an enabled shadow ingress must require a deployment-owned route resolver")
+    # A stale socket must be cleared only after an Lstat socket-type check.
+    if "clearStaleSocket" not in joined or "os.ModeSocket" not in joined or "os.Lstat" not in joined:
+        errors.append("shadow ingress must Lstat and refuse to remove a non-socket before clearing a stale socket")
     # Disabled-by-default: the server no-ops when not enabled.
     if "if !server.cfg.Enabled" not in joined:
         errors.append("shadow ingress must be disabled by default (no-op when not enabled)")
