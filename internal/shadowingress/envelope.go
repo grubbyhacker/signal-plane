@@ -11,11 +11,10 @@
 //
 // It is a dry-run intake: it never launches, never enqueues to the legacy
 // launcher, never mutates legacy dispatcher tables, opens no external network
-// listener, and touches no YouKnowMe container credential path. Cutover to an
-// active launcher and the deployment-owned route table that maps a signal to
-// (agent_type, mode) are later stages, so this ingress admits with a ZERO agent
-// binding: the emitter names a domain fact and the route snapshot it already
-// matched, nothing more.
+// listener, and touches no YouKnowMe container credential path. The external
+// route-table schema and launcher cutover remain later stages. This ingress
+// asks an injected deployment-owned RouteResolver for the route snapshot and
+// (agent_type, mode) binding; the emitter supplies only the domain fact.
 //
 // Disabled by default: an empty SocketPath or Enabled=false makes Serve a no-op.
 package shadowingress
