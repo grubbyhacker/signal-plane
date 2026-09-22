@@ -42,6 +42,24 @@ type ShadowAdmissionConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// DatabasePath is the work-ledger database the shadow admitter writes to.
 	DatabasePath string `yaml:"database_path"`
+	// Ingress configures the host-side Unix-domain-socket intake for shadow
+	// admission. Disabled by default and inert; carries no network address.
+	Ingress ShadowIngressConfig `yaml:"ingress"`
+}
+
+// ShadowIngressConfig configures the unprivileged host intake: a Unix-domain
+// socket authenticated by filesystem permissions and SO_PEERCRED. It is
+// DISABLED BY DEFAULT. There is no network listener and no credential; the
+// socket path's owner-only directory plus the peer-credential check are the
+// whole guard.
+type ShadowIngressConfig struct {
+	// Enabled turns the host ingress on. Default false: no socket is opened.
+	Enabled bool `yaml:"enabled"`
+	// SocketPath is the absolute path of the Unix-domain socket to listen on.
+	SocketPath string `yaml:"socket_path"`
+	// AllowedUIDs optionally restricts the connecting process UID (SO_PEERCRED).
+	// Empty means "same UID as this process".
+	AllowedUIDs []uint32 `yaml:"allowed_uids"`
 }
 
 type PushScannerConfig struct {
