@@ -15,7 +15,7 @@ fi
 """
 
 [tasks.check]
-run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run validate:shadow-admission && mise run validate:shadow-ingress && mise run test && mise run build"
+run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run validate:shadow-admission && mise run validate:shadow-ingress && mise run validate:route-resolver && mise run test && mise run build"
 
 [tasks."validate:image-tag-contract"]
 run = "python3 scripts/validate-image-tag-contract.py"
@@ -28,6 +28,9 @@ run = "python3 scripts/validate-shadow-admission.py"
 
 [tasks."validate:shadow-ingress"]
 run = "python3 scripts/validate-shadow-ingress.py"
+
+[tasks."validate:route-resolver"]
+run = "python3 scripts/validate-route-resolver.py"
 
 [tasks.test]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
