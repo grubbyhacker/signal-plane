@@ -47,7 +47,6 @@ FORBIDDEN_TOKENS = (
 )
 
 TARGETS = (
-    "./cmd/workitem-route-activate",
     "./internal/routeactivatecmd",
 )
 

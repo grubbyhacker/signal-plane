@@ -51,6 +51,11 @@ func (s *Service) Close() error {
 // must Close it. catalog is the deployment-owned mode catalog to validate
 // selected modes against.
 //
+// Build opens its OWN work-ledger handle from cfg.DatabasePath. That is correct
+// only for tooling that owns the database exclusively; the production
+// single-writer path is BuildWithStore, where the dispatcher passes the handle
+// it already owns so no second process opens the operational database.
+//
 // Build returns (nil, nil) when the ingress is disabled: there is nothing to
 // run, which is the default posture.
 func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog routeresolver.ModeCatalog, logger *slog.Logger) (*Service, error) {
@@ -65,6 +70,52 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 	if cfg.DatabasePath == "" {
 		return nil, errors.New("shadow ingress requires shadow_admission.database_path when enabled")
 	}
+	store, err := workledger.Open(cfg.DatabasePath)
+	if err != nil {
+		return nil, fmt.Errorf("open work ledger: %w", err)
+	}
+	service, err := BuildWithStore(ctx, store, cfg, catalog, logger)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	// The service now owns the handle Build opened, so Close releases it. Mark
+	// it owned by handing the store to the service (BuildWithStore left store
+	// nil because the caller there owns it).
+	service.store = store
+	return service, nil
+}
+
+// BuildWithStore constructs the shadow stack against a CALLER-OWNED work-ledger
+// store, opening nothing. It is the single-writer ingress seam: the dispatcher,
+// the sole owner of the operational database, passes its own attached handle so
+// the ingress admits through the one connection instead of opening a second.
+// The returned Service does NOT own the store (its Close is a no-op on the
+// ledger); the dispatcher closes its handle exactly once.
+//
+// It fails closed identically to Build: missing route config, catalog
+// mismatch, a route snapshot not active in the ledger, or bad socket
+// permissions all refuse to serve. Returns (nil, nil) when disabled.
+func BuildWithStore(ctx context.Context, store *workledger.Store, cfg config.ShadowAdmissionConfig, catalog routeresolver.ModeCatalog, logger *slog.Logger) (*Service, error) {
+	return BuildWithStoreAndSnapshots(ctx, store, cfg, nil, catalog, logger)
+}
+
+// BuildWithStoreAndSnapshots is the production single-writer constructor. The
+// snapshot map comes directly from dispatcher startup activation and binds any
+// stable route_id entries in the deployment-owned route table before the
+// resolver is constructed. No snapshot id is authored by deployment config.
+func BuildWithStoreAndSnapshots(ctx context.Context, store *workledger.Store, cfg config.ShadowAdmissionConfig, snapshotByRouteID map[string]string, catalog routeresolver.ModeCatalog, logger *slog.Logger) (*Service, error) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+	if !cfg.Enabled || !cfg.Ingress.Enabled {
+		logger.Info("shadow ingress disabled; nothing to serve",
+			"admission_enabled", cfg.Enabled, "ingress_enabled", cfg.Ingress.Enabled)
+		return nil, nil
+	}
+	if store == nil {
+		return nil, errors.New("shadow ingress requires a work-ledger store")
+	}
 	if cfg.Ingress.RouteConfigPath == "" {
 		return nil, errors.New("shadow ingress requires shadow_admission.ingress.route_config_path when enabled")
 	}
@@ -78,16 +129,17 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 	if err != nil {
 		return nil, fmt.Errorf("parse route config: %w", err)
 	}
+	if snapshotByRouteID != nil {
+		routeCfg, err = routeCfg.BindSnapshots(snapshotByRouteID)
+		if err != nil {
+			return nil, fmt.Errorf("bind dispatcher-activated route snapshots: %w", err)
+		}
+	}
 	// New fails closed on a catalog mismatch (a mode the AgentType does not
 	// declare) and on a config that smuggled a selection field.
 	resolver, err := routeresolver.New(routeCfg, catalog)
 	if err != nil {
 		return nil, fmt.Errorf("build route resolver: %w", err)
-	}
-
-	store, err := workledger.Open(cfg.DatabasePath)
-	if err != nil {
-		return nil, fmt.Errorf("open work ledger: %w", err)
 	}
 
 	// Fail closed on a missing route snapshot: every snapshot the route config
@@ -96,18 +148,15 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 	for _, id := range resolver.RouteSnapshotIDs() {
 		exists, existErr := store.RouteSnapshotExists(ctx, id)
 		if existErr != nil {
-			store.Close()
 			return nil, fmt.Errorf("verify route snapshot %q: %w", id, existErr)
 		}
 		if !exists {
-			store.Close()
 			return nil, fmt.Errorf("route config references route snapshot %q that is not active in the ledger", id)
 		}
 	}
 
 	shadow, err := shadowadmit.New(store, true)
 	if err != nil {
-		store.Close()
 		return nil, fmt.Errorf("build shadow admitter: %w", err)
 	}
 
@@ -119,7 +168,6 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 		AllowedUIDs: cfg.Ingress.AllowedUIDs,
 	}, shadow, resolver, logger)
 	if err != nil {
-		store.Close()
 		return nil, fmt.Errorf("build shadow ingress: %w", err)
 	}
 
@@ -127,7 +175,9 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 		"socket", cfg.Ingress.SocketPath,
 		"route_revision", resolver.Revision(),
 		"routes", len(resolver.RouteSnapshotIDs()))
-	return &Service{server: server, store: store, revision: resolver.Revision()}, nil
+	// store is nil here: the caller owns the handle. Build (above) sets it when
+	// it opened the handle itself.
+	return &Service{server: server, store: nil, revision: resolver.Revision()}, nil
 }
 
 // Run is the process entrypoint: it builds the stack from the loaded config and

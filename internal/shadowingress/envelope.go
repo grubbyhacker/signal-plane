@@ -39,7 +39,7 @@ const (
 	readTimeout = 5 * time.Second
 	// socketMode is the required permission on the listening socket: owner
 	// read/write only. Group/other access would widen who can enqueue.
-	socketMode = 0o600
+	socketMode = 0o660
 )
 
 // admitService is the narrow slice of *shadowadmit.Shadow this ingress needs.

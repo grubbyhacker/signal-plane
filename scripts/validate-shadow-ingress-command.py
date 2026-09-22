@@ -28,7 +28,6 @@ FORBIDDEN_SUBSTRINGS = (
 )
 
 TARGETS = (
-    "./cmd/workitem-shadow-ingress",
     "./internal/shadowingresscmd",
 )
 

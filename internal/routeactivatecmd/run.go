@@ -91,9 +91,35 @@ func (e descriptorExecutor) Execute(context.Context, workledger.ExecutorRequest)
 // Run performs the managed idempotent activation and returns the outcome. It
 // opens the ledger, decodes the definition, pre-flights conflict against the
 // active snapshot, then calls Store.ActivateRoute. It writes nothing else.
+//
+// Run is retained for tooling that legitimately owns its own short-lived ledger
+// handle (tests and one-shot fixtures). The production single-writer path is
+// RunWithStore, driven by the dispatcher against its own handle — the
+// operational database must be opened by exactly one process.
 func Run(ctx context.Context, opts Options, now time.Time) (Outcome, error) {
 	if opts.DatabasePath == "" {
 		return Outcome{}, errors.New("route activation requires a work-ledger database_path")
+	}
+	store, err := workledger.Open(opts.DatabasePath)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("open work ledger: %w", err)
+	}
+	defer store.Close()
+	return RunWithStore(ctx, store, opts, now)
+}
+
+// RunWithStore performs the managed idempotent activation against a CALLER-OWNED
+// work-ledger store, opening nothing. It is the single-writer activation seam:
+// the dispatcher, the sole owner of the operational database, calls this with
+// its own attached handle at startup so route activation writes through the one
+// connection instead of a second process. DatabasePath on opts is ignored here;
+// the store the caller passes IS the target.
+//
+// It decodes the definition, pre-flights conflict against the active snapshot,
+// then calls Store.ActivateRoute. It writes nothing else and never launches.
+func RunWithStore(ctx context.Context, store *workledger.Store, opts Options, now time.Time) (Outcome, error) {
+	if store == nil {
+		return Outcome{}, errors.New("route activation requires a work-ledger store")
 	}
 	definition, err := workledger.DecodeRouteDefinition(opts.RouteDefinitionJSON)
 	if err != nil {
@@ -113,12 +139,6 @@ func Run(ctx context.Context, opts Options, now time.Time) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, fmt.Errorf("compute activation digest: %w", err)
 	}
-
-	store, err := workledger.Open(opts.DatabasePath)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("open work ledger: %w", err)
-	}
-	defer store.Close()
 
 	active, hasActive, err := store.ActiveRouteSnapshot(ctx, definition.ID)
 	if err != nil {

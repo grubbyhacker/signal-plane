@@ -54,13 +54,16 @@ func Fact(event workledger.Event) string {
 }
 
 // RouteEntry maps one domain fact to a deployment-owned (agent_type, mode) and
-// the ledger route snapshot that admits it. It expresses no image, release, or
-// generation.
+// the ledger route that admits it. Deployment config names the stable RouteID;
+// the dispatcher replaces it in memory with the store-minted RouteSnapshotID
+// from its own startup activation. Legacy/tooling configs may provide an
+// already-minted RouteSnapshotID directly, but never both selectors.
 type RouteEntry struct {
 	Fact            string `json:"fact" yaml:"fact"`
 	AgentType       string `json:"agent_type" yaml:"agent_type"`
 	Mode            string `json:"mode" yaml:"mode"`
-	RouteSnapshotID string `json:"route_snapshot_id" yaml:"route_snapshot_id"`
+	RouteID         string `json:"route_id,omitempty" yaml:"route_id,omitempty"`
+	RouteSnapshotID string `json:"route_snapshot_id,omitempty" yaml:"route_snapshot_id,omitempty"`
 	// ContractRevision pins the AgentType/route contract revision this route
 	// resolved against. Optional; bounded when present.
 	ContractRevision string `json:"contract_revision" yaml:"contract_revision"`
@@ -83,7 +86,8 @@ var (
 )
 
 // Validate bounds every field, requires a positive version, forbids duplicate
-// facts, and validates each route's shape. It consults no live system.
+// facts, and requires exactly one stable route id or minted snapshot id per
+// route. It consults no live system.
 func (config Config) Validate() error {
 	if config.Version <= 0 {
 		return errors.New("route config version must be positive")
@@ -106,14 +110,46 @@ func (config Config) Validate() error {
 		if !snakePattern.MatchString(route.Mode) {
 			return fmt.Errorf("route %q mode must be a bounded snake_case identifier", route.Fact)
 		}
-		if route.RouteSnapshotID == "" || len(route.RouteSnapshotID) > 256 {
-			return fmt.Errorf("route %q requires a bounded route_snapshot_id", route.Fact)
+		hasRouteID := route.RouteID != ""
+		hasSnapshotID := route.RouteSnapshotID != ""
+		if hasRouteID == hasSnapshotID {
+			return fmt.Errorf("route %q requires exactly one of route_id or route_snapshot_id", route.Fact)
+		}
+		if hasRouteID && !kebabPattern.MatchString(route.RouteID) {
+			return fmt.Errorf("route %q route_id must be a bounded kebab-case identifier", route.Fact)
+		}
+		if hasSnapshotID && len(route.RouteSnapshotID) > 256 {
+			return fmt.Errorf("route %q route_snapshot_id is oversized", route.Fact)
 		}
 		if len(route.ContractRevision) > 256 {
 			return fmt.Errorf("route %q contract_revision is oversized", route.Fact)
 		}
 	}
 	return nil
+}
+
+// BindSnapshots replaces stable route ids with the snapshot ids minted by the
+// dispatcher's startup activations. It returns a copy and fails closed when a
+// configured route was not activated. Direct snapshot-id entries are preserved
+// for backward-compatible tooling and tests.
+func (config Config) BindSnapshots(snapshotByRouteID map[string]string) (Config, error) {
+	if err := config.Validate(); err != nil {
+		return Config{}, err
+	}
+	bound := Config{Version: config.Version, Routes: append([]RouteEntry(nil), config.Routes...)}
+	for i := range bound.Routes {
+		route := &bound.Routes[i]
+		if route.RouteID == "" {
+			continue
+		}
+		snapshotID := snapshotByRouteID[route.RouteID]
+		if snapshotID == "" {
+			return Config{}, fmt.Errorf("route %q references route_id %q without a dispatcher activation", route.Fact, route.RouteID)
+		}
+		route.RouteID = ""
+		route.RouteSnapshotID = snapshotID
+	}
+	return bound, bound.Validate()
 }
 
 // Revision computes a stable, deployment-owned snapshot revision over the
@@ -156,6 +192,11 @@ func New(config Config, catalog ModeCatalog) (*Resolver, error) {
 	}
 	if err := config.Validate(); err != nil {
 		return nil, err
+	}
+	for _, route := range config.Routes {
+		if route.RouteID != "" || route.RouteSnapshotID == "" {
+			return nil, fmt.Errorf("route %q must be bound to a dispatcher-minted route_snapshot_id before resolver construction", route.Fact)
+		}
 	}
 	// Guard against a config that smuggled a selection field past the struct
 	// (e.g. via a hand-authored map). Serialize and scan.

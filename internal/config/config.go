@@ -45,13 +45,54 @@ type ShadowAdmissionConfig struct {
 	// Ingress configures the host-side Unix-domain-socket intake for shadow
 	// admission. Disabled by default and inert; carries no network address.
 	Ingress ShadowIngressConfig `yaml:"ingress"`
+	// RouteActivations are the deployment-owned route snapshots the dispatcher
+	// activates into the work ledger at startup, through its own single Store
+	// handle. This replaces the standalone route-activation writer: activation
+	// is idempotent (a rerun of the same definition returns the active snapshot)
+	// and happens in the ONE process that owns the database. Empty by default,
+	// so an unconfigured dispatcher activates nothing.
+	RouteActivations []RouteActivation `yaml:"route_activations"`
+	// Launcher registers the executor that turns admitted agent-bound WorkItems
+	// into authenticated broker profile launches. It is disabled by default and
+	// uses the dispatcher's existing broker origin and credential.
+	Launcher WorkItemLauncherConfig `yaml:"launcher"`
+}
+
+// WorkItemLauncherConfig binds one work-ledger executor descriptor to reviewed
+// broker launch profiles by AgentType mode. The emitter cannot select profiles.
+type WorkItemLauncherConfig struct {
+	Enabled         bool              `yaml:"enabled"`
+	AgentType       string            `yaml:"agent_type"`
+	ExecutorID      string            `yaml:"executor_id"`
+	ExecutorKind    string            `yaml:"executor_kind"`
+	ExecutorVersion string            `yaml:"executor_version"`
+	Profiles        map[string]string `yaml:"profiles"`
+}
+
+// RouteActivation names a deployment-owned RouteDefinition file plus the
+// executor descriptor Store.ActivateRoute requires. It never carries a
+// route_snapshot_id (the store mints it) and never a launcher, image, release,
+// or generation. The dispatcher activates each at startup, idempotently.
+type RouteActivation struct {
+	// RouteDefinitionPath is the absolute path of the deployment-owned
+	// RouteDefinition JSON file.
+	RouteDefinitionPath string `yaml:"route_definition_path"`
+	// ExecutorID is the executor id the route definition names.
+	ExecutorID string `yaml:"executor_id"`
+	// ExecutorKind is deterministic_tool or policy_evaluator.
+	ExecutorKind string `yaml:"executor_kind"`
+	// ExecutorVersion is the executor version string.
+	ExecutorVersion string `yaml:"executor_version"`
+	// AllowSupersede permits the explicit, safe activation transition when an
+	// active snapshot for the same route id exists with a DIFFERENT digest.
+	AllowSupersede bool `yaml:"allow_supersede"`
 }
 
 // ShadowIngressConfig configures the unprivileged host intake: a Unix-domain
 // socket authenticated by filesystem permissions and SO_PEERCRED. It is
 // DISABLED BY DEFAULT. There is no network listener and no credential; the
-// socket path's owner-only directory plus the peer-credential check are the
-// whole guard.
+// socket path's non-group-writable directory plus the peer-credential check are
+// the whole guard. A setgid transport group may have read/execute traversal.
 type ShadowIngressConfig struct {
 	// Enabled turns the host ingress on. Default false: no socket is opened.
 	Enabled bool `yaml:"enabled"`
@@ -457,6 +498,51 @@ func (cfg Config) Validate() error {
 			return errors.New("push_scanner bounds exceed the reviewed broker and scanner limits")
 		}
 	}
+	if err := validateRouteActivations(cfg.ShadowAdmission.RouteActivations); err != nil {
+		return err
+	}
+	if launcher := cfg.ShadowAdmission.Launcher; launcher.Enabled {
+		agentTypePattern := regexp.MustCompile(`^[a-z][a-z0-9-]{0,127}$`)
+		modePattern := regexp.MustCompile(`^[a-z][a-z0-9_]{0,127}$`)
+		profilePattern := regexp.MustCompile(`^[a-z][a-z0-9-]{0,127}$`)
+		if !cfg.Dispatcher.Enabled || !cfg.WorkRouter.Enabled {
+			return errors.New("enabled shadow_admission.launcher requires dispatcher and work_router execution loops")
+		}
+		if !agentTypePattern.MatchString(launcher.AgentType) || strings.TrimSpace(launcher.ExecutorID) == "" || strings.TrimSpace(launcher.ExecutorVersion) == "" {
+			return errors.New("enabled shadow_admission.launcher requires bounded agent_type, executor_id, and executor_version")
+		}
+		kind := launcher.ExecutorKind
+		if kind == "" {
+			kind = "deterministic_tool"
+		}
+		if kind != "deterministic_tool" && kind != "policy_evaluator" {
+			return errors.New("shadow_admission.launcher executor_kind must be deterministic_tool or policy_evaluator")
+		}
+		if len(launcher.Profiles) == 0 {
+			return errors.New("enabled shadow_admission.launcher requires at least one mode profile")
+		}
+		for mode, profile := range launcher.Profiles {
+			if !modePattern.MatchString(mode) || !profilePattern.MatchString(profile) {
+				return fmt.Errorf("shadow_admission.launcher profile mapping %q=%q is invalid", mode, profile)
+			}
+		}
+		matchedActivation := false
+		for _, activation := range cfg.ShadowAdmission.RouteActivations {
+			activationKind := activation.ExecutorKind
+			if activationKind == "" {
+				activationKind = "deterministic_tool"
+			}
+			if activation.ExecutorID == launcher.ExecutorID {
+				matchedActivation = true
+				if activation.ExecutorVersion != launcher.ExecutorVersion || activationKind != kind {
+					return errors.New("shadow_admission.launcher descriptor must exactly match its route activation descriptor")
+				}
+			}
+		}
+		if !matchedActivation {
+			return errors.New("shadow_admission.launcher executor_id has no deployment-owned route activation")
+		}
+	}
 	seen := map[string]string{}
 	for _, route := range cfg.Routes {
 		if err := route.Validate(); err != nil {
@@ -466,6 +552,43 @@ func (cfg Config) Validate() error {
 			return fmt.Errorf("route path %q is used by both %q and %q", route.Path, previous, route.ID)
 		}
 		seen[route.Path] = route.ID
+	}
+	return nil
+}
+
+// validateRouteActivations fails at config LOAD (not dispatcher startup) for
+// every shadow_admission.route_activations entry the dispatcher will install.
+// Each entry must name an absolute, bounded route_definition_path plus a
+// nonblank, bounded executor_id and executor_version, and a recognized
+// executor_kind (empty defaults to deterministic_tool at activation). Paths
+// must be unique so two entries cannot fight over the same definition file.
+func validateRouteActivations(activations []RouteActivation) error {
+	seenPaths := map[string]struct{}{}
+	for i, activation := range activations {
+		if strings.TrimSpace(activation.RouteDefinitionPath) == "" {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a route_definition_path", i)
+		}
+		if !strings.HasPrefix(activation.RouteDefinitionPath, "/") {
+			return fmt.Errorf("shadow_admission.route_activations[%d] route_definition_path must be absolute", i)
+		}
+		if len(activation.RouteDefinitionPath) > 4096 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] route_definition_path is oversized", i)
+		}
+		if _, dup := seenPaths[activation.RouteDefinitionPath]; dup {
+			return fmt.Errorf("shadow_admission.route_activations declares duplicate route_definition_path %q", activation.RouteDefinitionPath)
+		}
+		seenPaths[activation.RouteDefinitionPath] = struct{}{}
+		if strings.TrimSpace(activation.ExecutorID) == "" || len(activation.ExecutorID) > 256 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a bounded executor_id", i)
+		}
+		if strings.TrimSpace(activation.ExecutorVersion) == "" || len(activation.ExecutorVersion) > 256 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a bounded executor_version", i)
+		}
+		switch activation.ExecutorKind {
+		case "", "deterministic_tool", "policy_evaluator":
+		default:
+			return fmt.Errorf("shadow_admission.route_activations[%d] executor_kind must be deterministic_tool or policy_evaluator", i)
+		}
 	}
 	return nil
 }

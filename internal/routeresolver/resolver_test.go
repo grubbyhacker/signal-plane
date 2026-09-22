@@ -146,3 +146,53 @@ func TestFactComposition(t *testing.T) {
 		t.Fatalf("actionless fact = %q", got)
 	}
 }
+
+func TestBindSnapshotsUsesDispatcherActivationOutcomes(t *testing.T) {
+	cfg := Config{
+		Version: 1,
+		Routes: []RouteEntry{{
+			Fact: "upload.completed", AgentType: "youknowme-curator", Mode: "process_intake",
+			RouteID: "ykm-upload-intake", ContractRevision: "contract-v1",
+		}},
+	}
+	if _, err := New(cfg, YouKnowMeCuratorCatalog()); err == nil {
+		t.Fatal("resolver accepted an unbound stable route id")
+	}
+	bound, err := cfg.BindSnapshots(map[string]string{"ykm-upload-intake": "route-0123456789abcdef0123456789abcdef"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.Routes[0].RouteID != "" || bound.Routes[0].RouteSnapshotID != "route-0123456789abcdef0123456789abcdef" {
+		t.Fatalf("bound route = %#v", bound.Routes[0])
+	}
+	resolver, err := New(bound, YouKnowMeCuratorCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolver.Resolve(context.Background(), workledger.Event{EventKind: "upload", Action: "completed"})
+	if err != nil || !resolved.Matched || resolved.RouteSnapshotID != bound.Routes[0].RouteSnapshotID {
+		t.Fatalf("resolved = %#v err=%v", resolved, err)
+	}
+	if _, err := cfg.BindSnapshots(nil); err == nil {
+		t.Fatal("missing dispatcher activation binding was accepted")
+	}
+}
+
+func TestRouteEntryRequiresExactlyOneRouteSelector(t *testing.T) {
+	base := RouteEntry{Fact: "upload.completed", AgentType: "youknowme-curator", Mode: "process_intake"}
+	for name, route := range map[string]RouteEntry{
+		"neither": base,
+		"both": func() RouteEntry {
+			route := base
+			route.RouteID = "ykm-upload-intake"
+			route.RouteSnapshotID = "route-existing"
+			return route
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := (Config{Version: 1, Routes: []RouteEntry{route}}).Validate(); err == nil {
+				t.Fatalf("%s route selector shape was accepted", name)
+			}
+		})
+	}
+}

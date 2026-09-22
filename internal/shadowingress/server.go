@@ -89,8 +89,9 @@ func NewServer(cfg Config, admit *shadowadmit.Shadow, resolver RouteResolver, lo
 	return &Server{cfg: cfg, admit: admit, resolver: resolver, logger: logger, now: time.Now, authz: defaultPeerAuthorizer()}, nil
 }
 
-// validateSocketPath requires an absolute path in an existing owner-only
-// directory. A world-writable parent would let another user pre-create or
+// validateSocketPath requires an absolute path in an existing directory that
+// is not group/world writable. Group read/execute is allowed for a setgid
+// transport directory; write permission would let another user pre-create or
 // swap the socket, defeating the filesystem-permission half of the guard.
 func validateSocketPath(path string) error {
 	if path == "" {

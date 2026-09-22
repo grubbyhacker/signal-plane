@@ -1,18 +1,19 @@
 package main
 
 import (
-	"github.com/grubbyhacker/signal-plane/internal/config"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 )
 
-func TestDisabledStandbyInitializesLedgerWithoutSecrets(t *testing.T) {
-	handler, err := disabledHandler(config.WorkRouterConfig{DatabasePath: filepath.Join(t.TempDir(), "ledger.db")})
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestStandbyServesHealthWithoutOpeningLedger asserts the single-writer
+// invariant at the router boundary: under the redesign this binary opens NO
+// database handle (the work ledger is owned solely by github-task-dispatcher),
+// yet it still serves health. readyz reports 503 because it intentionally does
+// no work. The handler is constructed with no config and no filesystem, which
+// is itself the proof that it touches no database.
+func TestStandbyServesHealthWithoutOpeningLedger(t *testing.T) {
+	handler := standbyHandler()
 	for _, test := range []struct {
 		path   string
 		status int

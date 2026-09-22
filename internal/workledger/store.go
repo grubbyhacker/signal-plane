@@ -53,6 +53,19 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, owned: true}, nil
 }
 
+// Attach wraps an ALREADY-OPEN *sql.DB as a work-ledger Store without opening a
+// second SQLite handle or re-running migrations. It is the single-writer seam:
+// the one process that owns the operational database (the dispatcher, via
+// dispatcher.OpenStore, which already ran workledger.Migrate on this same
+// handle) exposes a work-ledger view over that shared connection. The returned
+// Store is not owned, so Close is a no-op — the owner closes the underlying
+// *sql.DB exactly once. Never call Open for a database another handle in this
+// process already opened; SQLite is opened with SetMaxOpenConns(1) and a second
+// writer handle is precisely the multi-writer hazard this redesign removes.
+func Attach(db *sql.DB) *Store {
+	return &Store{db: db, owned: false}
+}
+
 func (store *Store) Close() error {
 	if store.owned {
 		return store.db.Close()
