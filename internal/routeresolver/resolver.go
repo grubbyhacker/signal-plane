@@ -186,6 +186,22 @@ func New(config Config, catalog ModeCatalog) (*Resolver, error) {
 // Revision returns the stable route-config snapshot revision.
 func (resolver *Resolver) Revision() string { return resolver.revision }
 
+// RouteSnapshotIDs returns the distinct ledger route snapshot IDs this config
+// references, sorted. A caller uses it to verify every referenced snapshot is
+// activated in the ledger before serving — fail closed on a missing snapshot.
+func (resolver *Resolver) RouteSnapshotIDs() []string {
+	seen := make(map[string]struct{}, len(resolver.byFact))
+	for _, route := range resolver.byFact {
+		seen[route.RouteSnapshotID] = struct{}{}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // Resolve maps a validated domain-fact event to a deployment-owned routing
 // decision. An unknown fact returns Matched=false — no dispatch, no guessing.
 // The returned binding carries only (agent_type, mode, contract revision); it
