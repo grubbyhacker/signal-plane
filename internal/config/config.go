@@ -45,6 +45,32 @@ type ShadowAdmissionConfig struct {
 	// Ingress configures the host-side Unix-domain-socket intake for shadow
 	// admission. Disabled by default and inert; carries no network address.
 	Ingress ShadowIngressConfig `yaml:"ingress"`
+	// RouteActivations are the deployment-owned route snapshots the dispatcher
+	// activates into the work ledger at startup, through its own single Store
+	// handle. This replaces the standalone route-activation writer: activation
+	// is idempotent (a rerun of the same definition returns the active snapshot)
+	// and happens in the ONE process that owns the database. Empty by default,
+	// so an unconfigured dispatcher activates nothing.
+	RouteActivations []RouteActivation `yaml:"route_activations"`
+}
+
+// RouteActivation names a deployment-owned RouteDefinition file plus the
+// executor descriptor Store.ActivateRoute requires. It never carries a
+// route_snapshot_id (the store mints it) and never a launcher, image, release,
+// or generation. The dispatcher activates each at startup, idempotently.
+type RouteActivation struct {
+	// RouteDefinitionPath is the absolute path of the deployment-owned
+	// RouteDefinition JSON file.
+	RouteDefinitionPath string `yaml:"route_definition_path"`
+	// ExecutorID is the executor id the route definition names.
+	ExecutorID string `yaml:"executor_id"`
+	// ExecutorKind is deterministic_tool or policy_evaluator.
+	ExecutorKind string `yaml:"executor_kind"`
+	// ExecutorVersion is the executor version string.
+	ExecutorVersion string `yaml:"executor_version"`
+	// AllowSupersede permits the explicit, safe activation transition when an
+	// active snapshot for the same route id exists with a DIFFERENT digest.
+	AllowSupersede bool `yaml:"allow_supersede"`
 }
 
 // ShadowIngressConfig configures the unprivileged host intake: a Unix-domain

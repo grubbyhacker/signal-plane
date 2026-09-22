@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/grubbyhacker/signal-plane/internal/buildinfo"
@@ -17,6 +19,10 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 	"github.com/grubbyhacker/signal-plane/internal/eventbus"
 	"github.com/grubbyhacker/signal-plane/internal/recovery"
+	"github.com/grubbyhacker/signal-plane/internal/routeactivatecmd"
+	"github.com/grubbyhacker/signal-plane/internal/routeresolver"
+	"github.com/grubbyhacker/signal-plane/internal/shadowingresscmd"
+	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"github.com/nats-io/nats.go"
 )
 
@@ -76,6 +82,31 @@ func main() {
 		logger.Error("dispatcher recovery gate failed", "error", err)
 		os.Exit(1)
 	}
+	// Single-writer seam: this process is the sole opener of the operational
+	// work-ledger database. Route activation and the shadow-admission ingress
+	// run HERE, against the dispatcher's own attached handle (store.WorkLedger),
+	// never by opening the database in a second process. ctx is cancelled on
+	// SIGINT/SIGTERM so the ingress socket is released cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	workLedger := store.WorkLedger()
+	if err := activateRoutes(ctx, workLedger, cfg.ShadowAdmission.RouteActivations, logger); err != nil {
+		logger.Error("dispatcher route activation failed", "error", err)
+		os.Exit(1)
+	}
+	ingress, err := shadowingresscmd.BuildWithStore(ctx, workLedger, cfg.ShadowAdmission, routeresolver.YouKnowMeCuratorCatalog(), logger)
+	if err != nil {
+		logger.Error("build shadow ingress failed", "error", err)
+		os.Exit(1)
+	}
+	if ingress != nil {
+		go func() {
+			if serveErr := ingress.Serve(ctx); serveErr != nil {
+				logger.Error("shadow ingress exited with error", "error", serveErr)
+			}
+		}()
+		logger.Info("shadow ingress serving in dispatcher process", "route_revision", ingress.Revision())
+	}
 	go func() {
 		logger.Info("starting dispatcher HTTP listener", "addr", cfg.Dispatcher.Addr)
 		if err := http.ListenAndServe(cfg.Dispatcher.Addr, metrics.Handler()); err != nil {
@@ -94,7 +125,6 @@ func main() {
 		os.Exit(1)
 	}
 	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, ReporterURL: cfg.Dispatcher.ReporterBrokerURL, ReporterToken: reporterToken, Client: &http.Client{Timeout: 30 * time.Second}}
-	ctx := context.Background()
 	metrics.SetReady(true)
 	go worker(ctx, logger, metrics, store, broker)
 	logger.Info("starting github-task-dispatcher", "version", buildinfo.Version, "durable", cfg.Dispatcher.Durable, "workers", 1)
@@ -115,6 +145,37 @@ func main() {
 		metrics.SetReady(true)
 		dispatcher.Process(ctx, logger, metrics, store, cfg.Dispatcher.RepositoryTaskRoutes, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
+}
+
+// activateRoutes idempotently installs each deployment-owned route snapshot
+// into the work ledger through the dispatcher's OWN handle at startup. It
+// replaces the standalone route-activation writer: activation happens in the
+// one process that owns the database. An empty list is a clean no-op.
+func activateRoutes(ctx context.Context, ledger *workledger.Store, activations []config.RouteActivation, logger *slog.Logger) error {
+	for _, activation := range activations {
+		routeJSON, err := os.ReadFile(activation.RouteDefinitionPath)
+		if err != nil {
+			return fmt.Errorf("read route definition %q: %w", activation.RouteDefinitionPath, err)
+		}
+		kind := activation.ExecutorKind
+		if kind == "" {
+			kind = string(workledger.ExecutorDeterministicTool)
+		}
+		outcome, err := routeactivatecmd.RunWithStore(ctx, ledger, routeactivatecmd.Options{
+			RouteDefinitionJSON: routeJSON,
+			Executor: workledger.ExecutorDescriptor{
+				ID:      activation.ExecutorID,
+				Kind:    workledger.ExecutorKind(kind),
+				Version: activation.ExecutorVersion,
+			},
+			AllowSupersede: activation.AllowSupersede,
+		}, time.Now().UTC())
+		if err != nil {
+			return fmt.Errorf("activate route %q: %w", activation.RouteDefinitionPath, err)
+		}
+		logger.Info("activated deployment-owned route", "route_id", outcome.RouteID, "route_snapshot_id", outcome.RouteSnapshotID, "already_active", outcome.AlreadyActive, "superseded", outcome.Superseded)
+	}
+	return nil
 }
 
 func runFailedLaunchReconciliation(args []string, output io.Writer, now time.Time) error {

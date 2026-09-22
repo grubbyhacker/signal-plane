@@ -226,6 +226,16 @@ func ensureColumn(db *sql.DB, table, column, definition string) error {
 func (s *Store) Close() error                    { return s.db.Close() }
 func (s *Store) Ready(ctx context.Context) error { return s.db.PingContext(ctx) }
 
+// WorkLedger returns a work-ledger view over this dispatcher store's SINGLE
+// underlying *sql.DB handle. OpenStore already ran workledger.Migrate on that
+// handle, so the view shares the exact connection the dispatcher owns — no
+// second sql.Open, no second writer. This is how the dispatcher becomes the
+// sole process opening the operational work-ledger database: route activation
+// and the shadow-admission ingress run inside the dispatcher process against
+// this view instead of opening the database themselves. The view is not owned;
+// the dispatcher closes the handle once via Store.Close.
+func (s *Store) WorkLedger() *workledger.Store { return workledger.Attach(s.db) }
+
 // Record persists the delivery's JetStream position and semantically unique job
 // atomically. The sequence is the recovery checkpoint: a restored consumer can
 // replay starting at RecoverySequence without losing accepted work.
