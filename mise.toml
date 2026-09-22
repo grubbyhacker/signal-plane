@@ -15,7 +15,7 @@ fi
 """
 
 [tasks.check]
-run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run validate:shadow-admission && mise run validate:shadow-ingress && mise run validate:route-resolver && mise run validate:shadow-ingress-command && mise run validate:dockerfile-packaging && mise run test && mise run build"
+run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run validate:shadow-admission && mise run validate:shadow-ingress && mise run validate:route-resolver && mise run validate:shadow-ingress-command && mise run validate:route-activate-command && mise run validate:dockerfile-packaging && mise run test && mise run build"
 
 [tasks."validate:image-tag-contract"]
 run = "python3 scripts/validate-image-tag-contract.py"
@@ -34,6 +34,9 @@ run = "python3 scripts/validate-route-resolver.py"
 
 [tasks."validate:shadow-ingress-command"]
 run = "python3 scripts/validate-shadow-ingress-command.py"
+
+[tasks."validate:route-activate-command"]
+run = "python3 scripts/validate-route-activate-command.py"
 
 [tasks."validate:dockerfile-packaging"]
 run = "python3 scripts/validate-dockerfile-packaging.py"
@@ -54,7 +57,7 @@ description = "Run the deterministic in-process dispatcher restore/replay/reconc
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./internal/recovery -run '^TestDispatcherRecoveryProof$' -count=1"
 
 [tasks.build]
-run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher ./cmd/resume-release-router ./cmd/push-security-scanner ./cmd/workitem-shadow-ingress"
+run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go build ./cmd/signal-gateway ./cmd/signal-observer ./cmd/github-task-dispatcher ./cmd/resume-release-router ./cmd/push-security-scanner ./cmd/workitem-shadow-ingress ./cmd/workitem-route-activate"
 
 [tasks.image-build]
 run = "docker build -t signal-plane:local ."
