@@ -91,11 +91,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	workLedger := store.WorkLedger()
-	if err := activateRoutes(ctx, workLedger, cfg.ShadowAdmission.RouteActivations, logger); err != nil {
+	routeSnapshots, err := activateRoutes(ctx, workLedger, cfg.ShadowAdmission.RouteActivations, logger)
+	if err != nil {
 		logger.Error("dispatcher route activation failed", "error", err)
 		os.Exit(1)
 	}
-	ingress, err := shadowingresscmd.BuildWithStore(ctx, workLedger, cfg.ShadowAdmission, routeresolver.YouKnowMeCuratorCatalog(), logger)
+	ingress, err := shadowingresscmd.BuildWithStoreAndSnapshots(ctx, workLedger, cfg.ShadowAdmission, routeSnapshots, routeresolver.YouKnowMeCuratorCatalog(), logger)
 	if err != nil {
 		logger.Error("build shadow ingress failed", "error", err)
 		os.Exit(1)
@@ -189,11 +190,12 @@ func runFetchLoop(ctx context.Context, logger *slog.Logger, metrics *dispatcher.
 // into the work ledger through the dispatcher's OWN handle at startup. It
 // replaces the standalone route-activation writer: activation happens in the
 // one process that owns the database. An empty list is a clean no-op.
-func activateRoutes(ctx context.Context, ledger *workledger.Store, activations []config.RouteActivation, logger *slog.Logger) error {
+func activateRoutes(ctx context.Context, ledger *workledger.Store, activations []config.RouteActivation, logger *slog.Logger) (map[string]string, error) {
+	snapshotByRouteID := make(map[string]string, len(activations))
 	for _, activation := range activations {
 		routeJSON, err := os.ReadFile(activation.RouteDefinitionPath)
 		if err != nil {
-			return fmt.Errorf("read route definition %q: %w", activation.RouteDefinitionPath, err)
+			return nil, fmt.Errorf("read route definition %q: %w", activation.RouteDefinitionPath, err)
 		}
 		kind := activation.ExecutorKind
 		if kind == "" {
@@ -209,11 +211,15 @@ func activateRoutes(ctx context.Context, ledger *workledger.Store, activations [
 			AllowSupersede: activation.AllowSupersede,
 		}, time.Now().UTC())
 		if err != nil {
-			return fmt.Errorf("activate route %q: %w", activation.RouteDefinitionPath, err)
+			return nil, fmt.Errorf("activate route %q: %w", activation.RouteDefinitionPath, err)
 		}
+		if previous := snapshotByRouteID[outcome.RouteID]; previous != "" && previous != outcome.RouteSnapshotID {
+			return nil, fmt.Errorf("route %q activated more than one snapshot (%q and %q)", outcome.RouteID, previous, outcome.RouteSnapshotID)
+		}
+		snapshotByRouteID[outcome.RouteID] = outcome.RouteSnapshotID
 		logger.Info("activated deployment-owned route", "route_id", outcome.RouteID, "route_snapshot_id", outcome.RouteSnapshotID, "already_active", outcome.AlreadyActive, "superseded", outcome.Superseded)
 	}
-	return nil
+	return snapshotByRouteID, nil
 }
 
 func runFailedLaunchReconciliation(args []string, output io.Writer, now time.Time) error {

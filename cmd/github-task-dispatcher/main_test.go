@@ -17,6 +17,7 @@ import (
 
 	"github.com/grubbyhacker/signal-plane/internal/config"
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
+	"github.com/grubbyhacker/signal-plane/internal/workledger"
 )
 
 func TestDisabledStandbyPreparesStoreWithoutBrokerOrNATS(t *testing.T) {
@@ -316,5 +317,55 @@ func TestRecoveryCommandDefaultsToReadOnlyPlan(t *testing.T) {
 	}
 	if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
 		t.Fatal("dry-run modified restored SQLite")
+	}
+}
+
+func TestActivateRoutesReturnsStableSnapshotBindings(t *testing.T) {
+	ledger, err := workledger.Open(filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+
+	definition := workledger.RouteDefinition{
+		ID:              "ykm-upload-intake",
+		SchemaVersion:   1,
+		SemanticVersion: "1.0.0",
+		ExecutorID:      "youknowme.curator",
+		Admission: workledger.AdmissionPolicy{
+			Sources:     []string{"youknowme"},
+			Namespaces:  []string{"grubbyhacker/youknowme"},
+			ObjectKinds: []string{"upload"},
+			Events:      []string{"upload"},
+			Actions:     []string{"completed"},
+		},
+		Concurrency: workledger.ConcurrencyPolicy{Serialization: workledger.SerializeObject},
+		Retry:       workledger.RetryPolicy{MaxAttempts: 2, Backoff: []time.Duration{time.Second}},
+	}
+	raw, err := json.Marshal(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "route.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activations := []config.RouteActivation{{
+		RouteDefinitionPath: path,
+		ExecutorID:          "youknowme.curator",
+		ExecutorKind:        "deterministic_tool",
+		ExecutorVersion:     "v1",
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	first, err := activateRoutes(context.Background(), ledger, activations, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := activateRoutes(context.Background(), ledger, activations, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first["ykm-upload-intake"] == "" || second["ykm-upload-intake"] != first["ykm-upload-intake"] {
+		t.Fatalf("activation bindings are not stable: first=%#v second=%#v", first, second)
 	}
 }

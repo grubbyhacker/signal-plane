@@ -235,3 +235,44 @@ func waitForSocket(t *testing.T, path string) {
 	}
 	t.Fatalf("socket %s never appeared", path)
 }
+
+func TestBuildWithStoreAndSnapshotsBindsStableRouteID(t *testing.T) {
+	dbPath, snapshotID := prepareLedger(t)
+	store, err := workledger.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	routeCfg := filepath.Join(t.TempDir(), "routes.yaml")
+	body := `version: 1
+routes:
+  - fact: upload.completed
+    agent_type: youknowme-curator
+    mode: process_intake
+    route_id: ykm-upload-intake
+    contract_revision: contract-v1
+`
+	if err := os.WriteFile(routeCfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := BuildWithStoreAndSnapshots(
+		context.Background(), store,
+		enabledConfig(dbPath, shortSocketPath(t), routeCfg),
+		map[string]string{"ykm-upload-intake": snapshotID},
+		routeresolver.YouKnowMeCuratorCatalog(), nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service == nil || service.Revision() == "" {
+		t.Fatalf("bound service = %#v", service)
+	}
+	if _, err := BuildWithStoreAndSnapshots(
+		context.Background(), store,
+		enabledConfig(dbPath, shortSocketPath(t), routeCfg),
+		nil, routeresolver.YouKnowMeCuratorCatalog(), nil,
+	); err == nil {
+		t.Fatal("unbound stable route id was accepted")
+	}
+}

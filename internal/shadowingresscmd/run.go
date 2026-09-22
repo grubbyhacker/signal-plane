@@ -97,6 +97,14 @@ func Build(ctx context.Context, cfg config.ShadowAdmissionConfig, catalog router
 // mismatch, a route snapshot not active in the ledger, or bad socket
 // permissions all refuse to serve. Returns (nil, nil) when disabled.
 func BuildWithStore(ctx context.Context, store *workledger.Store, cfg config.ShadowAdmissionConfig, catalog routeresolver.ModeCatalog, logger *slog.Logger) (*Service, error) {
+	return BuildWithStoreAndSnapshots(ctx, store, cfg, nil, catalog, logger)
+}
+
+// BuildWithStoreAndSnapshots is the production single-writer constructor. The
+// snapshot map comes directly from dispatcher startup activation and binds any
+// stable route_id entries in the deployment-owned route table before the
+// resolver is constructed. No snapshot id is authored by deployment config.
+func BuildWithStoreAndSnapshots(ctx context.Context, store *workledger.Store, cfg config.ShadowAdmissionConfig, snapshotByRouteID map[string]string, catalog routeresolver.ModeCatalog, logger *slog.Logger) (*Service, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
@@ -120,6 +128,12 @@ func BuildWithStore(ctx context.Context, store *workledger.Store, cfg config.Sha
 	routeCfg, err := routeresolver.ParseConfig(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse route config: %w", err)
+	}
+	if snapshotByRouteID != nil {
+		routeCfg, err = routeCfg.BindSnapshots(snapshotByRouteID)
+		if err != nil {
+			return nil, fmt.Errorf("bind dispatcher-activated route snapshots: %w", err)
+		}
 	}
 	// New fails closed on a catalog mismatch (a mode the AgentType does not
 	// declare) and on a config that smuggled a selection field.
