@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 21
+const SchemaVersion = 22
 
 type WorkState string
 
@@ -129,16 +129,26 @@ func (event Event) SemanticObjectKey() string {
 }
 
 type WorkItem struct {
-	ID                        string
-	RouteSnapshotID           string
-	RouteID                   string
-	SemanticObjectKey         string
-	Source                    string
-	Namespace                 string
-	ObjectKind                string
-	ObjectID                  string
-	SourceRevision            string
-	SerializationKey          string
+	ID                string
+	RouteSnapshotID   string
+	RouteID           string
+	SemanticObjectKey string
+	Source            string
+	Namespace         string
+	ObjectKind        string
+	ObjectID          string
+	SourceRevision    string
+	SerializationKey  string
+	// Agent binding (source-neutral, platform/broker-authoritative). Zero
+	// values mean "no agent resolved yet" and preserve the pre-agent behavior.
+	AgentType                 string
+	AgentMode                 string
+	TypeContractRevision      string
+	ResolvedReleaseGeneration int64
+	ResolvedReleaseDigest     string
+	BrokerRunID               string
+	AuthoritativePRRepository string
+	AuthoritativePRNumber     int64
 	State                     WorkState
 	StateVersion              int
 	SupersededByID            string

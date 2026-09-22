@@ -197,17 +197,37 @@ func (store *Store) RecordIngressFailure(ctx context.Context, event Event, class
 }
 
 func (store *Store) Admit(ctx context.Context, snapshotID string, event Event, now time.Time) (AdmissionResult, error) {
-	return store.admit(ctx, snapshotID, event, nil, now)
+	return store.admit(ctx, snapshotID, event, nil, AgentBinding{}, now)
+}
+
+// AdmitWithAgent admits an event carrying a deployment-owned (AgentType, mode)
+// selection resolved by the dispatcher route. Only the admission-safe subset of
+// the binding is honored; supplying any broker-resolved selection field (image
+// digest, release generation, broker run, PR correlation) is rejected, because
+// the emitter/caller never selects an image, release, or generation.
+func (store *Store) AdmitWithAgent(ctx context.Context, snapshotID string, event Event, binding AgentBinding, now time.Time) (AdmissionResult, error) {
+	return store.admit(ctx, snapshotID, event, nil, binding, now)
 }
 
 func (store *Store) AdmitRelease(ctx context.Context, snapshotID string, event Event, operation ReleaseOperation, now time.Time) (AdmissionResult, error) {
 	if err := operation.Validate(); err != nil {
 		return AdmissionResult{}, err
 	}
-	return store.admit(ctx, snapshotID, event, &operation, now)
+	return store.admit(ctx, snapshotID, event, &operation, AgentBinding{}, now)
 }
 
-func (store *Store) admit(ctx context.Context, snapshotID string, event Event, operation *ReleaseOperation, now time.Time) (AdmissionResult, error) {
+func (store *Store) admit(ctx context.Context, snapshotID string, event Event, operation *ReleaseOperation, binding AgentBinding, now time.Time) (AdmissionResult, error) {
+	// Admission is source-neutral and selection-free: a caller may carry a
+	// deployment-owned (AgentType, mode, contract revision) selection, but never
+	// a release, generation, image digest, broker run, or PR correlation. Those
+	// are broker-resolved after admission.
+	if err := binding.RejectAdmissionSelection(); err != nil {
+		return AdmissionResult{}, err
+	}
+	admissionBinding := binding.AdmissionBinding()
+	if err := admissionBinding.Validate(); err != nil {
+		return AdmissionResult{}, err
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return AdmissionResult{}, err
@@ -247,10 +267,10 @@ func (store *Store) admit(ctx context.Context, snapshotID string, event Event, o
 	}
 	semanticKey := event.SemanticObjectKey()
 	var item WorkItem
-	err = tx.QueryRowContext(ctx, `SELECT id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,state,state_version,superseded_by_id,latest_executor_correlation,created_at,updated_at,terminal_at,next_attempt_at FROM work_items WHERE route_snapshot_id=? AND semantic_object_key=? AND source_revision=? ORDER BY created_at DESC LIMIT 1`, snapshot.ID, semanticKey, event.SourceRevision).Scan(workItemScan(&item)...)
+	err = tx.QueryRowContext(ctx, `SELECT `+workItemColumns+` FROM work_items WHERE route_snapshot_id=? AND semantic_object_key=? AND source_revision=? ORDER BY created_at DESC LIMIT 1`, snapshot.ID, semanticKey, event.SourceRevision).Scan(workItemScan(&item)...)
 	if errors.Is(err, sql.ErrNoRows) {
-		item = WorkItem{ID: newID("work"), RouteSnapshotID: snapshot.ID, RouteID: definition.ID, SemanticObjectKey: semanticKey, Source: event.Source, Namespace: event.Namespace, ObjectKind: event.ObjectKind, ObjectID: event.ObjectID, SourceRevision: event.SourceRevision, SerializationKey: serializationKey(definition, event), State: StateAdmitted, StateVersion: 1, CreatedAt: now.UTC(), UpdatedAt: now.UTC()}
-		_, err = tx.ExecContext(ctx, `INSERT INTO work_items(id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,task_evidence_digest,state,state_version,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ID, item.RouteSnapshotID, item.RouteID, item.SemanticObjectKey, item.Source, item.Namespace, item.ObjectKind, item.ObjectID, item.SourceRevision, item.SerializationKey, event.PayloadDigest, item.State, item.StateVersion, millis(now), millis(now), millis(now))
+		item = WorkItem{ID: newID("work"), RouteSnapshotID: snapshot.ID, RouteID: definition.ID, SemanticObjectKey: semanticKey, Source: event.Source, Namespace: event.Namespace, ObjectKind: event.ObjectKind, ObjectID: event.ObjectID, SourceRevision: event.SourceRevision, SerializationKey: serializationKey(definition, event), AgentType: admissionBinding.AgentType, AgentMode: admissionBinding.Mode, TypeContractRevision: admissionBinding.TypeContractRevision, State: StateAdmitted, StateVersion: 1, CreatedAt: now.UTC(), UpdatedAt: now.UTC()}
+		_, err = tx.ExecContext(ctx, `INSERT INTO work_items(id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,task_evidence_digest,agent_type,agent_mode,type_contract_revision,state,state_version,created_at,updated_at,next_attempt_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, item.ID, item.RouteSnapshotID, item.RouteID, item.SemanticObjectKey, item.Source, item.Namespace, item.ObjectKind, item.ObjectID, item.SourceRevision, item.SerializationKey, event.PayloadDigest, item.AgentType, item.AgentMode, item.TypeContractRevision, item.State, item.StateVersion, millis(now), millis(now), millis(now))
 		if err != nil {
 			return AdmissionResult{}, err
 		}
@@ -343,7 +363,7 @@ func (store *Store) Claim(ctx context.Context, now time.Time) (WorkItem, Executo
 		return WorkItem{}, ExecutorAttempt{}, false, err
 	}
 	var item WorkItem
-	err = tx.QueryRowContext(ctx, `SELECT w.id,w.route_snapshot_id,w.route_id,w.semantic_object_key,w.source,w.namespace,w.object_kind,w.object_id,w.source_revision,w.serialization_key,w.state,w.state_version,w.superseded_by_id,w.latest_executor_correlation,w.created_at,w.updated_at,w.terminal_at,w.next_attempt_at FROM work_items w WHERE w.state IN (?,?) AND w.next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM serialization_leases l WHERE l.serialization_key=w.serialization_key) ORDER BY w.next_attempt_at,w.created_at LIMIT 1`, StateAdmitted, StateWaiting, millis(now)).Scan(workItemScan(&item)...)
+	err = tx.QueryRowContext(ctx, `SELECT w.id,w.route_snapshot_id,w.route_id,w.semantic_object_key,w.source,w.namespace,w.object_kind,w.object_id,w.source_revision,w.serialization_key,w.agent_type,w.agent_mode,w.type_contract_revision,w.resolved_release_generation,w.resolved_release_digest,w.broker_run_id,w.authoritative_pr_repository,w.authoritative_pr_number,w.state,w.state_version,w.superseded_by_id,w.latest_executor_correlation,w.created_at,w.updated_at,w.terminal_at,w.next_attempt_at FROM work_items w WHERE w.state IN (?,?) AND w.next_attempt_at<=? AND NOT EXISTS(SELECT 1 FROM serialization_leases l WHERE l.serialization_key=w.serialization_key) ORDER BY w.next_attempt_at,w.created_at LIMIT 1`, StateAdmitted, StateWaiting, millis(now)).Scan(workItemScan(&item)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return WorkItem{}, ExecutorAttempt{}, false, err
@@ -523,6 +543,105 @@ func (store *Store) RecoverInterrupted(ctx context.Context, now time.Time) (int6
 	return count, tx.Commit()
 }
 
+// WorkItem returns a stored work item by id.
+func (store *Store) WorkItem(ctx context.Context, id string) (WorkItem, error) {
+	var item WorkItem
+	err := store.db.QueryRowContext(ctx, `SELECT `+workItemColumns+` FROM work_items WHERE id=?`, id).Scan(workItemScan(&item)...)
+	return item, err
+}
+
+// ResolveRelease records the broker-resolved release generation, its immutable
+// image digest, and the broker run identity onto a work item. This is the
+// broker's authority, exercised AFTER admission; enforcement remains digest-only
+// at launch. Monotonicity is by generation number: a resolution may only move
+// the generation forward, never backward, and a mismatched digest for the same
+// generation is refused. Emitters and runtime callers never reach this path.
+func (store *Store) ResolveRelease(ctx context.Context, workItemID string, generation int64, digest, brokerRunID string, now time.Time) error {
+	if generation <= 0 {
+		return errors.New("resolved release generation must be positive")
+	}
+	if !imageDigestFormat.MatchString(digest) {
+		return errors.New("resolved release digest must be a sha256 image digest")
+	}
+	if brokerRunID == "" || len(brokerRunID) > 256 {
+		return errors.New("broker run id is required and bounded")
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var priorGen int64
+	var priorDigest, priorRun string
+	if err := tx.QueryRowContext(ctx, `SELECT resolved_release_generation,resolved_release_digest,broker_run_id FROM work_items WHERE id=?`, workItemID).Scan(&priorGen, &priorDigest, &priorRun); err != nil {
+		return err
+	}
+	if priorGen == generation {
+		if priorDigest != digest {
+			return errors.New("resolved generation already bound to a different digest")
+		}
+		if priorRun != "" && priorRun != brokerRunID {
+			return errors.New("resolved generation already bound to a different broker run")
+		}
+	} else if generation < priorGen {
+		return errors.New("resolved release generation is not monotonic")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE work_items SET resolved_release_generation=?,resolved_release_digest=?,broker_run_id=?,state_version=state_version+1,updated_at=? WHERE id=?`, generation, digest, brokerRunID, millis(now), workItemID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("work item not found for release resolution")
+	}
+	return tx.Commit()
+}
+
+// RecordAuthoritativePRCorrelation binds a repository and PR number to a work
+// item. The design requires this to originate ONLY from the broker's own
+// authenticated pull.create side effect — never parsed from agent output,
+// branch names, or PR body markers. This method persists that binding; it does
+// not itself observe the broker call. Re-recording the same correlation is
+// idempotent; a different correlation for the same work item is refused.
+func (store *Store) RecordAuthoritativePRCorrelation(ctx context.Context, workItemID, repository string, prNumber int64, now time.Time) error {
+	if !repoFormat.MatchString(repository) || len(repository) > 256 {
+		return errors.New("authoritative PR repository must be owner/name")
+	}
+	if prNumber <= 0 {
+		return errors.New("authoritative PR number must be positive")
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var priorRepo string
+	var priorNumber int64
+	if err := tx.QueryRowContext(ctx, `SELECT authoritative_pr_repository,authoritative_pr_number FROM work_items WHERE id=?`, workItemID).Scan(&priorRepo, &priorNumber); err != nil {
+		return err
+	}
+	if priorRepo != "" && (priorRepo != repository || priorNumber != prNumber) {
+		return errors.New("work item already correlated to a different pull request")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE work_items SET authoritative_pr_repository=?,authoritative_pr_number=?,state_version=state_version+1,updated_at=? WHERE id=?`, repository, prNumber, millis(now), workItemID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("work item not found for PR correlation")
+	}
+	return tx.Commit()
+}
+
+// WorkItemByAuthoritativePR maps a repository and PR number back to the
+// originating work item, which is how a later review webhook is attributed to
+// an AgentType. An unknown pull request yields no match (sql.ErrNoRows), which
+// callers must treat as "no dispatch": silence is correct, guessing is the flaw.
+func (store *Store) WorkItemByAuthoritativePR(ctx context.Context, repository string, prNumber int64) (WorkItem, error) {
+	var item WorkItem
+	err := store.db.QueryRowContext(ctx, `SELECT `+workItemColumns+` FROM work_items WHERE authoritative_pr_repository=? AND authoritative_pr_number=? ORDER BY created_at DESC LIMIT 1`, repository, prNumber).Scan(workItemScan(&item)...)
+	return item, err
+}
+
 func loadSnapshot(ctx context.Context, tx *sql.Tx, id string) (RouteSnapshot, RouteDefinition, error) {
 	var snapshot RouteSnapshot
 	var encoded string
@@ -551,13 +670,16 @@ func loadDefinition(ctx context.Context, tx *sql.Tx, id string) (RouteDefinition
 
 func loadWorkItem(ctx context.Context, tx *sql.Tx, id string) (WorkItem, error) {
 	var item WorkItem
-	err := tx.QueryRowContext(ctx, `SELECT id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,state,state_version,superseded_by_id,latest_executor_correlation,created_at,updated_at,terminal_at,next_attempt_at FROM work_items WHERE id=?`, id).Scan(workItemScan(&item)...)
+	err := tx.QueryRowContext(ctx, `SELECT `+workItemColumns+` FROM work_items WHERE id=?`, id).Scan(workItemScan(&item)...)
 	return item, err
 }
 
 func workItemScan(item *WorkItem) []any {
-	return []any{&item.ID, &item.RouteSnapshotID, &item.RouteID, &item.SemanticObjectKey, &item.Source, &item.Namespace, &item.ObjectKind, &item.ObjectID, &item.SourceRevision, &item.SerializationKey, &item.State, &item.StateVersion, nullString{target: &item.SupersededByID}, &item.LatestExecutorCorrelation, millisTime{target: &item.CreatedAt}, millisTime{target: &item.UpdatedAt}, optionalTime{target: &item.TerminalAt}, optionalTime{target: &item.NextAttemptAt}}
+	return []any{&item.ID, &item.RouteSnapshotID, &item.RouteID, &item.SemanticObjectKey, &item.Source, &item.Namespace, &item.ObjectKind, &item.ObjectID, &item.SourceRevision, &item.SerializationKey, &item.AgentType, &item.AgentMode, &item.TypeContractRevision, &item.ResolvedReleaseGeneration, &item.ResolvedReleaseDigest, &item.BrokerRunID, &item.AuthoritativePRRepository, &item.AuthoritativePRNumber, &item.State, &item.StateVersion, nullString{target: &item.SupersededByID}, &item.LatestExecutorCorrelation, millisTime{target: &item.CreatedAt}, millisTime{target: &item.UpdatedAt}, optionalTime{target: &item.TerminalAt}, optionalTime{target: &item.NextAttemptAt}}
 }
+
+// workItemColumns is the SELECT column list matching workItemScan order.
+const workItemColumns = `id,route_snapshot_id,route_id,semantic_object_key,source,namespace,object_kind,object_id,source_revision,serialization_key,agent_type,agent_mode,type_contract_revision,resolved_release_generation,resolved_release_digest,broker_run_id,authoritative_pr_repository,authoritative_pr_number,state,state_version,superseded_by_id,latest_executor_correlation,created_at,updated_at,terminal_at,next_attempt_at`
 
 type nullString struct{ target *string }
 
