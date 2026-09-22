@@ -550,6 +550,18 @@ func (store *Store) WorkItem(ctx context.Context, id string) (WorkItem, error) {
 	return item, err
 }
 
+// RouteSnapshotExists reports whether an ACTIVE (non-retired) route snapshot
+// with the given id exists. A caller wiring a deployment-owned route config
+// uses it to fail closed when the config references a snapshot the ledger does
+// not have activated.
+func (store *Store) RouteSnapshotExists(ctx context.Context, id string) (bool, error) {
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM route_snapshots WHERE id=? AND retired_at IS NULL`, id).Scan(&count); err != nil {
+		return false, err
+	}
+	return count == 1, nil
+}
+
 // ResolveRelease records the broker-resolved release generation, its immutable
 // image digest, and the broker run identity onto a work item. This is the
 // broker's authority, exercised AFTER admission; enforcement remains digest-only

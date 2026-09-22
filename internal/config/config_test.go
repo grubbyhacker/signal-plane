@@ -334,6 +334,7 @@ shadow_admission:
     enabled: true
     socket_path: /run/signal-plane/shadow.sock
     allowed_uids: [1000]
+    route_config_path: /etc/signal-plane/routes.yaml
 routes:
   - id: manual-local
     path: /manual
@@ -347,7 +348,7 @@ routes:
 		t.Fatal(err)
 	}
 	ing := enabled.ShadowAdmission.Ingress
-	if !ing.Enabled || ing.SocketPath != "/run/signal-plane/shadow.sock" || len(ing.AllowedUIDs) != 1 || ing.AllowedUIDs[0] != 1000 {
+	if !ing.Enabled || ing.SocketPath != "/run/signal-plane/shadow.sock" || len(ing.AllowedUIDs) != 1 || ing.AllowedUIDs[0] != 1000 || ing.RouteConfigPath != "/etc/signal-plane/routes.yaml" {
 		t.Fatalf("shadow ingress config = %#v", ing)
 	}
 }

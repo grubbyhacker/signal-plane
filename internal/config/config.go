@@ -60,6 +60,9 @@ type ShadowIngressConfig struct {
 	// AllowedUIDs optionally restricts the connecting process UID (SO_PEERCRED).
 	// Empty means "same UID as this process".
 	AllowedUIDs []uint32 `yaml:"allowed_uids"`
+	// RouteConfigPath is the absolute path of the deployment-owned route table
+	// (fact -> agent_type/mode/route_snapshot_id). Required when enabled.
+	RouteConfigPath string `yaml:"route_config_path"`
 }
 
 type PushScannerConfig struct {
