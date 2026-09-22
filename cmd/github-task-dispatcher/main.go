@@ -19,6 +19,7 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/dispatcher"
 	"github.com/grubbyhacker/signal-plane/internal/eventbus"
 	"github.com/grubbyhacker/signal-plane/internal/recovery"
+	"github.com/grubbyhacker/signal-plane/internal/resumeupload"
 	"github.com/grubbyhacker/signal-plane/internal/routeactivatecmd"
 	"github.com/grubbyhacker/signal-plane/internal/routeresolver"
 	"github.com/grubbyhacker/signal-plane/internal/shadowingresscmd"
@@ -119,6 +120,19 @@ func main() {
 		os.Exit(1)
 	}
 	defer bus.Close()
+	// Relocated Resume Builder release pipeline: the release/published ingress
+	// and the YouKnowMe upload executor run HERE, against the dispatcher's own
+	// work-ledger handle, so the standalone resume-release-router no longer
+	// opens the database. Disabled (nil) when work_router.enabled is false.
+	resumeService, err := resumeupload.Build(ctx, cfg.WorkRouter, resumeupload.Deps{Store: workLedger, Bus: bus, Stream: cfg.NATS.Stream, Logger: logger})
+	if err != nil {
+		logger.Error("build resume-release pipeline failed", "error", err)
+		os.Exit(1)
+	}
+	if resumeService != nil {
+		go resumeService.Serve(ctx)
+		logger.Info("resume-release pipeline serving in dispatcher process")
+	}
 	consumer, err := bus.NewConsumer(eventbus.ConsumerConfig{Subject: cfg.Dispatcher.Subject, Durable: cfg.Dispatcher.Durable, AckWait: 30 * time.Second, MaxAckPending: 64, MaxDeliver: 10, StartSequence: cfg.Dispatcher.RecoveryStartSequence})
 	if err != nil {
 		logger.Error("create dispatcher consumer failed", "error", err)
@@ -128,22 +142,46 @@ func main() {
 	metrics.SetReady(true)
 	go worker(ctx, logger, metrics, store, broker)
 	logger.Info("starting github-task-dispatcher", "version", buildinfo.Version, "durable", cfg.Dispatcher.Durable, "workers", 1)
+	runFetchLoop(ctx, logger, metrics, store, consumer, cfg.Dispatcher.RepositoryTaskRoutes)
+	// ctx cancelled (SIGINT/SIGTERM): fall through so deferred bus.Close and
+	// store.Close run, and the deferred signal.stop restores default handlers.
+	logger.Info("github-task-dispatcher shutting down", "reason", context.Cause(ctx))
+}
+
+// runFetchLoop pulls dispatcher deliveries until ctx is cancelled, then RETURNS
+// so main's deferred cleanup (bus.Close, store.Close, ingress socket removal)
+// runs. It never terminates the process itself; a clean return is what lets the
+// single-writer store handle close exactly once on shutdown.
+func runFetchLoop(ctx context.Context, logger *slog.Logger, metrics *dispatcher.Metrics, store *dispatcher.Store, consumer *eventbus.Consumer, routes []config.RepositoryTaskRoute) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		msg, err := consumer.Fetch(2 * time.Second)
 		if errors.Is(err, nats.ErrTimeout) {
+			if ctx.Err() != nil {
+				return
+			}
 			_, consumerErr := consumer.Ready(ctx)
 			storeErr := store.Ready(ctx)
 			metrics.SetReady(consumerErr == nil && storeErr == nil)
 			continue
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			metrics.SetReady(false)
 			logger.Error("fetch delivery failed", "error", err)
-			time.Sleep(time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 		metrics.SetReady(true)
-		dispatcher.Process(ctx, logger, metrics, store, cfg.Dispatcher.RepositoryTaskRoutes, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
+		dispatcher.Process(ctx, logger, metrics, store, routes, dispatcher.NATSDelivery{Message: msg}, time.Now().UTC())
 	}
 }
 

@@ -483,6 +483,9 @@ func (cfg Config) Validate() error {
 			return errors.New("push_scanner bounds exceed the reviewed broker and scanner limits")
 		}
 	}
+	if err := validateRouteActivations(cfg.ShadowAdmission.RouteActivations); err != nil {
+		return err
+	}
 	seen := map[string]string{}
 	for _, route := range cfg.Routes {
 		if err := route.Validate(); err != nil {
@@ -492,6 +495,43 @@ func (cfg Config) Validate() error {
 			return fmt.Errorf("route path %q is used by both %q and %q", route.Path, previous, route.ID)
 		}
 		seen[route.Path] = route.ID
+	}
+	return nil
+}
+
+// validateRouteActivations fails at config LOAD (not dispatcher startup) for
+// every shadow_admission.route_activations entry the dispatcher will install.
+// Each entry must name an absolute, bounded route_definition_path plus a
+// nonblank, bounded executor_id and executor_version, and a recognized
+// executor_kind (empty defaults to deterministic_tool at activation). Paths
+// must be unique so two entries cannot fight over the same definition file.
+func validateRouteActivations(activations []RouteActivation) error {
+	seenPaths := map[string]struct{}{}
+	for i, activation := range activations {
+		if strings.TrimSpace(activation.RouteDefinitionPath) == "" {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a route_definition_path", i)
+		}
+		if !strings.HasPrefix(activation.RouteDefinitionPath, "/") {
+			return fmt.Errorf("shadow_admission.route_activations[%d] route_definition_path must be absolute", i)
+		}
+		if len(activation.RouteDefinitionPath) > 4096 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] route_definition_path is oversized", i)
+		}
+		if _, dup := seenPaths[activation.RouteDefinitionPath]; dup {
+			return fmt.Errorf("shadow_admission.route_activations declares duplicate route_definition_path %q", activation.RouteDefinitionPath)
+		}
+		seenPaths[activation.RouteDefinitionPath] = struct{}{}
+		if strings.TrimSpace(activation.ExecutorID) == "" || len(activation.ExecutorID) > 256 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a bounded executor_id", i)
+		}
+		if strings.TrimSpace(activation.ExecutorVersion) == "" || len(activation.ExecutorVersion) > 256 {
+			return fmt.Errorf("shadow_admission.route_activations[%d] requires a bounded executor_version", i)
+		}
+		switch activation.ExecutorKind {
+		case "", "deterministic_tool", "policy_evaluator":
+		default:
+			return fmt.Errorf("shadow_admission.route_activations[%d] executor_kind must be deterministic_tool or policy_evaluator", i)
+		}
 	}
 	return nil
 }
