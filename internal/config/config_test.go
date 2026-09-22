@@ -305,3 +305,49 @@ routes:
 		t.Fatalf("shadow admission config = %#v", enabled.ShadowAdmission)
 	}
 }
+
+func TestShadowIngressDisabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+routes:
+  - id: manual-local
+    path: /manual
+    source: manual
+    publish_subject: signals.manual.local.test
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ShadowAdmission.Ingress.Enabled {
+		t.Fatal("shadow ingress must be disabled by default")
+	}
+
+	enabledPath := filepath.Join(dir, "ingress.yaml")
+	if err := os.WriteFile(enabledPath, []byte(`
+shadow_admission:
+  enabled: true
+  ingress:
+    enabled: true
+    socket_path: /run/signal-plane/shadow.sock
+    allowed_uids: [1000]
+routes:
+  - id: manual-local
+    path: /manual
+    source: manual
+    publish_subject: signals.manual.local.test
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := Load(enabledPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ing := enabled.ShadowAdmission.Ingress
+	if !ing.Enabled || ing.SocketPath != "/run/signal-plane/shadow.sock" || len(ing.AllowedUIDs) != 1 || ing.AllowedUIDs[0] != 1000 {
+		t.Fatalf("shadow ingress config = %#v", ing)
+	}
+}
