@@ -550,6 +550,35 @@ func (store *Store) WorkItem(ctx context.Context, id string) (WorkItem, error) {
 	return item, err
 }
 
+// ActiveRouteSnapshot returns the sole ACTIVE (non-retired) route snapshot for
+// a route id, or ok=false when none is active. It is read-only: a managed
+// activation CLI uses it to detect, BEFORE mutating, whether an active snapshot
+// already exists and whether its digest matches the definition being
+// activated — so a differing definition can be refused (fail closed) instead of
+// silently superseding the active generation. The unique active_route_snapshot
+// index guarantees at most one active row per route_id.
+func (store *Store) ActiveRouteSnapshot(ctx context.Context, routeID string) (RouteSnapshot, bool, error) {
+	var snapshot RouteSnapshot
+	var activated int64
+	err := store.db.QueryRowContext(ctx, `SELECT id,route_id,schema_version,semantic_version,digest,executor_id,executor_kind,executor_version,activated_at FROM route_snapshots WHERE route_id=? AND retired_at IS NULL`, routeID).Scan(&snapshot.ID, &snapshot.RouteID, &snapshot.SchemaVersion, &snapshot.SemanticVersion, &snapshot.Digest, &snapshot.ExecutorID, &snapshot.ExecutorKind, &snapshot.ExecutorVersion, &activated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RouteSnapshot{}, false, nil
+	}
+	if err != nil {
+		return RouteSnapshot{}, false, err
+	}
+	snapshot.ActivatedAt = time.UnixMilli(activated).UTC()
+	return snapshot, true, nil
+}
+
+// ActivationDigest is the stable content digest a route definition and its
+// executor descriptor activate under — the same value saveRoute keys the active
+// snapshot on. A managed activation CLI computes it to compare against an
+// already-active snapshot's digest without reaching into the database.
+func ActivationDigest(definition RouteDefinition, executor ExecutorDescriptor) (string, error) {
+	return activationDigest(definition, executor)
+}
+
 // RouteSnapshotExists reports whether an ACTIVE (non-retired) route snapshot
 // with the given id exists. A caller wiring a deployment-owned route config
 // uses it to fail closed when the config references a snapshot the ledger does
