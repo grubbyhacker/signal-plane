@@ -1,0 +1,19 @@
+# Deployment-owned route table for the shadow-ingress RouteResolver.
+#
+# It maps DOMAIN FACTS only to (agent_type, mode). Emitters never name
+# agent_type, mode, image, release, or generation — a fact is all an emitter
+# states, and this deployment-owned table chooses the agent. route_snapshot_id
+# points at the ledger route snapshot that admits the fact (activated
+# separately). No image/release/generation field may appear here.
+version: 1
+routes:
+  - fact: upload.completed
+    agent_type: youknowme-curator
+    mode: process_intake
+    route_snapshot_id: REPLACE_WITH_ACTIVATED_ROUTE_SNAPSHOT_ID
+    contract_revision: contract-v1
+  - fact: youknowme.reconciliation_due
+    agent_type: youknowme-curator
+    mode: reconcile
+    route_snapshot_id: REPLACE_WITH_ACTIVATED_ROUTE_SNAPSHOT_ID
+    contract_revision: contract-v1
