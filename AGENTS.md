@@ -56,6 +56,14 @@ the current scope.
   narrow interfaces, and explicit tests.
 - If external dependencies are added, keep them justified and run `go mod tidy`.
 
+## Agent platform coupling
+
+Cross-repo architecture and invariants live in
+`agent-infra-docs/design/agent-platform-coupling.md` (source of truth). This
+repo's per-stage notes, schema specifics, and local validation live under
+`docs/agent-platform/`. A per-repo document may not contradict the architecture
+document.
+
 ## Delivery
 
 Work on feature branches and open ready-for-review PRs. Do not open draft PRs
