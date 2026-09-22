@@ -15,13 +15,16 @@ fi
 """
 
 [tasks.check]
-run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run test && mise run build"
+run = "mise run fmt-check && mise run validate:image-tag-contract && mise run validate:workitem-agent-admission && mise run validate:shadow-admission && mise run test && mise run build"
 
 [tasks."validate:image-tag-contract"]
 run = "python3 scripts/validate-image-tag-contract.py"
 
 [tasks."validate:workitem-agent-admission"]
 run = "python3 scripts/validate-workitem-agent-admission.py"
+
+[tasks."validate:shadow-admission"]
+run = "python3 scripts/validate-shadow-admission.py"
 
 [tasks.test]
 run = "GOCACHE=$PWD/.gocache GOMODCACHE=$PWD/.gomodcache go test ./..."
