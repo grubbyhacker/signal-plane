@@ -320,6 +320,41 @@ func repairSourceID(attemptKey string) string {
 	return fmt.Sprintf("ci-repair-v1-%x", sha256.Sum256([]byte(attemptKey)))
 }
 
+// LaunchWorkItem starts a reviewed broker profile for one authoritative Signal
+// Plane WorkItem. The profile must explicitly declare work_item_id; no image,
+// release, generation, agent type, or mode is caller-selectable.
+func (b *Broker) LaunchWorkItem(ctx context.Context, profile, workItemID, idempotencyKey string) (LaunchResult, error) {
+	if strings.TrimSpace(workItemID) == "" || len(workItemID) > 64 {
+		return LaunchResult{}, permanentMalformed("authoritative work_item_id is required and bounded", nil)
+	}
+	if strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 255 {
+		return LaunchResult{}, permanentMalformed("work item launch idempotency key is required and bounded", nil)
+	}
+	body, err := json.Marshal(map[string]any{"parameters": map[string]any{"work_item_id": workItemID}})
+	if err != nil {
+		return LaunchResult{}, permanentMalformed("encode WorkItem broker launch request", err)
+	}
+	endpoint, err := b.launchURL(profile)
+	if err != nil {
+		return LaunchResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return LaunchResult{}, permanentMalformed("create WorkItem broker launch request", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+	b.authorize(req)
+	var result LaunchResult
+	if err := b.doJSON(req, &result); err != nil {
+		return LaunchResult{}, err
+	}
+	if result.Version != brokerRunLaunchVersion || strings.TrimSpace(result.RunID) == "" {
+		return LaunchResult{}, permanentMalformed("WorkItem broker launch response is invalid", nil)
+	}
+	result.RunID = strings.TrimSpace(result.RunID)
+	return result, nil
+}
 func (b *Broker) Launch(ctx context.Context, job Job) (LaunchResult, error) {
 	body, err := json.Marshal(struct {
 		Parameters struct {

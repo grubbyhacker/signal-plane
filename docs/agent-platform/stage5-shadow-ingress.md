@@ -16,8 +16,11 @@ rotate." This document may not contradict it.
 `internal/shadowingress` — the host-side intake that feeds the shadow-admission
 seam (#62).
 
-- Transport: a **Unix-domain socket** created with owner-only mode (`0600`) in
-  an owner-only directory (a group/world-writable parent is refused at start).
+- Transport: a **Unix-domain socket** created with group-readable/writable mode
+  (`0660`) in a setgid directory whose group is the YouKnowMe transport GID.
+  The directory remains non-group-writable; a group/world-writable parent is
+  refused at start. Database permissions are unchanged and never shared with
+  the producer.
 - Authentication: **SO_PEERCRED** on Linux (`golang.org/x/sys/unix.GetsockoptUcred`)
   reads the connecting process's kernel-reported UID and checks it against an
   allow-list (empty = own UID only). The credential is set by the kernel at
@@ -60,7 +63,7 @@ the zero binding, and the disabled-by-default no-op.
   fields); `validateSocketPath` (absolute + owner-only parent); enabled ingress
   requires a resolver; disabled no-op; socket round-trip that proves the
   RESOLVER's output (not caller input) feeds shadowadmit and the persisted
-  binding is the resolver's, plus deterministic dedup and `0600` mode; an
+  binding is the resolver's, plus deterministic dedup and `0660` mode; an
   unmatched fact is dropped, not admitted; `clearStaleSocket` removes a real
   socket but preserves a regular file, and `Serve` refuses to start (without
   clobbering it) on a non-socket path. The round-trip injects an allow-all

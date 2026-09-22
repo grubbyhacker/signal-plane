@@ -39,10 +39,11 @@ type Service struct {
 // Deps are the process-level dependencies the dispatcher supplies. Store is the
 // dispatcher's own attached work-ledger view; Bus is the shared NATS connection.
 type Deps struct {
-	Store  *workledger.Store
-	Bus    *eventbus.Bus
-	Stream string
-	Logger *slog.Logger
+	Store     *workledger.Store
+	Bus       *eventbus.Bus
+	Stream    string
+	Logger    *slog.Logger
+	Executors []workledger.Executor
 }
 
 // Build constructs the release pipeline from the work_router config, reading the
@@ -89,6 +90,11 @@ func Build(ctx context.Context, cfg config.WorkRouterConfig, deps Deps) (*Servic
 	registry := workledger.NewRegistry()
 	if err := registry.Register(executor); err != nil {
 		return nil, fmt.Errorf("register resume upload executor: %w", err)
+	}
+	for _, additional := range deps.Executors {
+		if err := registry.Register(additional); err != nil {
+			return nil, fmt.Errorf("register WorkItem executor: %w", err)
+		}
 	}
 	route := workledger.RouteDefinition{
 		ID: "resume-builder-release-upload", SchemaVersion: 1, SemanticVersion: "1.0.0", ExecutorID: ExecutorID,

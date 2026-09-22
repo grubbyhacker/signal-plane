@@ -23,6 +23,7 @@ import (
 	"github.com/grubbyhacker/signal-plane/internal/routeactivatecmd"
 	"github.com/grubbyhacker/signal-plane/internal/routeresolver"
 	"github.com/grubbyhacker/signal-plane/internal/shadowingresscmd"
+	"github.com/grubbyhacker/signal-plane/internal/workitemlaunch"
 	"github.com/grubbyhacker/signal-plane/internal/workledger"
 	"github.com/nats-io/nats.go"
 )
@@ -121,11 +122,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer bus.Close()
-	// Relocated Resume Builder release pipeline: the release/published ingress
-	// and the YouKnowMe upload executor run HERE, against the dispatcher's own
-	// work-ledger handle, so the standalone resume-release-router no longer
-	// opens the database. Disabled (nil) when work_router.enabled is false.
-	resumeService, err := resumeupload.Build(ctx, cfg.WorkRouter, resumeupload.Deps{Store: workLedger, Bus: bus, Stream: cfg.NATS.Stream, Logger: logger})
+	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, ReporterURL: cfg.Dispatcher.ReporterBrokerURL, ReporterToken: reporterToken, Client: &http.Client{Timeout: 30 * time.Second}}
+	var additionalExecutors []workledger.Executor
+	if cfg.ShadowAdmission.Launcher.Enabled {
+		additionalExecutors = append(additionalExecutors, &workitemlaunch.Executor{Config: cfg.ShadowAdmission.Launcher, Broker: broker})
+	}
+	// Relocated Resume Builder release pipeline and the authoritative WorkItem
+	// launcher share one execution registry and the dispatcher's one ledger
+	// handle. No second process can claim WorkItems or open SQLite.
+	resumeService, err := resumeupload.Build(ctx, cfg.WorkRouter, resumeupload.Deps{Store: workLedger, Bus: bus, Stream: cfg.NATS.Stream, Logger: logger, Executors: additionalExecutors})
 	if err != nil {
 		logger.Error("build resume-release pipeline failed", "error", err)
 		os.Exit(1)
@@ -139,7 +144,6 @@ func main() {
 		logger.Error("create dispatcher consumer failed", "error", err)
 		os.Exit(1)
 	}
-	broker := &dispatcher.Broker{URL: cfg.Dispatcher.BrokerURL, Token: token, ReporterURL: cfg.Dispatcher.ReporterBrokerURL, ReporterToken: reporterToken, Client: &http.Client{Timeout: 30 * time.Second}}
 	metrics.SetReady(true)
 	go worker(ctx, logger, metrics, store, broker)
 	logger.Info("starting github-task-dispatcher", "version", buildinfo.Version, "durable", cfg.Dispatcher.Durable, "workers", 1)

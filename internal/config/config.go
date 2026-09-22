@@ -52,6 +52,21 @@ type ShadowAdmissionConfig struct {
 	// and happens in the ONE process that owns the database. Empty by default,
 	// so an unconfigured dispatcher activates nothing.
 	RouteActivations []RouteActivation `yaml:"route_activations"`
+	// Launcher registers the executor that turns admitted agent-bound WorkItems
+	// into authenticated broker profile launches. It is disabled by default and
+	// uses the dispatcher's existing broker origin and credential.
+	Launcher WorkItemLauncherConfig `yaml:"launcher"`
+}
+
+// WorkItemLauncherConfig binds one work-ledger executor descriptor to reviewed
+// broker launch profiles by AgentType mode. The emitter cannot select profiles.
+type WorkItemLauncherConfig struct {
+	Enabled         bool              `yaml:"enabled"`
+	AgentType       string            `yaml:"agent_type"`
+	ExecutorID      string            `yaml:"executor_id"`
+	ExecutorKind    string            `yaml:"executor_kind"`
+	ExecutorVersion string            `yaml:"executor_version"`
+	Profiles        map[string]string `yaml:"profiles"`
 }
 
 // RouteActivation names a deployment-owned RouteDefinition file plus the
@@ -76,8 +91,8 @@ type RouteActivation struct {
 // ShadowIngressConfig configures the unprivileged host intake: a Unix-domain
 // socket authenticated by filesystem permissions and SO_PEERCRED. It is
 // DISABLED BY DEFAULT. There is no network listener and no credential; the
-// socket path's owner-only directory plus the peer-credential check are the
-// whole guard.
+// socket path's non-group-writable directory plus the peer-credential check are
+// the whole guard. A setgid transport group may have read/execute traversal.
 type ShadowIngressConfig struct {
 	// Enabled turns the host ingress on. Default false: no socket is opened.
 	Enabled bool `yaml:"enabled"`
@@ -485,6 +500,48 @@ func (cfg Config) Validate() error {
 	}
 	if err := validateRouteActivations(cfg.ShadowAdmission.RouteActivations); err != nil {
 		return err
+	}
+	if launcher := cfg.ShadowAdmission.Launcher; launcher.Enabled {
+		agentTypePattern := regexp.MustCompile(`^[a-z][a-z0-9-]{0,127}$`)
+		modePattern := regexp.MustCompile(`^[a-z][a-z0-9_]{0,127}$`)
+		profilePattern := regexp.MustCompile(`^[a-z][a-z0-9-]{0,127}$`)
+		if !cfg.Dispatcher.Enabled || !cfg.WorkRouter.Enabled {
+			return errors.New("enabled shadow_admission.launcher requires dispatcher and work_router execution loops")
+		}
+		if !agentTypePattern.MatchString(launcher.AgentType) || strings.TrimSpace(launcher.ExecutorID) == "" || strings.TrimSpace(launcher.ExecutorVersion) == "" {
+			return errors.New("enabled shadow_admission.launcher requires bounded agent_type, executor_id, and executor_version")
+		}
+		kind := launcher.ExecutorKind
+		if kind == "" {
+			kind = "deterministic_tool"
+		}
+		if kind != "deterministic_tool" && kind != "policy_evaluator" {
+			return errors.New("shadow_admission.launcher executor_kind must be deterministic_tool or policy_evaluator")
+		}
+		if len(launcher.Profiles) == 0 {
+			return errors.New("enabled shadow_admission.launcher requires at least one mode profile")
+		}
+		for mode, profile := range launcher.Profiles {
+			if !modePattern.MatchString(mode) || !profilePattern.MatchString(profile) {
+				return fmt.Errorf("shadow_admission.launcher profile mapping %q=%q is invalid", mode, profile)
+			}
+		}
+		matchedActivation := false
+		for _, activation := range cfg.ShadowAdmission.RouteActivations {
+			activationKind := activation.ExecutorKind
+			if activationKind == "" {
+				activationKind = "deterministic_tool"
+			}
+			if activation.ExecutorID == launcher.ExecutorID {
+				matchedActivation = true
+				if activation.ExecutorVersion != launcher.ExecutorVersion || activationKind != kind {
+					return errors.New("shadow_admission.launcher descriptor must exactly match its route activation descriptor")
+				}
+			}
+		}
+		if !matchedActivation {
+			return errors.New("shadow_admission.launcher executor_id has no deployment-owned route activation")
+		}
 	}
 	seen := map[string]string{}
 	for _, route := range cfg.Routes {
