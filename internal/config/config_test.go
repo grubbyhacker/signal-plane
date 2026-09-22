@@ -263,3 +263,45 @@ func TestValidateEnabledPushScannerRequiresReviewedPrivateContract(t *testing.T)
 		t.Fatal("scanner reconciliation beyond reviewed SLO cadence was accepted")
 	}
 }
+
+func TestShadowAdmissionDisabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+routes:
+  - id: manual-local
+    path: /manual
+    source: manual
+    publish_subject: signals.manual.local.test
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ShadowAdmission.Enabled {
+		t.Fatal("shadow admission must be disabled by default")
+	}
+
+	enabledPath := filepath.Join(dir, "enabled.yaml")
+	if err := os.WriteFile(enabledPath, []byte(`
+shadow_admission:
+  enabled: true
+  database_path: /tmp/shadow.db
+routes:
+  - id: manual-local
+    path: /manual
+    source: manual
+    publish_subject: signals.manual.local.test
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enabled, err := Load(enabledPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enabled.ShadowAdmission.Enabled || enabled.ShadowAdmission.DatabasePath != "/tmp/shadow.db" {
+		t.Fatalf("shadow admission config = %#v", enabled.ShadowAdmission)
+	}
+}

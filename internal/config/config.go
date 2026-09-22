@@ -21,12 +21,27 @@ const (
 )
 
 type Config struct {
-	Gateway     GatewayConfig     `yaml:"gateway"`
-	NATS        NATSConfig        `yaml:"nats"`
-	Dispatcher  DispatcherConfig  `yaml:"dispatcher"`
-	WorkRouter  WorkRouterConfig  `yaml:"work_router"`
-	PushScanner PushScannerConfig `yaml:"push_scanner"`
-	Routes      []Route           `yaml:"routes"`
+	Gateway         GatewayConfig         `yaml:"gateway"`
+	NATS            NATSConfig            `yaml:"nats"`
+	Dispatcher      DispatcherConfig      `yaml:"dispatcher"`
+	WorkRouter      WorkRouterConfig      `yaml:"work_router"`
+	PushScanner     PushScannerConfig     `yaml:"push_scanner"`
+	ShadowAdmission ShadowAdmissionConfig `yaml:"shadow_admission"`
+	Routes          []Route               `yaml:"routes"`
+}
+
+// ShadowAdmissionConfig configures the Stage-5 shadow-admission seam: a
+// source-neutral WorkItem candidate is admitted into the ledger (dedup +
+// durable persistence) WITHOUT launching, enqueueing to the legacy launcher, or
+// mutating legacy dispatcher tables. It is DISABLED BY DEFAULT and inert: the
+// zero value does nothing, and even when Enabled it only admits (dry-run),
+// never launches. External ingress transport is design-deferred, so this block
+// carries no listener address.
+type ShadowAdmissionConfig struct {
+	// Enabled turns the shadow seam on. Default false: the seam is inert.
+	Enabled bool `yaml:"enabled"`
+	// DatabasePath is the work-ledger database the shadow admitter writes to.
+	DatabasePath string `yaml:"database_path"`
 }
 
 type PushScannerConfig struct {
