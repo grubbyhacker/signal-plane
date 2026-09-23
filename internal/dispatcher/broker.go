@@ -323,14 +323,20 @@ func repairSourceID(attemptKey string) string {
 // LaunchWorkItem starts a reviewed broker profile for one authoritative Signal
 // Plane WorkItem. The profile must explicitly declare work_item_id; no image,
 // release, generation, agent type, or mode is caller-selectable.
-func (b *Broker) LaunchWorkItem(ctx context.Context, profile, workItemID, idempotencyKey string) (LaunchResult, error) {
+func (b *Broker) LaunchWorkItem(ctx context.Context, profile, workItemID, uploadID, idempotencyKey string) (LaunchResult, error) {
 	if strings.TrimSpace(workItemID) == "" || len(workItemID) > 64 {
 		return LaunchResult{}, permanentMalformed("authoritative work_item_id is required and bounded", nil)
+	}
+	if strings.TrimSpace(uploadID) == "" || len(uploadID) > 80 {
+		return LaunchResult{}, permanentMalformed("authoritative upload_id is required and bounded", nil)
 	}
 	if strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 255 {
 		return LaunchResult{}, permanentMalformed("work item launch idempotency key is required and bounded", nil)
 	}
-	body, err := json.Marshal(map[string]any{"parameters": map[string]any{"work_item_id": workItemID}})
+	body, err := json.Marshal(map[string]any{"parameters": map[string]any{
+		"work_item_id": workItemID,
+		"upload_ids":   []string{uploadID},
+	}})
 	if err != nil {
 		return LaunchResult{}, permanentMalformed("encode WorkItem broker launch request", err)
 	}

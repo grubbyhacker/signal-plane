@@ -22,15 +22,19 @@ func TestBrokerLaunchWorkItemContract(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if len(body.Parameters) != 1 || body.Parameters["work_item_id"] != "work-123" {
+		if len(body.Parameters) != 2 || body.Parameters["work_item_id"] != "work-123" {
 			t.Fatalf("parameters = %#v", body.Parameters)
+		}
+		uploads, ok := body.Parameters["upload_ids"].([]any)
+		if !ok || len(uploads) != 1 || uploads[0] != "upl_123" {
+			t.Fatalf("upload_ids = %#v", body.Parameters["upload_ids"])
 		}
 		_, _ = w.Write([]byte(`{"version":"broker-run-launch/v1","run_id":"run-123"}`))
 	}))
 	defer server.Close()
 
 	broker := &Broker{URL: server.URL, Token: "dispatcher-token", Client: server.Client()}
-	result, err := broker.LaunchWorkItem(context.Background(), "ykm-curator-workitem-intake", "work-123", "executor:work-123:digest:1")
+	result, err := broker.LaunchWorkItem(context.Background(), "ykm-curator-workitem-intake", "work-123", "upl_123", "executor:work-123:digest:1")
 	if err != nil {
 		t.Fatal(err)
 	}
