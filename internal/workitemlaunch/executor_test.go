@@ -11,13 +11,13 @@ import (
 )
 
 type fakeBroker struct {
-	profile, workItemID, key string
-	result                   dispatcher.LaunchResult
-	err                      error
+	profile, workItemID, uploadID, key string
+	result                             dispatcher.LaunchResult
+	err                                error
 }
 
-func (broker *fakeBroker) LaunchWorkItem(_ context.Context, profile, workItemID, key string) (dispatcher.LaunchResult, error) {
-	broker.profile, broker.workItemID, broker.key = profile, workItemID, key
+func (broker *fakeBroker) LaunchWorkItem(_ context.Context, profile, workItemID, uploadID, key string) (dispatcher.LaunchResult, error) {
+	broker.profile, broker.workItemID, broker.uploadID, broker.key = profile, workItemID, uploadID, key
 	return broker.result, broker.err
 }
 
@@ -36,7 +36,7 @@ func testExecutor(broker Broker) *Executor {
 
 func testRequest() workledger.ExecutorRequest {
 	return workledger.ExecutorRequest{
-		WorkItem: workledger.WorkItem{ID: "work-123", AgentType: "youknowme-curator", AgentMode: "process_intake"},
+		WorkItem: workledger.WorkItem{ID: "work-123", AgentType: "youknowme-curator", AgentMode: "process_intake", ObjectKind: "upload", ObjectID: "upl_123"},
 		Attempt:  workledger.ExecutorAttempt{IdempotencyKey: "executor:work-123:digest:1"},
 	}
 }
@@ -47,7 +47,7 @@ func TestExecutorLaunchesAuthoritativeWorkItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if broker.profile != "ykm-curator-workitem-intake" || broker.workItemID != "work-123" || broker.key != "executor:work-123:digest:1" {
+	if broker.profile != "ykm-curator-workitem-intake" || broker.workItemID != "work-123" || broker.uploadID != "upl_123" || broker.key != "executor:work-123:digest:1" {
 		t.Fatalf("launch coordinates = %#v", broker)
 	}
 	if result.Outcome != workledger.OutcomeCompleted || result.ExternalCorrelation != "run-123" || result.ResultDigest == "" {
